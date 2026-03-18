@@ -161,7 +161,7 @@ mod tests {
         let p = params![42_i64, "hello", 3.14_f64, true];
         assert_eq!(p.len(), 4);
         assert_eq!(p[0].0, SqliteValue::Integer(42));
-        assert_eq!(p[1].0, SqliteValue::Text("hello".to_owned()));
+        assert_eq!(p[1].0, SqliteValue::Text("hello".into()));
         assert_eq!(p[2].0, SqliteValue::Float(3.14));
         assert_eq!(p[3].0, SqliteValue::Integer(1));
     }
@@ -190,7 +190,7 @@ mod tests {
         let value = u64::MAX;
         assert_eq!(
             ParamValue::from(value).0,
-            SqliteValue::Text(value.to_string())
+            SqliteValue::Text(value.to_string().into())
         );
     }
 
@@ -201,7 +201,7 @@ mod tests {
             Ok(int) => assert_eq!(ParamValue::from(value).0, SqliteValue::Integer(int)),
             Err(_) => assert_eq!(
                 ParamValue::from(value).0,
-                SqliteValue::Text(value.to_string())
+                SqliteValue::Text(value.to_string().into())
             ),
         }
     }

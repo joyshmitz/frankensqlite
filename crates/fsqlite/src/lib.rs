@@ -62,10 +62,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(3),
-                SqliteValue::Text("abcd".to_owned()),
-            ]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("abcd".into()),]
         );
     }
 
@@ -78,14 +75,14 @@ mod tests {
                 &[
                     SqliteValue::Integer(4),
                     SqliteValue::Integer(5),
-                    SqliteValue::Text("ok".to_owned()),
+                    SqliteValue::Text("ok".into()),
                 ],
             )
             .expect("query_with_params should succeed");
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(9), SqliteValue::Text("ok".to_owned())]
+            vec![SqliteValue::Integer(9), SqliteValue::Text("ok".into())]
         );
     }
 
@@ -153,7 +150,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT 42, 'hello';").unwrap();
         assert_eq!(row.get(0), Some(&SqliteValue::Integer(42)));
-        assert_eq!(row.get(1), Some(&SqliteValue::Text("hello".to_owned())));
+        assert_eq!(row.get(1), Some(&SqliteValue::Text("hello".into())));
     }
 
     #[test]
@@ -204,9 +201,9 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let stmt = conn.prepare("SELECT ?1;").unwrap();
         let row = stmt
-            .query_row_with_params(&[SqliteValue::Text("xyz".to_owned())])
+            .query_row_with_params(&[SqliteValue::Text("xyz".into())])
             .unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("xyz".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("xyz".into())]);
     }
 
     #[test]
@@ -554,7 +551,7 @@ mod tests {
         let row = conn.query_row("SELECT 'hello world';").unwrap();
         assert_eq!(
             row_values(&row),
-            vec![SqliteValue::Text("hello world".to_owned())]
+            vec![SqliteValue::Text("hello world".into())]
         );
     }
 
@@ -563,9 +560,9 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let blob = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let row = conn
-            .query_row_with_params("SELECT ?1;", &[SqliteValue::Blob(blob.clone())])
+            .query_row_with_params("SELECT ?1;", &[SqliteValue::Blob(blob.clone().into())])
             .unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Blob(blob)]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Blob(blob.into())]);
     }
 
     // ── Transaction control ──────────────────────────────────────────────
@@ -719,10 +716,7 @@ mod tests {
     fn string_concatenation() {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT 'foo' || 'bar';").unwrap();
-        assert_eq!(
-            row_values(&row),
-            vec![SqliteValue::Text("foobar".to_owned())]
-        );
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("foobar".into())]);
     }
 
     // ── Compound WHERE predicates (bd-2832) ────────────────────────────
@@ -829,7 +823,7 @@ mod tests {
         let row = conn
             .query_row("SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END;")
             .unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("yes".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("yes".into())]);
     }
 
     #[test]
@@ -838,7 +832,7 @@ mod tests {
         let row = conn
             .query_row("SELECT CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END;")
             .unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("b".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("b".into())]);
     }
 
     // ── Built-in functions ─────────────────────────────────────────────
@@ -866,8 +860,8 @@ mod tests {
         assert_eq!(
             row_values(&row),
             vec![
-                SqliteValue::Text("HELLO".to_owned()),
-                SqliteValue::Text("world".to_owned()),
+                SqliteValue::Text("HELLO".into()),
+                SqliteValue::Text("world".into()),
             ]
         );
     }
@@ -876,10 +870,7 @@ mod tests {
     fn builtin_typeof() {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT TYPEOF(42);").unwrap();
-        assert_eq!(
-            row_values(&row),
-            vec![SqliteValue::Text("integer".to_owned())]
-        );
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("integer".into())]);
     }
 
     // ── CAST ───────────────────────────────────────────────────────────
@@ -888,7 +879,7 @@ mod tests {
     fn cast_integer_to_text() {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT CAST(42 AS TEXT);").unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("42".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("42".into())]);
     }
 
     #[test]
@@ -906,7 +897,7 @@ mod tests {
         let row = conn.query_row("SELECT X'DEADBEEF';").unwrap();
         assert_eq!(
             row_values(&row),
-            vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])]
+            vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into())]
         );
     }
 
@@ -1002,10 +993,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(10),
-                SqliteValue::Text("hello".to_owned())
-            ]
+            vec![SqliteValue::Integer(10), SqliteValue::Text("hello".into())]
         );
     }
 
@@ -1073,8 +1061,8 @@ mod tests {
         let rows = conn.query("SELECT b FROM t3 WHERE b LIKE 't%';").unwrap();
         let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
         assert_eq!(vals.len(), 2);
-        assert!(vals.contains(&SqliteValue::Text("two".to_owned())));
-        assert!(vals.contains(&SqliteValue::Text("three".to_owned())));
+        assert!(vals.contains(&SqliteValue::Text("two".into())));
+        assert!(vals.contains(&SqliteValue::Text("three".into())));
     }
 
     // ── Aggregates (bd-xldj) ────────────────────────────────────────────
@@ -1262,8 +1250,8 @@ mod tests {
             .query("SELECT CASE WHEN a > 3 THEN 'big' ELSE 'small' END FROM tp;")
             .unwrap();
         assert_eq!(rows.len(), 5);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("small".to_owned()));
-        assert_eq!(rows[3].values()[0], SqliteValue::Text("big".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("small".into()));
+        assert_eq!(rows[3].values()[0], SqliteValue::Text("big".into()));
     }
 
     // ── CAST on table column ────────────────────────────────────────────
@@ -1276,7 +1264,7 @@ mod tests {
         let row = conn
             .query_row("SELECT CAST(v AS TEXT) FROM tcast;")
             .unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("42".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("42".into())]);
     }
 
     // ── IS NULL / IS NOT NULL on table ──────────────────────────────────
@@ -1316,19 +1304,19 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         assert_eq!(
             row_values(&conn.query_row("SELECT typeof(3.14);").unwrap()),
-            vec![SqliteValue::Text("real".to_owned())]
+            vec![SqliteValue::Text("real".into())]
         );
         assert_eq!(
             row_values(&conn.query_row("SELECT typeof('abc');").unwrap()),
-            vec![SqliteValue::Text("text".to_owned())]
+            vec![SqliteValue::Text("text".into())]
         );
         assert_eq!(
             row_values(&conn.query_row("SELECT typeof(NULL);").unwrap()),
-            vec![SqliteValue::Text("null".to_owned())]
+            vec![SqliteValue::Text("null".into())]
         );
         assert_eq!(
             row_values(&conn.query_row("SELECT typeof(X'FF');").unwrap()),
-            vec![SqliteValue::Text("blob".to_owned())]
+            vec![SqliteValue::Text("blob".into())]
         );
     }
 
@@ -1338,10 +1326,7 @@ mod tests {
         let row = conn
             .query_row("SELECT substr('hello world', 7, 5);")
             .unwrap();
-        assert_eq!(
-            row_values(&row),
-            vec![SqliteValue::Text("world".to_owned())]
-        );
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("world".into())]);
     }
 
     #[test]
@@ -1352,7 +1337,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_values(&row),
-            vec![SqliteValue::Text("hello rust".to_owned())]
+            vec![SqliteValue::Text("hello rust".into())]
         );
     }
 
@@ -1360,10 +1345,7 @@ mod tests {
     fn builtin_trim() {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT trim('  hello  ');").unwrap();
-        assert_eq!(
-            row_values(&row),
-            vec![SqliteValue::Text("hello".to_owned())]
-        );
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("hello".into())]);
     }
 
     #[test]
@@ -1379,7 +1361,7 @@ mod tests {
     fn builtin_hex() {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT hex(X'CAFE');").unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("CAFE".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("CAFE".into())]);
     }
 
     // ── IS NULL expression context ──────────────────────────────────────
@@ -1399,7 +1381,7 @@ mod tests {
     fn soundex_null_returns_question_marks() {
         let conn = Connection::open(":memory:").unwrap();
         let row = conn.query_row("SELECT soundex(NULL);").unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Text("?000".to_owned())]);
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("?000".into())]);
     }
 
     // ── LIKE underscore wildcard ─────────────────────────────────────────
@@ -1410,10 +1392,7 @@ mod tests {
         setup_bd2832(&conn);
         let rows = conn.query("SELECT b FROM tp WHERE b LIKE 'b_ta';").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("beta".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("beta".into())]);
     }
 
     // ── NOT IN / NOT BETWEEN ────────────────────────────────────────────
@@ -1531,18 +1510,15 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("orig".to_owned())
-            ]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("orig".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("hit".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("hit".into())]
         );
         assert_eq!(
             row_values(&rows[2]),
-            vec![SqliteValue::Integer(3), SqliteValue::Text("hit".to_owned())]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("hit".into())]
         );
     }
 
@@ -1677,11 +1653,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("a".to_owned()), SqliteValue::Integer(2)]
+            vec![SqliteValue::Text("a".into()), SqliteValue::Integer(2)]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Text("b".to_owned()), SqliteValue::Integer(1)]
+            vec![SqliteValue::Text("b".into()), SqliteValue::Integer(1)]
         );
     }
 
@@ -1700,11 +1676,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("a".to_owned()), SqliteValue::Integer(10)]
+            vec![SqliteValue::Text("a".into()), SqliteValue::Integer(10)]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Text("b".to_owned()), SqliteValue::Integer(20)]
+            vec![SqliteValue::Text("b".into()), SqliteValue::Integer(20)]
         );
     }
 
@@ -1727,12 +1703,12 @@ mod tests {
 
         let projected: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
         assert!(projected.contains(&vec![
-            SqliteValue::Text("left-b".to_owned()),
-            SqliteValue::Text("right-b".to_owned())
+            SqliteValue::Text("left-b".into()),
+            SqliteValue::Text("right-b".into())
         ]));
         assert!(projected.contains(&vec![
             SqliteValue::Null,
-            SqliteValue::Text("right-c".to_owned())
+            SqliteValue::Text("right-c".into())
         ]));
     }
 
@@ -1754,17 +1730,14 @@ mod tests {
         assert_eq!(rows.len(), 3);
 
         let projected: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert!(projected.contains(&vec![SqliteValue::Text("left-a".into()), SqliteValue::Null]));
         assert!(projected.contains(&vec![
-            SqliteValue::Text("left-a".to_owned()),
-            SqliteValue::Null
-        ]));
-        assert!(projected.contains(&vec![
-            SqliteValue::Text("left-b".to_owned()),
-            SqliteValue::Text("right-b".to_owned())
+            SqliteValue::Text("left-b".into()),
+            SqliteValue::Text("right-b".into())
         ]));
         assert!(projected.contains(&vec![
             SqliteValue::Null,
-            SqliteValue::Text("right-c".to_owned())
+            SqliteValue::Text("right-c".into())
         ]));
     }
 
@@ -1786,12 +1759,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let projected: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
         assert!(projected.contains(&vec![
-            SqliteValue::Text("left-one".to_owned()),
-            SqliteValue::Text("right-one".to_owned())
+            SqliteValue::Text("left-one".into()),
+            SqliteValue::Text("right-one".into())
         ]));
         assert!(projected.contains(&vec![
             SqliteValue::Null,
-            SqliteValue::Text("right-null".to_owned())
+            SqliteValue::Text("right-null".into())
         ]));
     }
 
@@ -1816,14 +1789,8 @@ mod tests {
                 (v[0].clone(), v[1].clone())
             })
             .collect();
-        assert!(vals.contains(&(
-            SqliteValue::Text("eng".to_owned()),
-            SqliteValue::Integer(300)
-        )));
-        assert!(vals.contains(&(
-            SqliteValue::Text("sales".to_owned()),
-            SqliteValue::Integer(50)
-        )));
+        assert!(vals.contains(&(SqliteValue::Text("eng".into()), SqliteValue::Integer(300))));
+        assert!(vals.contains(&(SqliteValue::Text("sales".into()), SqliteValue::Integer(50))));
     }
 
     #[test]
@@ -1842,12 +1809,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let a_row = rows
             .iter()
-            .find(|r| row_values(r)[0] == SqliteValue::Text("a".to_owned()))
+            .find(|r| row_values(r)[0] == SqliteValue::Text("a".into()))
             .unwrap();
         assert_eq!(
             row_values(a_row),
             vec![
-                SqliteValue::Text("a".to_owned()),
+                SqliteValue::Text("a".into()),
                 SqliteValue::Integer(3),
                 SqliteValue::Integer(10),
                 SqliteValue::Integer(30),
@@ -1855,12 +1822,12 @@ mod tests {
         );
         let b_row = rows
             .iter()
-            .find(|r| row_values(r)[0] == SqliteValue::Text("b".to_owned()))
+            .find(|r| row_values(r)[0] == SqliteValue::Text("b".into()))
             .unwrap();
         assert_eq!(
             row_values(b_row),
             vec![
-                SqliteValue::Text("b".to_owned()),
+                SqliteValue::Text("b".into()),
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(5),
                 SqliteValue::Integer(5),
@@ -1908,8 +1875,8 @@ mod tests {
         conn.execute_with_params(
             "INSERT INTO message_payloads(recipients_json, attachments) VALUES (?1, ?2);",
             &[
-                SqliteValue::Text(recipients.to_owned()),
-                SqliteValue::Text(attachments.to_owned()),
+                SqliteValue::Text(recipients.into()),
+                SqliteValue::Text(attachments.into()),
             ],
         )
         .unwrap();
@@ -1920,8 +1887,8 @@ mod tests {
         assert_eq!(
             row_values(&row),
             vec![
-                SqliteValue::Text(recipients.to_owned()),
-                SqliteValue::Text(attachments.to_owned())
+                SqliteValue::Text(recipients.into()),
+                SqliteValue::Text(attachments.into())
             ]
         );
     }
@@ -2055,12 +2022,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0])[1],
-            SqliteValue::Text("fallback".to_owned())
+            SqliteValue::Text("fallback".into())
         );
-        assert_eq!(
-            row_values(&rows[1])[1],
-            SqliteValue::Text("present".to_owned())
-        );
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Text("present".into()));
     }
 
     #[test]
@@ -2077,15 +2041,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("null".to_owned())
-        );
-        assert_eq!(
-            row_values(&rows[1])[1],
-            SqliteValue::Text("small".to_owned())
-        );
-        assert_eq!(row_values(&rows[2])[1], SqliteValue::Text("big".to_owned()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("null".into()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Text("small".into()));
+        assert_eq!(row_values(&rows[2])[1], SqliteValue::Text("big".into()));
     }
 
     #[test]
@@ -2172,7 +2130,7 @@ mod tests {
         conn.execute("INSERT INTO dst SELECT * FROM src;").unwrap();
         let rows = conn.query("SELECT id, val FROM dst ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("a".to_owned()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("a".into()));
     }
 
     #[test]
@@ -2232,7 +2190,7 @@ mod tests {
             .query("SELECT cat, COUNT(*) as cnt FROM t GROUP BY cat HAVING cnt > 1;")
             .unwrap();
         assert_eq!(rows.len(), 1, "Only group A has count > 1");
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("A".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("A".into()));
     }
 
     #[test]
@@ -2264,8 +2222,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         let grps: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
-        assert!(grps.contains(&SqliteValue::Text("A".to_owned())));
-        assert!(grps.contains(&SqliteValue::Text("C".to_owned())));
+        assert!(grps.contains(&SqliteValue::Text("A".into())));
+        assert!(grps.contains(&SqliteValue::Text("C".into())));
     }
 
     #[test]
@@ -2280,7 +2238,7 @@ mod tests {
             .query("SELECT grp, SUM(val) FROM hc GROUP BY grp HAVING CASE grp WHEN 'X' THEN 1 ELSE 0 END = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("X".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("X".into()));
     }
 
     #[test]
@@ -2348,8 +2306,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         let grps: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
-        assert!(grps.contains(&SqliteValue::Text("apple".to_owned())));
-        assert!(grps.contains(&SqliteValue::Text("apricot".to_owned())));
+        assert!(grps.contains(&SqliteValue::Text("apple".into())));
+        assert!(grps.contains(&SqliteValue::Text("apricot".into())));
     }
 
     #[test]
@@ -2361,7 +2319,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_values(&rows[0])[0],
-            SqliteValue::Text("no match".to_owned())
+            SqliteValue::Text("no match".into())
         );
     }
 
@@ -2371,10 +2329,7 @@ mod tests {
         let rows = conn
             .query("SELECT CASE NULL WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'none' END;")
             .unwrap();
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("none".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("none".into()));
     }
 
     #[test]
@@ -2384,7 +2339,7 @@ mod tests {
         let rows = conn
             .query("SELECT CASE 1 WHEN NULL THEN 'bad' WHEN 1 THEN 'ok' ELSE 'miss' END;")
             .unwrap();
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -2400,14 +2355,8 @@ mod tests {
                 "SELECT id, CASE val WHEN 'x' THEN 'found' ELSE 'other' END AS r FROM cj ORDER BY id;",
             )
             .unwrap();
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("other".to_owned())
-        );
-        assert_eq!(
-            row_values(&rows[1])[1],
-            SqliteValue::Text("found".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("other".into()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Text("found".into()));
     }
 
     #[test]
@@ -2469,10 +2418,7 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (1, '  hello  ');")
             .unwrap();
         let rows = conn.query("SELECT UPPER(TRIM(val)) FROM t;").unwrap();
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("HELLO".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("HELLO".into()));
     }
 
     #[test]
@@ -2500,7 +2446,7 @@ mod tests {
         // C SQLite: hex(NULL) returns '' (empty string), not NULL.
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT HEX(NULL);").unwrap();
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text(String::new()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("".into()));
     }
 
     #[test]
@@ -2524,9 +2470,9 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         // Negative start counts from right: -1 = last char.
         let rows = conn.query("SELECT SUBSTR('hello', -1);").unwrap();
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("o".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("o".into()));
         let rows = conn.query("SELECT SUBSTR('hello', -3);").unwrap();
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("llo".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("llo".into()));
     }
 
     #[test]
@@ -2724,7 +2670,7 @@ mod tests {
         let rows = conn
             .query("SELECT id, NULLIF(val, 'skip') FROM t ORDER BY id;")
             .unwrap();
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("x".into()));
         assert_eq!(row_values(&rows[1])[1], SqliteValue::Null);
     }
 
@@ -2738,11 +2684,8 @@ mod tests {
         let rows = conn
             .query("SELECT id, IIF(val > 10, 'big', 'small') FROM t ORDER BY id;")
             .unwrap();
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("small".to_owned())
-        );
-        assert_eq!(row_values(&rows[1])[1], SqliteValue::Text("big".to_owned()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("small".into()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Text("big".into()));
     }
 
     #[test]
@@ -2759,9 +2702,9 @@ mod tests {
             .query("SELECT DISTINCT val FROM t ORDER BY val;")
             .unwrap();
         assert_eq!(rows.len(), 3, "DISTINCT should return 3 unique values");
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".to_owned()));
-        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("b".to_owned()));
-        assert_eq!(row_values(&rows[2])[0], SqliteValue::Text("c".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("b".into()));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Text("c".into()));
     }
 
     #[test]
@@ -2790,7 +2733,7 @@ mod tests {
             .unwrap();
         let rows = conn.query("SELECT id, val FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("new".to_owned()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("new".into()));
     }
 
     #[test]
@@ -2803,10 +2746,7 @@ mod tests {
             .unwrap();
         let rows = conn.query("SELECT id, val FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("first".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("first".into()));
     }
 
     #[test]
@@ -2855,14 +2795,8 @@ mod tests {
             .query("SELECT name FROM t WHERE name LIKE '%li%' ORDER BY name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("Alice".to_owned())
-        );
-        assert_eq!(
-            row_values(&rows[1])[0],
-            SqliteValue::Text("Charlie".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("Charlie".into()));
     }
 
     #[test]
@@ -2882,8 +2816,8 @@ mod tests {
             conn.query("SELECT val FROM t1 WHERE id IN (SELECT t1_id FROM t2) ORDER BY val;");
         if let Ok(rows) = result {
             assert_eq!(rows.len(), 2);
-            assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".to_owned()));
-            assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("c".to_owned()));
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".into()));
+            assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("c".into()));
         } else {
             // IN subquery not yet supported — that's fine for now
         }
@@ -2904,7 +2838,7 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("Alice".to_owned()),
+                SqliteValue::Text("Alice".into()),
                 SqliteValue::Integer(30),
             ]
         );
@@ -2922,10 +2856,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("Bob".to_owned()),
-                SqliteValue::Integer(25),
-            ]
+            vec![SqliteValue::Text("Bob".into()), SqliteValue::Integer(25),]
         );
     }
 
@@ -2981,7 +2912,7 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("Alice".to_owned()),
+                SqliteValue::Text("Alice".into()),
                 SqliteValue::Integer(31),
             ]
         );
@@ -3015,7 +2946,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "DELETE RETURNING should produce 1 row");
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("Bob".to_owned()),]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("Bob".into()),]
         );
         // Verify the row is actually deleted
         let remaining = conn.query("SELECT COUNT(*) FROM t;").unwrap();
@@ -3067,7 +2998,7 @@ mod tests {
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
         assert_eq!(
             row_values(&rows[0])[1],
-            SqliteValue::Text("active".to_string()),
+            SqliteValue::Text("active".to_string().into()),
             "status should use DEFAULT 'active'"
         );
         assert_eq!(
@@ -3094,10 +3025,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
         assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(42));
-        assert_eq!(
-            row_values(&rows[0])[2],
-            SqliteValue::Text("hello".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[2], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -3141,11 +3069,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0])[1],
-            SqliteValue::Text("alice".to_string())
+            SqliteValue::Text("alice".to_string().into())
         );
         assert_eq!(
             row_values(&rows[0])[2],
-            SqliteValue::Text("pending".to_string()),
+            SqliteValue::Text("pending".to_string().into()),
             "omitted column should use DEFAULT 'pending'"
         );
     }
@@ -3274,7 +3202,7 @@ mod tests {
             .unwrap();
         let vals = row_values(&rows[0]);
         assert_eq!(vals[0], SqliteValue::Integer(42));
-        assert_eq!(vals[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(vals[1], SqliteValue::Text("x".into()));
     }
 
     /// SELECT after INSERT should see the correct IPK values.
@@ -3288,10 +3216,7 @@ mod tests {
         let rows = conn.query("SELECT * FROM t ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(42));
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("Alice".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("Alice".into()));
         assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(100));
     }
 
@@ -3313,14 +3238,14 @@ mod tests {
         );
         assert_eq!(
             vals[1],
-            SqliteValue::Text("Alice".to_owned()),
+            SqliteValue::Text("Alice".into()),
             "name should be Alice (from column-list position 0)"
         );
         // Also verify via SELECT that the stored record is correct.
         let sel = conn.query("SELECT id, name FROM t;").unwrap();
         let sv = row_values(&sel[0]);
         assert_eq!(sv[0], SqliteValue::Integer(42));
-        assert_eq!(sv[1], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(sv[1], SqliteValue::Text("Alice".into()));
     }
 
     #[test]
@@ -3336,10 +3261,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("seed".to_owned()),
-                SqliteValue::Integer(11)
-            ]
+            vec![SqliteValue::Text("seed".into()), SqliteValue::Integer(11)]
         );
 
         let rows = conn
@@ -3347,10 +3269,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("fresh".to_owned()),
-                SqliteValue::Integer(22)
-            ]
+            vec![SqliteValue::Text("fresh".into()), SqliteValue::Integer(22)]
         );
     }
 
@@ -3364,7 +3283,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(7), SqliteValue::Text("x".to_owned())]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("x".into())]
         );
     }
 
@@ -3401,12 +3320,12 @@ mod tests {
             .unwrap();
         let vals = row_values(&rows[0]);
         assert_eq!(vals[0], SqliteValue::Integer(42));
-        assert_eq!(vals[1], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(vals[1], SqliteValue::Text("Alice".into()));
 
         let sel = conn.query("SELECT id, name FROM t;").unwrap();
         let stored = row_values(&sel[0]);
         assert_eq!(stored[0], SqliteValue::Integer(42));
-        assert_eq!(stored[1], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(stored[1], SqliteValue::Text("Alice".into()));
     }
 
     #[test]
@@ -3420,13 +3339,13 @@ mod tests {
         let vals = row_values(&rows[0]);
         assert_eq!(vals[0], SqliteValue::Integer(7));
         assert_eq!(vals[1], SqliteValue::Integer(7));
-        assert_eq!(vals[2], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(vals[2], SqliteValue::Text("Bob".into()));
 
         let sel = conn.query("SELECT id, rowid, name FROM t;").unwrap();
         let stored = row_values(&sel[0]);
         assert_eq!(stored[0], SqliteValue::Integer(7));
         assert_eq!(stored[1], SqliteValue::Integer(7));
-        assert_eq!(stored[2], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(stored[2], SqliteValue::Text("Bob".into()));
     }
 
     #[test]
@@ -3447,7 +3366,7 @@ mod tests {
             .unwrap();
         let vals = row_values(&rows[0]);
         assert_eq!(vals[0], SqliteValue::Integer(1));
-        assert_eq!(vals[1], SqliteValue::Text("dup".to_owned()));
+        assert_eq!(vals[1], SqliteValue::Text("dup".into()));
         assert_eq!(vals[2], SqliteValue::Integer(8));
     }
 
@@ -3521,7 +3440,7 @@ mod tests {
             "omitted IPK should auto-generate, got {:?}",
             vals[0]
         );
-        assert_eq!(vals[1], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(vals[1], SqliteValue::Text("Bob".into()));
     }
 
     /// DELETE then reinsert with same IPK should work.
@@ -3539,7 +3458,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0])[0],
-            SqliteValue::Text("reinserted".to_owned())
+            SqliteValue::Text("reinserted".into())
         );
     }
 
@@ -3591,7 +3510,7 @@ mod tests {
             .query("SELECT c FROM t WHERE a = 1 AND b = 20;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("y".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("y".into()));
 
         // Query using only first column prefix.
         let rows = conn.query("SELECT c FROM t WHERE a = 1;").unwrap();
@@ -4140,10 +4059,7 @@ mod tests {
         // Index on IPK should work.
         let rows = conn.query("SELECT name FROM t WHERE id = 100;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("alice".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("alice".into()));
     }
 
     // ── Mixed operations sequence ─────────────────────────────────────────────
@@ -4491,13 +4407,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let vals = row_values(&rows[0]);
         // SQLite behavior: '3.0e+5' → NUMERIC → integer 300000
-        assert_eq!(vals[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(vals[0], SqliteValue::Text("integer".into()));
         assert_eq!(vals[1], SqliteValue::Integer(300_000));
         // 123 into TEXT → text "123"
-        assert_eq!(vals[2], SqliteValue::Text("text".to_owned()));
-        assert_eq!(vals[3], SqliteValue::Text("123".to_owned()));
+        assert_eq!(vals[2], SqliteValue::Text("text".into()));
+        assert_eq!(vals[3], SqliteValue::Text("123".into()));
         // '0042' into INTEGER → integer 42
-        assert_eq!(vals[4], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(vals[4], SqliteValue::Text("integer".into()));
         assert_eq!(vals[5], SqliteValue::Integer(42));
     }
 
@@ -4559,10 +4475,7 @@ mod tests {
             .query("SELECT typeof(9223372036854775807 + 1)")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("real".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("real".into()));
     }
 
     #[test]
@@ -4573,10 +4486,7 @@ mod tests {
             .query("SELECT typeof(-9223372036854775808 - 1)")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("real".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("real".into()));
     }
 
     #[test]
@@ -4594,10 +4504,7 @@ mod tests {
         let rows = conn.query("SELECT id, note FROM q5 ORDER BY id").unwrap();
         assert_eq!(rows.len(), 1, "ROLLBACK TO s1 should undo inner insert");
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("outer".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("outer".into()));
     }
 
     #[test]
@@ -4776,7 +4683,7 @@ mod tests {
         let a_val = &row_values(&rows[0])[1];
         match a_val {
             SqliteValue::Text(s) => {
-                assert!(s == "x,y" || s == "y,x", "group_concat for 'a' = {s}");
+                assert!(&**s == "x,y" || &**s == "y,x", "group_concat for 'a' = {s}");
             }
             other => panic!("expected Text, got {other:?}"),
         }
@@ -5054,7 +4961,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let city = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 let cnt = match vals[1] {
@@ -5087,7 +4994,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let city = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 let cnt = match vals[1] {
@@ -5323,11 +5230,11 @@ mod tests {
             .map(|r| {
                 let v = row_values(r);
                 let name = match &v[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     other => panic!("expected Text, got {other:?}"),
                 };
                 let item = match &v[1] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     other => panic!("expected Text, got {other:?}"),
                 };
                 (name, item)
@@ -5365,11 +5272,11 @@ mod tests {
             .map(|r| {
                 let v = row_values(r);
                 let val = match &v[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     other => panic!("expected Text, got {other:?}"),
                 };
                 let info = match &v[1] {
-                    SqliteValue::Text(s) => Some(s.clone()),
+                    SqliteValue::Text(s) => Some(s.to_string()),
                     SqliteValue::Null => None,
                     other => panic!("expected Text or Null, got {other:?}"),
                 };
@@ -5666,7 +5573,7 @@ mod tests {
                 (
                     vals[0].to_integer(),
                     match &vals[1] {
-                        SqliteValue::Text(s) => s.clone(),
+                        SqliteValue::Text(s) => s.to_string(),
                         _ => panic!("expected text"),
                     },
                 )
@@ -5743,7 +5650,7 @@ mod tests {
         let results: Vec<String> = rows
             .iter()
             .map(|r| match &row_values(r)[0] {
-                SqliteValue::Text(s) => s.clone(),
+                SqliteValue::Text(s) => s.to_string(),
                 _ => panic!("expected text"),
             })
             .collect();
@@ -5829,7 +5736,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let name = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 (name, vals[1].to_integer())
@@ -5862,11 +5769,11 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let dept = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 let name = match &vals[1] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 (dept, name, vals[2].to_integer())
@@ -5903,7 +5810,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let name = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 (name, vals[1].to_integer(), vals[2].to_integer())
@@ -5962,7 +5869,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let name = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 (name, vals[1].to_integer(), vals[2].to_integer())
@@ -6033,7 +5940,7 @@ mod tests {
                 let vals = row_values(r);
                 (
                     match &vals[0] {
-                        SqliteValue::Text(s) => s.clone(),
+                        SqliteValue::Text(s) => s.to_string(),
                         _ => panic!("expected text"),
                     },
                     vals[1].to_integer(),
@@ -6110,7 +6017,7 @@ mod tests {
         let results: Vec<String> = rows
             .iter()
             .map(|r| match &row_values(r)[0] {
-                SqliteValue::Text(s) => s.clone(),
+                SqliteValue::Text(s) => s.to_string(),
                 _ => panic!("expected text"),
             })
             .collect();
@@ -6157,7 +6064,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let cat = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 (cat, vals[1].to_integer())
@@ -6202,7 +6109,7 @@ mod tests {
         let results: Vec<String> = rows
             .iter()
             .map(|r| match &row_values(r)[0] {
-                SqliteValue::Text(s) => s.clone(),
+                SqliteValue::Text(s) => s.to_string(),
                 _ => panic!("expected text"),
             })
             .collect();
@@ -6235,11 +6142,11 @@ mod tests {
             .unwrap();
         let vals = row_values(&rows[0]);
         let a = match &vals[0] {
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             _ => panic!("expected text"),
         };
         let b = match &vals[1] {
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             _ => panic!("expected text"),
         };
         assert_eq!(a, "yes");
@@ -6257,7 +6164,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         let val = match &row_values(&rows[0])[0] {
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             _ => panic!("expected text"),
         };
         assert_eq!(val, "100% done");
@@ -6302,7 +6209,7 @@ mod tests {
             .unwrap();
         let rows = conn.query("SELECT v FROM t WHERE id = 1;").unwrap();
         let val = match &row_values(&rows[0])[0] {
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             _ => panic!("expected text"),
         };
         assert_eq!(val, "first");
@@ -6318,7 +6225,7 @@ mod tests {
             .unwrap();
         let rows = conn.query("SELECT v FROM t WHERE id = 1;").unwrap();
         let val = match &row_values(&rows[0])[0] {
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             _ => panic!("expected text"),
         };
         assert_eq!(val, "second");
@@ -6361,7 +6268,7 @@ mod tests {
             .map(|r| {
                 let vals = row_values(r);
                 let cat = match &vals[0] {
-                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Text(s) => s.to_string(),
                     _ => panic!("expected text"),
                 };
                 (cat, vals[1].to_integer())
@@ -6453,7 +6360,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         let val = match &row_values(&rows[0])[0] {
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             _ => panic!("expected text"),
         };
         assert_eq!(val, "456");
@@ -9189,7 +9096,7 @@ mod tests {
             .query("SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) >= 3;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("B".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("B".into()));
     }
 
     #[test]
@@ -9204,7 +9111,7 @@ mod tests {
             .query("SELECT product FROM sales GROUP BY product HAVING SUM(amount) > 50;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("Y".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("Y".into()));
     }
 
     #[test]

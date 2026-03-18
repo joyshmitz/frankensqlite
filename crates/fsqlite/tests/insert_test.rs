@@ -20,9 +20,6 @@ fn test_insert_test() {
     println!("dst row 0: {:?}", rows2[0].values());
     assert_eq!(
         rows2[0].values(),
-        &[
-            SqliteValue::Text("ten".to_string()),
-            SqliteValue::Integer(10)
-        ]
+        &[SqliteValue::Text("ten".into()), SqliteValue::Integer(10)]
     );
 }

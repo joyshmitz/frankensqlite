@@ -20,6 +20,8 @@
 //! assert_eq!(result.current, 2);
 //! ```
 
+use std::sync::Arc;
+
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
@@ -194,7 +196,7 @@ impl MigrationRunner {
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(migration.version),
-                SqliteValue::Text(migration.name.to_owned().into()),
+                SqliteValue::Text(Arc::from(migration.name)),
             ],
         )?;
         Ok(())
@@ -394,7 +396,7 @@ mod tests {
             other => panic!("expected Integer(1), got {other:?}"),
         }
         match rows[0].get(1) {
-            Some(SqliteValue::Text(s)) if s == "initial_schema" => {}
+            Some(SqliteValue::Text(s)) if &**s == "initial_schema" => {}
             other => panic!("expected Text('initial_schema'), got {other:?}"),
         }
         match rows[1].get(0) {
@@ -402,7 +404,7 @@ mod tests {
             other => panic!("expected Integer(2), got {other:?}"),
         }
         match rows[1].get(1) {
-            Some(SqliteValue::Text(s)) if s == "add_index" => {}
+            Some(SqliteValue::Text(s)) if &**s == "add_index" => {}
             other => panic!("expected Text('add_index'), got {other:?}"),
         }
     }
@@ -466,7 +468,7 @@ mod tests {
         assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
         assert_eq!(
             rows[0].get(1),
-            Some(&SqliteValue::Text("create_items".to_owned()))
+            Some(&SqliteValue::Text("create_items".into()))
         );
     }
 
@@ -485,7 +487,7 @@ mod tests {
             "INSERT INTO _schema_migrations(version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(2),
-                SqliteValue::Text("already_applied".to_owned()),
+                SqliteValue::Text("already_applied".into()),
             ],
         )
         .unwrap();

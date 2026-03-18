@@ -62,7 +62,7 @@ fn fresh_database_applies_all_migrations() {
     let row = conn
         .query_row("SELECT model FROM conversations WHERE id = 's-001'")
         .unwrap();
-    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("opus".to_string()));
+    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("opus".into()));
 }
 
 // ===========================================================================
@@ -120,7 +120,7 @@ fn partial_resume_only_applies_new_migrations() {
     let row = conn
         .query_row("SELECT description FROM items WHERE id = 1")
         .unwrap();
-    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("desc".to_string()));
+    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("desc".into()));
 }
 
 // ===========================================================================
@@ -235,12 +235,12 @@ fn migration_records_name_in_tracking_table() {
     assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
     assert_eq!(
         rows[0].get(1).unwrap(),
-        &SqliteValue::Text("init_schema".to_string())
+        &SqliteValue::Text("init_schema".into())
     );
     assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(2));
     assert_eq!(
         rows[1].get(1).unwrap(),
-        &SqliteValue::Text("add_index".to_string())
+        &SqliteValue::Text("add_index".into())
     );
 }
 

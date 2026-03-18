@@ -27,10 +27,7 @@ fn params_macro_mixed_types_correct_values() {
     let p = params![1_i64, "hello", 3.14_f64];
     assert_eq!(p.len(), 3);
     assert_eq!(p[0].as_sqlite_value(), &SqliteValue::Integer(1));
-    assert_eq!(
-        p[1].as_sqlite_value(),
-        &SqliteValue::Text("hello".to_string())
-    );
+    assert_eq!(p[1].as_sqlite_value(), &SqliteValue::Text("hello".into()));
     assert_eq!(p[2].as_sqlite_value(), &SqliteValue::Float(3.14));
 }
 
@@ -51,7 +48,10 @@ fn params_macro_bool_true_and_false() {
 #[test]
 fn params_macro_blob() {
     let p = params![vec![1_u8, 2, 3]];
-    assert_eq!(p[0].as_sqlite_value(), &SqliteValue::Blob(vec![1, 2, 3]));
+    assert_eq!(
+        p[0].as_sqlite_value(),
+        &SqliteValue::Blob(vec![1, 2, 3].into())
+    );
 }
 
 #[test]
@@ -109,17 +109,17 @@ fn param_value_from_usize() {
 #[test]
 fn param_value_from_string_and_str() {
     let p: ParamValue = "hello".into();
-    assert_eq!(p.into_inner(), SqliteValue::Text("hello".to_string()));
+    assert_eq!(p.into_inner(), SqliteValue::Text("hello".into()));
 
     let p: ParamValue = String::from("world").into();
-    assert_eq!(p.into_inner(), SqliteValue::Text("world".to_string()));
+    assert_eq!(p.into_inner(), SqliteValue::Text("world".into()));
 }
 
 #[test]
 fn param_value_from_byte_slice() {
     let data: &[u8] = &[0xDE, 0xAD];
     let p: ParamValue = data.into();
-    assert_eq!(p.into_inner(), SqliteValue::Blob(vec![0xDE, 0xAD]));
+    assert_eq!(p.into_inner(), SqliteValue::Blob(vec![0xDE, 0xAD].into()));
 }
 
 // ===========================================================================
@@ -263,7 +263,7 @@ fn execute_params_inserts_rows() {
     assert_eq!(changed, 1);
 
     let row = conn.query_row("SELECT val FROM t WHERE id = 1").unwrap();
-    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("hello".to_string()));
+    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("hello".into()));
 }
 
 // ===========================================================================
@@ -349,7 +349,7 @@ fn transaction_commit_persists_data() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("committed".to_string())
+        &SqliteValue::Text("committed".into())
     );
 }
 
@@ -391,20 +391,14 @@ fn transaction_execute_with_params() {
         let tx = conn.transaction().unwrap();
         tx.execute_with_params(
             "INSERT INTO t VALUES (?1, ?2)",
-            &[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("in_tx".to_string()),
-            ],
+            &[SqliteValue::Integer(1), SqliteValue::Text("in_tx".into())],
         )
         .unwrap();
         tx.commit().unwrap();
     }
 
     let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Text("in_tx".to_string())
-    );
+    assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("in_tx".into()));
 }
 
 #[test]
@@ -434,10 +428,7 @@ fn transaction_execute_params_compat() {
     tx.commit().unwrap();
 
     let row = conn.query_row("SELECT val FROM t WHERE id = 1").unwrap();
-    assert_eq!(
-        row.get(0).unwrap(),
-        &SqliteValue::Text("via_params".to_string())
-    );
+    assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("via_params".into()));
 }
 
 // ===========================================================================
@@ -557,7 +548,7 @@ fn param_slice_to_values_converts_correctly() {
     let p = params![42_i64, "text"];
     let values = param_slice_to_values(p);
     assert_eq!(values[0], SqliteValue::Integer(42));
-    assert_eq!(values[1], SqliteValue::Text("text".to_string()));
+    assert_eq!(values[1], SqliteValue::Text("text".into()));
 }
 
 #[test]
@@ -704,7 +695,7 @@ mod rusqlite_parity {
             SqliteValue::Null => "NULL".to_string(),
             SqliteValue::Integer(i) => i.to_string(),
             SqliteValue::Float(f) => format!("{f}"),
-            SqliteValue::Text(s) => s.clone(),
+            SqliteValue::Text(s) => s.to_string(),
             SqliteValue::Blob(b) => format!("{b:?}"),
         }
     }
@@ -1049,8 +1040,8 @@ mod rusqlite_parity {
             rows[0].values(),
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("slug-001".to_owned()),
-                SqliteValue::Text("/path/001".to_owned()),
+                SqliteValue::Text("slug-001".into()),
+                SqliteValue::Text("/path/001".into()),
                 SqliteValue::Integer(1_773_076_744_605_941),
             ]
         );
@@ -1058,8 +1049,8 @@ mod rusqlite_parity {
             rows[1].values(),
             vec![
                 SqliteValue::Integer(2),
-                SqliteValue::Text("slug-002".to_owned()),
-                SqliteValue::Text("/path/002".to_owned()),
+                SqliteValue::Text("slug-002".into()),
+                SqliteValue::Text("/path/002".into()),
                 SqliteValue::Integer(1_773_076_744_605_942),
             ]
         );
@@ -1073,8 +1064,8 @@ mod rusqlite_parity {
             row.values(),
             vec![
                 SqliteValue::Integer(2),
-                SqliteValue::Text("slug-002".to_owned()),
-                SqliteValue::Text("/path/002".to_owned()),
+                SqliteValue::Text("slug-002".into()),
+                SqliteValue::Text("/path/002".into()),
                 SqliteValue::Integer(1_773_076_744_605_942),
             ]
         );
