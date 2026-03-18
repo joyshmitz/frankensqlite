@@ -249,9 +249,11 @@ impl ConcurrentHandle {
     }
 
     /// Returns the set of pages in the write set.
+    /// Uses SmallVec to avoid heap allocation for typical transactions (≤16 pages).
     #[must_use]
-    pub fn write_set_pages(&self) -> Vec<PageNumber> {
-        let mut pages = self.tracked_write_conflict_pages_iter().collect::<Vec<_>>();
+    pub fn write_set_pages(&self) -> smallvec::SmallVec<[PageNumber; 16]> {
+        let mut pages: smallvec::SmallVec<[PageNumber; 16]> =
+            self.tracked_write_conflict_pages_iter().collect();
         pages.sort_unstable();
         pages
     }
@@ -1372,6 +1374,30 @@ fn release_tracked_page_locks(
     lock_table.release_set(handle.held_lock_pages_iter(), txn_id);
 }
 
+fn merge_unique_incoming_edges(
+    incoming_edges: &mut Vec<DiscoveredEdge>,
+    seen_sources: &mut HashSet<TxnToken>,
+    discovered_edges: impl IntoIterator<Item = DiscoveredEdge>,
+) {
+    for edge in discovered_edges {
+        if seen_sources.insert(edge.from) {
+            incoming_edges.push(edge);
+        }
+    }
+}
+
+fn merge_unique_outgoing_edges(
+    outgoing_edges: &mut Vec<DiscoveredEdge>,
+    seen_targets: &mut HashSet<TxnToken>,
+    discovered_edges: impl IntoIterator<Item = DiscoveredEdge>,
+) {
+    for edge in discovered_edges {
+        if seen_targets.insert(edge.to) {
+            outgoing_edges.push(edge);
+        }
+    }
+}
+
 /// SSI validation result for concurrent commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SsiResult {
@@ -1894,7 +1920,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             Ok((
                 handle.token(),
                 handle.begin_seq(),
-                handle.write_set_pages(),
+                handle.write_set_pages().into_vec(),
                 handle.held_lock_pages(),
                 handle.is_marked_for_abort(),
             ))
@@ -2189,85 +2215,81 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &write_key_summary,
+        write_key_summary,
     );
     let committed_reader_candidates = registry.committed_reader_candidates(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &write_key_summary,
+        write_key_summary,
     );
     let active_writer_candidates = active_index.outgoing_candidate_refs(
         &active_views,
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &read_key_summary,
+        read_key_summary,
     );
     let committed_writer_candidates = registry.committed_writer_candidates(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &read_key_summary,
+        read_key_summary,
     );
 
     let mut incoming_edges = prepared.incoming_edges.clone();
-    for edge in discover_incoming_edges(
-        prepared.txn_token,
-        prepared.begin_seq,
-        committed_seq,
-        &write_keys,
-        &active_reader_candidates,
-        &[],
-    ) {
-        if incoming_edges
-            .iter()
-            .all(|existing| existing.from != edge.from)
-        {
-            incoming_edges.push(edge);
-        }
-    }
-    for edge in discover_incoming_edges(
-        prepared.txn_token,
-        prepared.begin_seq,
-        committed_seq,
-        &write_keys,
-        &[],
-        &committed_reader_candidates,
-    ) {
-        if incoming_edges
-            .iter()
-            .all(|existing| existing.from != edge.from)
-        {
-            incoming_edges.push(edge);
-        }
-    }
+    let mut incoming_sources = incoming_edges.iter().map(|edge| edge.from).collect();
+    merge_unique_incoming_edges(
+        &mut incoming_edges,
+        &mut incoming_sources,
+        discover_incoming_edges(
+            prepared.txn_token,
+            prepared.begin_seq,
+            committed_seq,
+            write_keys,
+            &active_reader_candidates,
+            &[],
+        ),
+    );
+    merge_unique_incoming_edges(
+        &mut incoming_edges,
+        &mut incoming_sources,
+        discover_incoming_edges(
+            prepared.txn_token,
+            prepared.begin_seq,
+            committed_seq,
+            write_keys,
+            &[],
+            &committed_reader_candidates,
+        ),
+    );
 
     let mut outgoing_edges = prepared.outgoing_edges.clone();
-    for edge in discover_outgoing_edges(
-        prepared.txn_token,
-        prepared.begin_seq,
-        committed_seq,
-        &read_keys,
-        &active_writer_candidates,
-        &[],
-    ) {
-        if outgoing_edges.iter().all(|existing| existing.to != edge.to) {
-            outgoing_edges.push(edge);
-        }
-    }
-    for edge in discover_outgoing_edges(
-        prepared.txn_token,
-        prepared.begin_seq,
-        committed_seq,
-        &read_keys,
-        &[],
-        &committed_writer_candidates,
-    ) {
-        if outgoing_edges.iter().all(|existing| existing.to != edge.to) {
-            outgoing_edges.push(edge);
-        }
-    }
+    let mut outgoing_targets = outgoing_edges.iter().map(|edge| edge.to).collect();
+    merge_unique_outgoing_edges(
+        &mut outgoing_edges,
+        &mut outgoing_targets,
+        discover_outgoing_edges(
+            prepared.txn_token,
+            prepared.begin_seq,
+            committed_seq,
+            read_keys,
+            &active_writer_candidates,
+            &[],
+        ),
+    );
+    merge_unique_outgoing_edges(
+        &mut outgoing_edges,
+        &mut outgoing_targets,
+        discover_outgoing_edges(
+            prepared.txn_token,
+            prepared.begin_seq,
+            committed_seq,
+            read_keys,
+            &[],
+            &committed_writer_candidates,
+        ),
+    );
 
     let has_in_rw = !incoming_edges.is_empty();
     let has_out_rw = !outgoing_edges.is_empty();
@@ -2775,7 +2797,7 @@ mod tests {
             let handle = registry.get_mut(s1).expect("handle");
             let mut pages = handle.write_set_pages();
             pages.sort();
-            assert_eq!(pages, vec![test_page(1), test_page(3)]);
+            assert_eq!(pages.as_slice(), &[test_page(1), test_page(3)]);
         }
 
         {
@@ -2823,7 +2845,7 @@ mod tests {
             concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &sp).unwrap();
             assert!(!concurrent_page_is_freed(&handle, test_page(1)));
             assert!(concurrent_read_page(&handle, test_page(1)).is_some());
-            assert_eq!(handle.write_set_pages(), vec![test_page(1)]);
+            assert_eq!(handle.write_set_pages().as_slice(), &[test_page(1)]);
         }
     }
 
@@ -2866,7 +2888,7 @@ mod tests {
         assert!(concurrent_page_is_freed(&handle, test_page(5)));
         assert!(concurrent_read_page(&handle, test_page(5)).is_none());
         assert_eq!(handle.write_set_len(), 0);
-        assert_eq!(handle.write_set_pages(), vec![test_page(5)]);
+        assert_eq!(handle.write_set_pages().as_slice(), &[test_page(5)]);
     }
 
     #[test]

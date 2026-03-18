@@ -106,6 +106,7 @@ fn strip_trailing_spaces(s: &[u8]) -> &[u8] {
 ///
 /// Pre-populated with the three built-in collations: BINARY, NOCASE, RTRIM.
 /// Custom collations can be registered via [`CollationRegistry::register`].
+#[derive(Clone)]
 pub struct CollationRegistry {
     collations: HashMap<String, Arc<dyn CollationFunction>>,
 }

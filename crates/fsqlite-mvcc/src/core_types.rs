@@ -266,10 +266,12 @@ type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHa
 /// For page numbers > 65536, falls back to sharded Mutex+HashMap buckets
 /// (same as before).
 ///
-/// Supports a rolling rebuild protocol (§5.6.3.1) where the table can operate
-/// in dual-table mode: an **active** table for new acquisitions and a
-/// **draining** table that is consulted for existing locks during the drain
-/// phase. This avoids stop-the-world abort storms during maintenance.
+/// Supports a rolling rebuild protocol (§5.6.3.1) for the sharded fallback
+/// table, where the table can operate in dual-table mode: an **active** table
+/// for new acquisitions and a **draining** table that is consulted for
+/// existing sharded locks during the drain phase. Fast-array locks remain in
+/// place and are cleaned separately during full rebuilds, avoiding
+/// stop-the-world abort storms during maintenance.
 pub struct InProcessPageLockTable {
     /// Lock-free fast path: flat atomic array for pages 1..=65536.
     /// Slot value 0 = unlocked; non-zero = TxnId.get() of the holder.
@@ -427,14 +429,18 @@ impl InProcessPageLockTable {
     /// Returns `Ok(())` if the lock was acquired, or `Err(holder)` with the
     /// `TxnId` of the current holder if the page is already locked.
     ///
-    /// During a rolling rebuild (§5.6.3.1), this checks the draining table
-    /// first. A lock in the draining table is still valid and blocks new
-    /// acquisitions by other transactions.
+    /// For pages above `FAST_LOCK_ARRAY_SIZE`, a rolling rebuild (§5.6.3.1)
+    /// checks the draining table first. A lock in the draining table is still
+    /// valid and blocks new acquisitions by other transactions.
     pub fn try_acquire(&self, page: PageNumber, txn: TxnId) -> Result<(), TxnId> {
-        // Step 0: Check draining table — but ONLY if a rebuild is in progress.
-        // Rolling rebuilds are extremely rare (maintenance-only), so the
-        // AtomicBool fast-path avoids taking the draining mutex on every call.
-        if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
+        let pgno = page.get() as usize;
+
+        // Step 0: During rebuilds, only sharded pages can exist in draining.
+        // begin_rebuild() rotates the sharded fallback table, while fast-path
+        // pages remain resident in fast_locks throughout the rebuild.
+        if pgno > FAST_LOCK_ARRAY_SIZE
+            && self.has_draining.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let draining_guard = self.draining.lock();
             if let Some(ref draining) = *draining_guard {
                 let shard_idx = Self::shard_index_static(page);
@@ -455,8 +461,6 @@ impl InProcessPageLockTable {
                 }
             }
         }
-
-        let pgno = page.get() as usize;
 
         // Step 1 (Hekaton fast path): For pages 1..=65536, use lock-free CAS
         // on the flat atomic array — no Mutex, no HashMap, zero contention.
@@ -504,8 +508,9 @@ impl InProcessPageLockTable {
 
     /// Release the lock on `page` held by `txn`.
     ///
-    /// Checks both active and draining tables. Returns `true` if the lock was
-    /// released from either table.
+    /// Pages above `FAST_LOCK_ARRAY_SIZE` also consult the draining shard
+    /// table during rolling rebuilds. Returns `true` if the lock was released
+    /// from either location.
     pub fn release(&self, page: PageNumber, txn: TxnId) -> bool {
         let pgno = page.get() as usize;
 
@@ -521,14 +526,13 @@ impl InProcessPageLockTable {
                 self.notify_waiters();
                 return true;
             }
-            // Not held by us — check draining table below.
+            // Not held by us — fast-array pages never live in draining.
         }
 
-        let shard_idx = Self::shard_index_static(page);
-
-        // Fallback: try sharded active table (for pages > 65536, or if the
-        // fast-path CAS failed because the lock wasn't held by this txn).
+        // Sharded active table (pages > 65536 only — pages 1..=65536
+        // use fast_locks for new acquisitions).
         if pgno > FAST_LOCK_ARRAY_SIZE {
+            let shard_idx = Self::shard_index_static(page);
             let shard = &self.shards[shard_idx];
             let mut map = shard.lock();
             if map.get(&page) == Some(&txn) {
@@ -540,11 +544,14 @@ impl InProcessPageLockTable {
             drop(map);
         }
 
-        // Try draining table only if a rebuild is in progress.
-        if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
+        // Try draining table (sharded pages only) — only if a rebuild is in progress.
+        if pgno > FAST_LOCK_ARRAY_SIZE
+            && self.has_draining.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let draining_guard = self.draining.lock();
             if let Some(ref draining) = *draining_guard {
-                let mut drain_map = draining.shards[shard_idx].lock();
+                let drain_shard_idx = Self::shard_index_static(page);
+                let mut drain_map = draining.shards[drain_shard_idx].lock();
                 if drain_map.get(&page) == Some(&txn) {
                     drain_map.remove(&page);
                     drop(drain_map);
@@ -599,15 +606,15 @@ impl InProcessPageLockTable {
     }
 
     /// Release a specific set of page locks held by `txn`.
+    ///
+    /// Pages above `FAST_LOCK_ARRAY_SIZE` fall back to the draining shard
+    /// table during rolling rebuilds if they are no longer present in the
+    /// active shard table.
     pub fn release_set(&self, pages: impl IntoIterator<Item = PageNumber>, txn: TxnId) {
         let has_drain = self.has_draining.load(std::sync::atomic::Ordering::Relaxed);
-        let draining_guard = if has_drain {
-            Some(self.draining.lock())
-        } else {
-            None
-        };
         let txn_raw = txn.get();
         let mut released_any = false;
+        let mut draining_guard = None;
         for page in pages {
             let pgno = page.get() as usize;
             // Fast path for pages 1..=65536.
@@ -626,7 +633,11 @@ impl InProcessPageLockTable {
             if map.get(&page) == Some(&txn) {
                 map.remove(&page);
                 released_any = true;
-            } else if let Some(ref guard) = draining_guard {
+                continue;
+            }
+            drop(map);
+            if has_drain {
+                let guard = draining_guard.get_or_insert_with(|| self.draining.lock());
                 if let Some(ref draining) = **guard {
                     let mut drain_map = draining.shards[shard_idx].lock();
                     if drain_map.get(&page) == Some(&txn) {
@@ -645,12 +656,15 @@ impl InProcessPageLockTable {
 
     /// Check which txn holds the lock on `page`, if any.
     ///
-    /// Checks both active and draining tables.
+    /// Fast-path pages are resolved from the flat array. Pages above
+    /// `FAST_LOCK_ARRAY_SIZE` also consult the draining shard table when a
+    /// rolling rebuild is in progress.
     #[must_use]
     pub fn holder(&self, page: PageNumber) -> Option<TxnId> {
         let pgno = page.get() as usize;
 
-        // Fast path: check flat atomic array for pages 1..=65536.
+        // Fast path: pages 1..=65536 are served entirely from the flat array.
+        // Rolling rebuild state only applies to the sharded fallback table.
         if pgno <= FAST_LOCK_ARRAY_SIZE {
             let val = self.fast_locks[pgno - 1].load(Ordering::Acquire);
             return if val == 0 {
@@ -660,7 +674,7 @@ impl InProcessPageLockTable {
             };
         }
 
-        // Fallback: check sharded active table.
+        // Pages > 65536: check sharded active table.
         let shard_idx = Self::shard_index_static(page);
         let shard = &self.shards[shard_idx];
         let map = shard.lock();
@@ -673,6 +687,7 @@ impl InProcessPageLockTable {
         if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
             let draining_guard = self.draining.lock();
             if let Some(ref draining) = *draining_guard {
+                let shard_idx = Self::shard_index_static(page);
                 let drain_map = draining.shards[shard_idx].lock();
                 if let Some(&holder) = drain_map.get(&page) {
                     drop(drain_map);
@@ -3551,6 +3566,12 @@ mod tests {
 
     const BEAD_22N12: &str = "bd-22n.12";
 
+    fn sharded_rebuild_page(offset: u32) -> PageNumber {
+        assert!(offset > 0, "offset must keep the page in the sharded range");
+        let base = u32::try_from(FAST_LOCK_ARRAY_SIZE).unwrap();
+        PageNumber::new(base + offset).unwrap()
+    }
+
     #[test]
     fn test_lock_table_rebuild_drains_to_zero_holders() {
         // bd-22n.12: begin_rebuild rotates active → draining, new acquisitions
@@ -3560,9 +3581,9 @@ mod tests {
         let txn1 = TxnId::new(1).unwrap();
         let txn2 = TxnId::new(2).unwrap();
 
-        let p1 = PageNumber::new(1).unwrap();
-        let p2 = PageNumber::new(2).unwrap();
-        let p3 = PageNumber::new(3).unwrap();
+        let p1 = sharded_rebuild_page(1);
+        let p2 = sharded_rebuild_page(2);
+        let p3 = sharded_rebuild_page(3);
 
         // Acquire locks before rebuild.
         table.try_acquire(p1, txn1).unwrap();
@@ -3607,13 +3628,41 @@ mod tests {
     }
 
     #[test]
+    fn test_fast_array_locks_stay_live_across_rebuild() {
+        // bd-22n.12: begin_rebuild rotates only the sharded fallback table.
+        // Fast-array locks stay resident and enforce contention throughout the
+        // rebuild without touching the draining table.
+        let mut table = InProcessPageLockTable::new();
+        let txn1 = TxnId::new(1).unwrap();
+        let txn2 = TxnId::new(2).unwrap();
+        let page = PageNumber::new(1).unwrap();
+
+        table.try_acquire(page, txn1).unwrap();
+        assert_eq!(table.lock_count(), 1);
+
+        table.begin_rebuild().unwrap();
+        assert!(table.is_rebuild_in_progress());
+        assert_eq!(table.draining_lock_count(), 0);
+        assert_eq!(table.lock_count(), 1);
+        assert_eq!(table.holder(page), Some(txn1));
+        assert_eq!(table.try_acquire(page, txn2), Err(txn1));
+
+        table.release_set([page], txn1);
+        assert_eq!(table.holder(page), None);
+        assert_eq!(table.lock_count(), 0);
+
+        let result = table.finalize_rebuild().unwrap();
+        assert_eq!(result.retained, 0);
+    }
+
+    #[test]
     fn test_read_only_txns_dont_block_rebuild() {
         // bd-22n.12 §5.6.3.1: read-only transactions MUST NOT block rebuild.
         // Read-only transactions don't acquire page locks, so the draining table
         // reaches quiescence without waiting for them.
         let mut table = InProcessPageLockTable::new();
         let writer = TxnId::new(1).unwrap();
-        let p1 = PageNumber::new(10).unwrap();
+        let p1 = sharded_rebuild_page(10);
 
         // One writer holds a lock.
         table.try_acquire(p1, writer).unwrap();
@@ -3656,18 +3705,14 @@ mod tests {
 
         // Set up locks: some active, some orphaned (txn crashed).
         for i in 1..=5u32 {
-            table
-                .try_acquire(PageNumber::new(i).unwrap(), txn_a)
-                .unwrap();
+            table.try_acquire(sharded_rebuild_page(i), txn_a).unwrap();
         }
         for i in 6..=10u32 {
-            table
-                .try_acquire(PageNumber::new(i).unwrap(), txn_b)
-                .unwrap();
+            table.try_acquire(sharded_rebuild_page(i), txn_b).unwrap();
         }
         for i in 11..=15u32 {
             table
-                .try_acquire(PageNumber::new(i).unwrap(), txn_orphan)
+                .try_acquire(sharded_rebuild_page(i), txn_orphan)
                 .unwrap();
         }
         assert_eq!(table.lock_count(), 15);
@@ -3728,7 +3773,7 @@ mod tests {
         // bd-22n.12: finalize_rebuild fails if the draining table is not empty.
         let mut table = InProcessPageLockTable::new();
         let txn = TxnId::new(1).unwrap();
-        table.try_acquire(PageNumber::new(1).unwrap(), txn).unwrap();
+        table.try_acquire(sharded_rebuild_page(1), txn).unwrap();
 
         table.begin_rebuild().unwrap();
 
@@ -3748,13 +3793,13 @@ mod tests {
         let crashed_txn = TxnId::new(2).unwrap();
 
         table
-            .try_acquire(PageNumber::new(1).unwrap(), active_txn)
+            .try_acquire(sharded_rebuild_page(1), active_txn)
             .unwrap();
         table
-            .try_acquire(PageNumber::new(2).unwrap(), crashed_txn)
+            .try_acquire(sharded_rebuild_page(2), crashed_txn)
             .unwrap();
         table
-            .try_acquire(PageNumber::new(3).unwrap(), crashed_txn)
+            .try_acquire(sharded_rebuild_page(3), crashed_txn)
             .unwrap();
 
         table.begin_rebuild().unwrap();
@@ -3789,7 +3834,7 @@ mod tests {
         );
 
         for i in 1..=10u32 {
-            table.try_acquire(PageNumber::new(i).unwrap(), txn).unwrap();
+            table.try_acquire(sharded_rebuild_page(i), txn).unwrap();
         }
 
         table.begin_rebuild().unwrap();
@@ -3806,7 +3851,7 @@ mod tests {
 
         // Release some locks.
         for i in 1..=7u32 {
-            table.release(PageNumber::new(i).unwrap(), txn);
+            table.release(sharded_rebuild_page(i), txn);
         }
 
         let progress = table.drain_progress().unwrap();
@@ -3817,7 +3862,7 @@ mod tests {
 
         // Release remaining.
         for i in 8..=10u32 {
-            table.release(PageNumber::new(i).unwrap(), txn);
+            table.release(sharded_rebuild_page(i), txn);
         }
 
         let progress = table.drain_progress().unwrap();
@@ -3836,14 +3881,14 @@ mod tests {
         let txn = TxnId::new(42).unwrap();
 
         // Acquire pre-rebuild.
-        table.try_acquire(PageNumber::new(1).unwrap(), txn).unwrap();
-        table.try_acquire(PageNumber::new(2).unwrap(), txn).unwrap();
+        table.try_acquire(sharded_rebuild_page(1), txn).unwrap();
+        table.try_acquire(sharded_rebuild_page(2), txn).unwrap();
 
         // Rotate.
         table.begin_rebuild().unwrap();
 
         // Acquire post-rebuild.
-        table.try_acquire(PageNumber::new(3).unwrap(), txn).unwrap();
+        table.try_acquire(sharded_rebuild_page(3), txn).unwrap();
 
         assert_eq!(table.draining_lock_count(), 2);
         assert_eq!(table.lock_count(), 1);
@@ -3871,7 +3916,7 @@ mod tests {
             let txn = TxnId::new(u64::try_from(t).unwrap()).unwrap();
             for p in 1..=pages_per_txn {
                 let page_no = (t - 1) * pages_per_txn + p;
-                let page = PageNumber::new(u32::try_from(page_no).unwrap()).unwrap();
+                let page = sharded_rebuild_page(u32::try_from(page_no).unwrap());
                 table.try_acquire(page, txn).unwrap();
             }
         }
@@ -3892,7 +3937,7 @@ mod tests {
             let txn = TxnId::new(u64::try_from(t).unwrap()).unwrap();
             for p in 1..=3_usize {
                 let page_no = 1000 + (t - txn_count - 1) * 3 + p;
-                let page = PageNumber::new(u32::try_from(page_no).unwrap()).unwrap();
+                let page = sharded_rebuild_page(u32::try_from(page_no).unwrap());
                 table.try_acquire(page, txn).unwrap();
             }
         }
@@ -3907,7 +3952,7 @@ mod tests {
             let txn = TxnId::new(u64::try_from(t).unwrap()).unwrap();
             for p in 1..=pages_per_txn {
                 let page_no = (t - 1) * pages_per_txn + p;
-                let page = PageNumber::new(u32::try_from(page_no).unwrap()).unwrap();
+                let page = sharded_rebuild_page(u32::try_from(page_no).unwrap());
                 assert!(
                     table.release(page, txn),
                     "bead_id={BEAD_22N12} case=e2e_old_txn_release t={t} p={page_no}"
@@ -5392,7 +5437,7 @@ mod tests {
         let mut table = InProcessPageLockTable::with_observer(
             obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
         );
-        let page = PageNumber::new(50).unwrap();
+        let page = sharded_rebuild_page(50);
         let txn_a = TxnId::new(1).unwrap();
         let txn_b = TxnId::new(2).unwrap();
 
@@ -5423,7 +5468,7 @@ mod tests {
                 requester,
                 holder,
                 ..
-            } if p.get() == 50 && requester.get() == 2 && holder.get() == 1
+            } if *p == page && requester.get() == 2 && holder.get() == 1
         ));
     }
 

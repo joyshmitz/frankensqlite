@@ -368,6 +368,10 @@ pub struct TransactionManager {
     max_chain_length: usize,
     /// Warning threshold for chain-length pressure.
     chain_length_warning: usize,
+    /// Adaptive chain-length EWMA (§12.1 conformal-inspired).
+    /// Tracks recent observed chain lengths to auto-tune compaction threshold.
+    /// Encoded as fixed-point: value * 256 (to avoid float atomics).
+    chain_ewma_x256: AtomicU64,
     /// Active snapshot highs keyed by txn id (used to derive GC horizon).
     active_snapshot_highs: Mutex<HashMap<TxnId, CommitSeq>>,
     /// Refcounted index of active snapshot highs so the minimum horizon can be
@@ -403,6 +407,8 @@ impl TransactionManager {
             version_guard_registry,
             max_chain_length: DEFAULT_MAX_CHAIN_LENGTH,
             chain_length_warning: DEFAULT_CHAIN_LENGTH_WARNING,
+            // Initial EWMA = 1 (single-version chains) × 256 (fixed-point).
+            chain_ewma_x256: AtomicU64::new(256),
             active_snapshot_highs: Mutex::new(HashMap::new()),
             active_snapshot_high_counts: Mutex::new(BTreeMap::new()),
             cached_gc_horizon: AtomicU64::new(NO_GC_HORIZON),
@@ -737,6 +743,35 @@ impl TransactionManager {
     fn record_chain_length_sample(&self, chain_len: usize) {
         let sample = u64::try_from(chain_len).unwrap_or(u64::MAX);
         GLOBAL_EBR_METRICS.record_chain_length_sample(sample);
+
+        // Update EWMA with α=0.125 (1/8): new = old * 7/8 + sample * 1/8.
+        // Fixed-point × 256 to avoid floating point.
+        let sample_x256 = chain_len.min(1024) as u64 * 256;
+        let _ = self
+            .chain_ewma_x256
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some((old * 7 + sample_x256) / 8)
+            });
+    }
+
+    /// Current adaptive compaction threshold based on observed chain lengths.
+    /// For ordinary chain budgets this is `max(PROACTIVE_COMPACT_THRESHOLD,
+    /// 2 × EWMA)` clamped below `max_chain_length / 2`; for very small
+    /// `max_chain_length` settings it collapses to the reachable upper bound
+    /// instead of panicking.
+    #[must_use]
+    fn adaptive_compact_threshold(&self) -> usize {
+        let ewma_x256 = self.chain_ewma_x256.load(Ordering::Relaxed);
+        let ewma = (ewma_x256 / 256) as usize;
+        // Threshold = 2× EWMA, clamped to [PROACTIVE_COMPACT_THRESHOLD, max_chain_length/2].
+        // Very small max_chain_length settings can make the nominal lower bound
+        // exceed the upper bound (for example 8 > 2 when max_chain_length = 4),
+        // so collapse both ends to the reachable upper bound instead of
+        // panicking in clamp().
+        let upper_bound = (self.max_chain_length / 2).max(1);
+        let lower_bound = PROACTIVE_COMPACT_THRESHOLD.min(upper_bound);
+        let threshold = ewma.saturating_mul(2).clamp(lower_bound, upper_bound);
+        threshold
     }
 
     fn enforce_chain_bound_for_page(&self, pgno: PageNumber) -> Result<(), MvccError> {
@@ -1412,17 +1447,17 @@ impl TransactionManager {
             }
         }
 
-        // Proactive version chain compaction (§8.10): attempt GC on written
-        // pages whose chains now exceed the compaction threshold.  This keeps
-        // average chain lengths short under sustained write workloads.
+        // Proactive version chain compaction (§8.10 + §12.1 adaptive):
+        // attempt GC on written pages whose chains exceed the adaptive
+        // compaction threshold (2× EWMA of observed chain lengths).
         // Cap at 16 pages per commit to bound overhead for bulk writes.
         let horizon = self.eager_gc_horizon();
-        if horizon != CommitSeq::new(NO_GC_HORIZON) {
-            for pgno in txn.write_set.iter().take(16) {
-                let chain_len = self.version_store.chain_length(*pgno);
-                if chain_len > PROACTIVE_COMPACT_THRESHOLD {
-                    self.version_store.prune_page_chain_eager(*pgno, horizon);
-                }
+        let compact_threshold = self.adaptive_compact_threshold();
+        for pgno in txn.write_set.iter().take(16) {
+            let chain_len = self.version_store.chain_length(*pgno);
+            self.record_chain_length_sample(chain_len);
+            if chain_len > compact_threshold {
+                let _ = self.version_store.prune_page_chain_eager(*pgno, horizon);
             }
         }
 
@@ -5796,6 +5831,28 @@ mod tests {
         assert!(
             after.gc_blocked_count > before.gc_blocked_count,
             "blocked backpressure counter should increase after timeout"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_compact_threshold_handles_small_max_chain_length() {
+        let mut mgr = mgr();
+        mgr.set_max_chain_length(4);
+        mgr.chain_ewma_x256
+            .store(32_u64 * 256, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mgr.adaptive_compact_threshold(),
+            2,
+            "threshold should collapse to max_chain_length/2 instead of panicking"
+        );
+
+        mgr.set_max_chain_length(1);
+        mgr.chain_ewma_x256
+            .store(128_u64 * 256, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mgr.adaptive_compact_threshold(),
+            1,
+            "single-version chains should still yield a valid positive threshold"
         );
     }
 

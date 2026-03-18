@@ -270,6 +270,8 @@ pub struct HotPathProfileSnapshot {
     pub prepared_schema_refreshes: u64,
     pub pager_publication_refreshes: u64,
     pub memory_autocommit_fast_path_begins: u64,
+    pub cached_read_snapshot_reuses: u64,
+    pub cached_read_snapshot_parks: u64,
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
@@ -306,6 +308,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PREPARED_SCHEMA_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PAGER_PUBLICATION_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_CACHED_READ_SNAPSHOT_REUSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_CACHED_READ_SNAPSHOT_PARKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_REUSES.store(0, AtomicOrdering::Relaxed);
@@ -337,6 +341,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         pager_publication_refreshes: FSQLITE_PAGER_PUBLICATION_REFRESHES
             .load(AtomicOrdering::Relaxed),
         memory_autocommit_fast_path_begins: FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS
+            .load(AtomicOrdering::Relaxed),
+        cached_read_snapshot_reuses: FSQLITE_CACHED_READ_SNAPSHOT_REUSES
+            .load(AtomicOrdering::Relaxed),
+        cached_read_snapshot_parks: FSQLITE_CACHED_READ_SNAPSHOT_PARKS
             .load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
             .load(AtomicOrdering::Relaxed),
@@ -14269,7 +14277,7 @@ impl Connection {
         read_pages.sort_by_key(|page| page.get());
         read_pages.dedup();
 
-        let mut write_pages = handle.write_set_pages();
+        let mut write_pages: Vec<PageNumber> = handle.write_set_pages().to_vec();
         write_pages.sort_by_key(|page| page.get());
         write_pages.dedup();
 
@@ -17912,11 +17920,8 @@ impl Connection {
             }
             // PRAGMA collation_list — return available collation sequences.
             // Output: seq, name
-            "collation_list" => Ok(self
-                .collation_registry
-                .lock()
-                .map(|registry| registry.names())
-                .unwrap_or_else(|_| CollationRegistry::new().names())
+            "collation_list" => Ok(lock_unpoisoned(self.collation_registry.as_ref())
+                .names()
                 .into_iter()
                 .enumerate()
                 .map(|(idx, name)| Row {
@@ -18857,11 +18862,16 @@ impl Connection {
             })
             .collect();
 
+        // Snapshot collation registry once before the O(N log N) sort.
+        let coll_snap = self
+            .collation_registry
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default();
         keyed_rows.sort_by(|(k1, _), (k2, _)| {
             for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
                 let coll = group_collations.get(i).and_then(|c| c.as_deref());
-                let ord =
-                    cmp_sqlite_values_collated(av, bv, coll, self.collation_registry.as_ref());
+                let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll, &coll_snap);
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -20151,11 +20161,16 @@ impl Connection {
             })
             .collect();
 
+        // Snapshot collation registry once before the O(N log N) sort.
+        let coll_snap = self
+            .collation_registry
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default();
         keyed_rows.sort_by(|(k1, _), (k2, _)| {
             for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
                 let coll = group_collations.get(i).and_then(|c| c.as_deref());
-                let ord =
-                    cmp_sqlite_values_collated(av, bv, coll, self.collation_registry.as_ref());
+                let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll, &coll_snap);
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -31047,12 +31062,22 @@ fn compare_text_bytes_collated(
             .map(|collation| collation.compare(left, right))
     };
 
-    match collation_registry.lock() {
-        Ok(registry) => compare_with(&registry),
-        Err(_) => None,
-    }
-    .or_else(|| compare_with(&CollationRegistry::new()))
-    .unwrap_or_else(|| left.cmp(right))
+    compare_with(&lock_unpoisoned(collation_registry)).unwrap_or_else(|| left.cmp(right))
+}
+
+/// Lock-free variant of [`compare_text_bytes_collated`] using a pre-snapshotted
+/// registry.  Avoids mutex acquisition on every comparison — critical for
+/// O(N log N) sort loops where the lock would be acquired millions of times.
+fn compare_text_bytes_collated_snapshot(
+    left: &[u8],
+    right: &[u8],
+    collation: &str,
+    registry: &CollationRegistry,
+) -> std::cmp::Ordering {
+    registry
+        .find(collation)
+        .map(|coll_fn| coll_fn.compare(left, right))
+        .unwrap_or_else(|| left.cmp(right))
 }
 
 fn cmp_sqlite_values_collated(
@@ -31063,6 +31088,19 @@ fn cmp_sqlite_values_collated(
 ) -> std::cmp::Ordering {
     if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
         return compare_text_bytes_collated(at.as_bytes(), bt.as_bytes(), coll, collation_registry);
+    }
+    cmp_sqlite_values(a, b)
+}
+
+/// Lock-free variant using a pre-snapshotted registry.
+fn cmp_sqlite_values_collated_snapshot(
+    a: &SqliteValue,
+    b: &SqliteValue,
+    collation: Option<&str>,
+    registry: &CollationRegistry,
+) -> std::cmp::Ordering {
+    if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
+        return compare_text_bytes_collated_snapshot(at.as_bytes(), bt.as_bytes(), coll, registry);
     }
     cmp_sqlite_values(a, b)
 }
@@ -31203,6 +31241,11 @@ fn sort_rows_by_order_terms(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Snapshot collation registry once before the sort to avoid locking the
+    // mutex on every comparison (§14.9 seqlock-inspired optimization).
+    // Under O(N log N) sorting, this eliminates N×log(N) mutex acquisitions.
+    let coll_snapshot = lock_unpoisoned(collation_registry).clone();
+
     rows.sort_by(|a, b| {
         for (idx, desc, nulls, coll) in &resolved {
             let av = &a.values()[*idx];
@@ -31223,7 +31266,7 @@ fn sort_rows_by_order_terms(
                 };
                 return ord;
             }
-            let ord = cmp_sqlite_values_collated(av, bv, coll.as_deref(), collation_registry);
+            let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll.as_deref(), &coll_snapshot);
             let ord = if *desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -34074,12 +34117,12 @@ fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerF
                 }
             }
             for ordering in &mut delete.order_by {
-                bind_trigger_columns_in_expr(&mut ordering.expr, frame);
+                bind_trigger_prefixed_only_in_expr(&mut ordering.expr, frame);
             }
             if let Some(limit_clause) = &mut delete.limit {
-                bind_trigger_columns_in_expr(&mut limit_clause.limit, frame);
+                bind_trigger_prefixed_only_in_expr(&mut limit_clause.limit, frame);
                 if let Some(offset) = &mut limit_clause.offset {
-                    bind_trigger_columns_in_expr(offset, frame);
+                    bind_trigger_prefixed_only_in_expr(offset, frame);
                 }
             }
         }
@@ -34218,14 +34261,14 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
     bind_trigger_columns_in_expr_inner(expr, frame, false);
 }
 
-/// Like `bind_trigger_columns_in_expr`, but only replaces column references
-/// that have an explicit `OLD.` / `NEW.` (or table-name) prefix.  Bare
-/// column references (no table qualifier) are left untouched so they resolve
-/// against the DML's target table at execution time.
+/// Like [`bind_trigger_columns_in_expr`], but only replaces column references
+/// that have an explicit `OLD.` or `NEW.` prefix.  Bare column references
+/// (no qualifier) and table-qualified references (`t.id`) are left untouched
+/// so they resolve against the DML's target table at execution time.
 ///
-/// Used for UPDATE/DELETE/INSERT WHERE and SET clauses inside trigger bodies,
-/// where bare `id` in `WHERE id = NEW.id` must scan the table column — not
-/// be replaced with the trigger pseudo-column value (which would turn the
+/// Used for UPDATE/DELETE WHERE and SET clauses inside trigger bodies, where
+/// `id` in `WHERE id = NEW.id` must refer to the scan row's column — not be
+/// replaced with the trigger pseudo-column value (which would turn the
 /// predicate into `WHERE 1 = 1`).
 fn bind_trigger_prefixed_only_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
     bind_trigger_columns_in_expr_inner(expr, frame, true);
@@ -58965,6 +59008,41 @@ mod schema_loading_tests {
 #[cfg(test)]
 mod pager_routing_tests {
     use super::*;
+    use fsqlite_ast::{ColumnRef, Expr, OrderingTerm, ResultColumn, Span};
+    use fsqlite_func::collation::CollationFunction;
+
+    #[derive(Debug)]
+    struct LengthFirstCollation;
+
+    impl CollationFunction for LengthFirstCollation {
+        fn name(&self) -> &str {
+            "LENFIRST"
+        }
+
+        fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+            left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+        }
+    }
+
+    fn poison_mutex<T>(mutex: &std::sync::Mutex<T>) {
+        static PANIC_HOOK_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _panic_hook_guard = PANIC_HOOK_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("intentional mutex poison for regression coverage");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(
+            mutex.lock().is_err(),
+            "expected mutex to be poisoned for this regression test"
+        );
+    }
 
     fn init_publication_test_tracing() {
         static TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -69241,6 +69319,79 @@ mod pager_routing_tests {
         assert!(names.iter().any(|n| &**n == "BINARY"));
         assert!(names.iter().any(|n| &**n == "NOCASE"));
         assert!(names.iter().any(|n| &**n == "RTRIM"));
+    }
+
+    #[test]
+    fn test_poisoned_collation_registry_preserves_custom_collations() {
+        let conn = Connection::open(":memory:").unwrap();
+        lock_unpoisoned(conn.collation_registry.as_ref()).register(LengthFirstCollation);
+        poison_mutex(conn.collation_registry.as_ref());
+
+        let names: Vec<String> = conn
+            .query("PRAGMA collation_list;")
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| match &row.values()[1] {
+                SqliteValue::Text(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.contains(&"LENFIRST".to_owned()),
+            "custom collation should survive poisoned-registry recovery"
+        );
+
+        assert_eq!(
+            super::compare_text_bytes_collated(
+                b"aa",
+                b"b",
+                "LENFIRST",
+                conn.collation_registry.as_ref()
+            ),
+            std::cmp::Ordering::Greater,
+            "poison recovery should preserve custom collation lookups"
+        );
+
+        let span = Span::new(0, 0);
+        let mut rows = vec![
+            Row {
+                values: vec![SqliteValue::Text("aa".into())],
+            },
+            Row {
+                values: vec![SqliteValue::Text("b".into())],
+            },
+            Row {
+                values: vec![SqliteValue::Text("c".into())],
+            },
+        ];
+        let order_by = vec![OrderingTerm {
+            expr: Expr::Column(ColumnRef::bare("word"), span),
+            direction: None,
+            nulls: None,
+        }];
+        let columns = vec![ResultColumn::Expr {
+            expr: Expr::Column(ColumnRef::bare("word"), span),
+            alias: Some("word".to_owned()),
+        }];
+        super::sort_rows_by_order_terms(
+            &mut rows,
+            &order_by,
+            &columns,
+            &[Some("LENFIRST".to_owned())],
+            conn.collation_registry.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Text("b".into()),
+                SqliteValue::Text("c".into()),
+                SqliteValue::Text("aa".into()),
+            ],
+            "fallback ORDER BY sorting should preserve poisoned custom collations"
+        );
     }
 
     #[test]

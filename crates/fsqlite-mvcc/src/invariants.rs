@@ -567,18 +567,16 @@ impl VersionStore {
         let pgno = version.pgno;
         let begin_ts = version.commit_seq;
 
+        // Step 0: Ensure slot exists BEFORE acquiring arena lock, because
+        // ensure_slot may take its own write locks (directory + slots) on the
+        // slow path, and we don't want to hold the arena write lock during
+        // that potentially slower allocation.
+        let shard = &self.chain_heads.shards[ChainHeadTable::shard_index(pgno)];
+        let slot_idx = shard.ensure_slot(pgno);
+
         // Step 1: Arena alloc (brief write lock — kept open for prev-link in step 2).
         let mut arena = self.arena.write();
         let idx = arena.alloc(version);
-
-        // Step 2: CAS-based chain head install.
-        // INV-3: Establish backward link BEFORE making the new head visible.
-        // We hold the arena write lock across the CAS loop to avoid a second
-        // lock acquisition for setting the prev pointer.  This is safe because
-        // readers take read locks (compatible with each other) and the CAS loop
-        // typically completes in 1 iteration under low contention.
-        let shard = &self.chain_heads.shards[ChainHeadTable::shard_index(pgno)];
-        let slot_idx = shard.ensure_slot(pgno);
         let new_raw = ChainHeadTable::pack_idx(idx);
         let mut cas_attempts = 0_u32;
 

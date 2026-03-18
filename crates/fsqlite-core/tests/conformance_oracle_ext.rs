@@ -23815,7 +23815,6 @@ fn test_conformance_complex_cte_with_join_s336() {
 }
 
 #[test]
-#[ignore = "eval_join_expr cannot execute correlated subqueries in WHERE (no Connection access)"]
 fn test_conformance_correlated_subquery_in_join_where_s336b() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
