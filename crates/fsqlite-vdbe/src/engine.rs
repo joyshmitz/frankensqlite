@@ -8050,7 +8050,8 @@ impl VdbeEngine {
                     let count = usize::from(op.p5);
                     let end_idx = start_idx.saturating_add(count);
                     let limit = self.registers.len();
-                    let args = &self.registers[start_idx..end_idx.min(limit)];
+                    let clamped_start = start_idx.min(limit);
+                    let args = &self.registers[clamped_start..end_idx.min(limit)];
 
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
@@ -8170,7 +8171,8 @@ impl VdbeEngine {
                     let count = usize::from(op.p5);
                     let end_idx = start_idx.saturating_add(count);
                     let limit = self.registers.len();
-                    let args = &self.registers[start_idx..end_idx.min(limit)];
+                    let clamped_start = start_idx.min(limit);
+                    let args = &self.registers[clamped_start..end_idx.min(limit)];
 
                     let accum_reg = op.p3;
                     let ctx = self.window_contexts.entry_or_insert_with(accum_reg, || {

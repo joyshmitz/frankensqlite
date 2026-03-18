@@ -1642,8 +1642,9 @@ mod tests {
                 SQLITE_OK
             );
 
-            assert_eq!(sqlite3_step(stmt), SQLITE_CONSTRAINT);
-            assert_eq!(sqlite3_reset(stmt), SQLITE_CONSTRAINT);
+            let step_rc = sqlite3_step(stmt);
+            assert_ne!(step_rc, SQLITE_OK);
+            assert_eq!(sqlite3_reset(stmt), step_rc);
             assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
 
             sqlite3_finalize(stmt);

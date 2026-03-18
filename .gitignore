@@ -26,6 +26,9 @@ Desktop.ini
 # Common accidental compiler output
 a.out
 
+# Backup files
+*.bak
+
 # Profiling and coverage
 *.profraw
 *.profdata
@@ -217,6 +220,7 @@ tmp_rch_probe/
 
 # Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
 .beads/.br_recovery/
+.beads_recovery_*/
 .beads/*.backup.*
 .beads/*.bad_*
 .beads/*.backup_*

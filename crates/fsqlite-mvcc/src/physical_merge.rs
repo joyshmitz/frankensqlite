@@ -445,7 +445,11 @@ fn compute_local_payload_size(payload_size: u64, usable: u32, is_table_leaf: boo
         return payload;
     }
     let min_local = ((usable.saturating_sub(12)) * 32 / 255).saturating_sub(23);
-    let surplus = (payload.saturating_sub(min_local)) % (usable.saturating_sub(4));
+    let divisor = usable.saturating_sub(4);
+    if divisor == 0 {
+        return min_local;
+    }
+    let surplus = (payload.saturating_sub(min_local)) % divisor;
     if surplus <= max_local.saturating_sub(min_local) {
         min_local + surplus
     } else {

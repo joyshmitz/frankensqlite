@@ -30942,10 +30942,14 @@ fn dedup_values_collated(
         dedup_values(values);
         return;
     }
+    let snap = collation_registry
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_default();
     let mut seen: Vec<&SqliteValue> = Vec::new();
     values.retain(|v| {
         let already = seen.iter().any(|s| {
-            cmp_sqlite_values_collated(v, s, collation, collation_registry)
+            cmp_sqlite_values_collated_snapshot(v, s, collation, &snap)
                 == std::cmp::Ordering::Equal
         });
         if already {
@@ -31005,11 +31009,15 @@ fn compute_aggregate_ext_collated(
 ) -> SqliteValue {
     // For MIN/MAX with a non-default collation, use collation-aware comparison.
     if collation.is_some() && (name == "min" || name == "max") {
+        let snap = collation_registry
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default();
         let filtered = values.iter().filter(|v| !matches!(v, SqliteValue::Null));
         let result = if name == "min" {
-            filtered.min_by(|a, b| cmp_sqlite_values_collated(a, b, collation, collation_registry))
+            filtered.min_by(|a, b| cmp_sqlite_values_collated_snapshot(a, b, collation, &snap))
         } else {
-            filtered.max_by(|a, b| cmp_sqlite_values_collated(a, b, collation, collation_registry))
+            filtered.max_by(|a, b| cmp_sqlite_values_collated_snapshot(a, b, collation, &snap))
         };
         return result.map_or(SqliteValue::Null, |v| (*v).clone());
     }
@@ -31122,14 +31130,14 @@ fn group_keys_equal_collated(
     a: &[SqliteValue],
     b: &[SqliteValue],
     collations: &[Option<String>],
-    collation_registry: &Mutex<CollationRegistry>,
+    coll_snap: &CollationRegistry,
 ) -> bool {
     if a.len() != b.len() {
         return false;
     }
     a.iter().zip(b.iter()).enumerate().all(|(i, (av, bv))| {
         let coll = collations.get(i).and_then(|c| c.as_deref());
-        cmp_sqlite_values_collated(av, bv, coll, collation_registry) == std::cmp::Ordering::Equal
+        cmp_sqlite_values_collated_snapshot(av, bv, coll, coll_snap) == std::cmp::Ordering::Equal
     })
 }
 
