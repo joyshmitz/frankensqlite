@@ -2371,15 +2371,9 @@ fn classify_fsqlite_error_as_batch(err: FrankenError) -> BatchError {
 }
 
 fn classify_fsqlite_error_as_op(err: FrankenError) -> OpError {
-    match err {
-        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. } => {
-            OpError::Busy(BusyDiagnostic {
-                class: BusyClass::Busy,
-                conflicting_pages: Vec::new(),
-                message: err.to_string(),
-            })
-        }
-        _ => OpError::Fatal(err.to_string()),
+    match classify_retryable_busy(err) {
+        Ok(busy) => OpError::Busy(busy),
+        Err(message) => OpError::Fatal(message),
     }
 }
 
@@ -3407,6 +3401,21 @@ mod tests {
             classify_fsqlite_error_as_batch(err),
             BatchError::Busy { .. }
         ));
+    }
+
+    #[test]
+    fn classify_op_busy_snapshot_preserves_taxonomy_and_pages() {
+        let err = FrankenError::BusySnapshot {
+            conflicting_pages: "7,9".to_owned(),
+        };
+
+        match classify_fsqlite_error_as_op(err) {
+            OpError::Busy(diag) => {
+                assert_eq!(diag.class, BusyClass::BusySnapshot);
+                assert_eq!(diag.conflicting_pages, vec![7, 9]);
+            }
+            OpError::Fatal(message) => panic!("expected retryable busy, got fatal: {message}"),
+        }
     }
 
     #[test]

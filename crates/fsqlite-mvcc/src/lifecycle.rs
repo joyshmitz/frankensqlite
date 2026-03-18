@@ -35,6 +35,10 @@ const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_SERIALIZED_WRITER_LEASE_SECS: u64 = 30;
 const DEFAULT_MAX_CHAIN_LENGTH: usize = 64;
 const DEFAULT_CHAIN_LENGTH_WARNING: usize = 32;
+/// Proactive compaction threshold — attempt GC when chain exceeds this length
+/// during commit-time publish.  This keeps average chains short (§8.10 version
+/// chain compaction) without waiting for the hard max_chain_length limit.
+const PROACTIVE_COMPACT_THRESHOLD: usize = 8;
 const NO_GC_HORIZON: u64 = u64::MAX;
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
@@ -1405,6 +1409,20 @@ impl TransactionManager {
                 self.version_store.publish(version);
                 self.commit_index.update(pgno, commit_seq);
                 txn.mark_page_write_committed(pgno, commit_seq);
+            }
+        }
+
+        // Proactive version chain compaction (§8.10): attempt GC on written
+        // pages whose chains now exceed the compaction threshold.  This keeps
+        // average chain lengths short under sustained write workloads.
+        // Cap at 16 pages per commit to bound overhead for bulk writes.
+        let horizon = self.eager_gc_horizon();
+        if horizon != CommitSeq::new(NO_GC_HORIZON) {
+            for pgno in txn.write_set.iter().take(16) {
+                let chain_len = self.version_store.chain_length(*pgno);
+                if chain_len > PROACTIVE_COMPACT_THRESHOLD {
+                    self.version_store.prune_page_chain_eager(*pgno, horizon);
+                }
             }
         }
 

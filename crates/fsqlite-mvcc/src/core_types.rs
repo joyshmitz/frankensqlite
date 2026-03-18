@@ -1712,10 +1712,11 @@ impl CommitIndex {
 
     /// Record that multiple pages were committed at `seq` in a single batch.
     ///
-    /// Each fast-array publication keeps the same `Release` ordering as
-    /// [`CommitIndex::update`]. Readers query individual pages, so there is no
-    /// shared "last page" synchronization point that can safely publish other
-    /// pages' stores.
+    /// The fast-array path uses one upfront `Release` fence followed by
+    /// per-page `Relaxed` stores. Readers query individual pages, so there is
+    /// no shared "last page" synchronization point; the fence publishes all
+    /// prior writes before any reader can observe one of the new per-page
+    /// commit-index values via `latest()`'s `Acquire` load.
     ///
     /// Pages that exceed `FAST_COMMIT_ARRAY_SIZE` fall through to the
     /// per-page sharded path (which takes its own locks).
@@ -1724,10 +1725,28 @@ impl CommitIndex {
             seq.get() != 0,
             "CommitIndex::batch_update called with CommitSeq(0)"
         );
+        if pages.is_empty() {
+            return;
+        }
+        let raw = seq.get();
+
+        // Issue a single Release fence upfront.  After this fence, all
+        // prior writes on this thread (version-store publishes, page-data
+        // commits, etc.) are ordered before the commit-index stores below.
+        // Any reader that does an Acquire load and sees one of these new
+        // values is guaranteed to also see everything that happened-before
+        // this fence.
+        //
+        // On x86 (TSO) the fence is free.  On ARM/RISC-V this collapses
+        // N individual Release stores into one DMB/fence instruction.
+        std::sync::atomic::fence(Ordering::Release);
+
         for &page in pages {
             let pgno = page.get() as usize;
             if pgno <= FAST_COMMIT_ARRAY_SIZE {
-                self.fast_array[pgno - 1].store(seq.get(), Ordering::Release);
+                // Safe to use Relaxed: the Release fence above already
+                // guarantees ordering for all stores that follow.
+                self.fast_array[pgno - 1].store(raw, Ordering::Relaxed);
             } else {
                 let shard = &self.shards[self.shard_index(page)];
                 shard.update(page, seq);

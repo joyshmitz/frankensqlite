@@ -8,9 +8,11 @@
 //! - `resolve_for_txn`: Write-set-aware resolution for transactions.
 //! - [`SerializedWriteMutex`]: Global write mutex for Serialized mode (INV-7).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use smallvec::SmallVec;
 
 use fsqlite_types::sync_primitives::{Mutex, RwLock};
 
@@ -54,8 +56,11 @@ use crate::observability::record_cas_attempt;
 pub struct TxnManager {
     next_txn_id: AtomicU64,
     next_commit_seq: AtomicU64,
-    /// Set of in-flight commit sequences (allocated but not yet finished).
-    active_commits: Mutex<BTreeSet<u64>>,
+    /// In-flight commit sequences (allocated but not yet finished).
+    /// Uses a sorted `SmallVec` instead of `BTreeSet` for cache locality
+    /// under typical concurrency (≤16 concurrent commits). Sorted order
+    /// enables O(1) minimum lookup via `first()`.
+    active_commits: Mutex<SmallVec<[u64; 16]>>,
     /// The highest commit sequence C such that all sequences <= C are fully finished.
     stable_commit_seq: AtomicU64,
 }
@@ -67,7 +72,7 @@ impl TxnManager {
         Self {
             next_txn_id: AtomicU64::new(initial_txn_id),
             next_commit_seq: AtomicU64::new(initial_commit_seq),
-            active_commits: Mutex::new(BTreeSet::new()),
+            active_commits: Mutex::new(SmallVec::new()),
             // If starting at S, then S-1 is the last stable commit.
             stable_commit_seq: AtomicU64::new(initial_commit_seq.saturating_sub(1)),
         }
@@ -105,7 +110,8 @@ impl TxnManager {
         // to ensure no race allows stable_commit_seq to jump past us.
         let mut active = self.active_commits.lock();
         let seq = self.next_commit_seq.fetch_add(1, Ordering::Release);
-        active.insert(seq);
+        // Sequences are monotonically increasing, so push to end maintains sorted order.
+        active.push(seq);
         CommitSeq::new(seq)
     }
 
@@ -115,11 +121,15 @@ impl TxnManager {
     pub fn finish_commit_seq(&self, seq: CommitSeq) {
         let mut active = self.active_commits.lock();
         let raw = seq.get();
-        let removed = active.remove(&raw);
-        debug_assert!(removed, "finished commit seq {raw} was not active");
+        // Remove by position (O(N) for SmallVec, but N ≤ 16 typical).
+        if let Some(pos) = active.iter().position(|&s| s == raw) {
+            active.remove(pos);
+        } else {
+            debug_assert!(false, "finished commit seq {raw} was not active");
+        }
 
         // The stable sequence is the predecessor of the earliest active commit.
-        // If no commits are active, it is the predecessor of next_commit_seq.
+        // SmallVec is sorted, so first() gives the minimum.
         let new_stable = if let Some(&min_active) = active.first() {
             min_active.saturating_sub(1)
         } else {
@@ -557,13 +567,16 @@ impl VersionStore {
         let pgno = version.pgno;
         let begin_ts = version.commit_seq;
 
-        // Step 1: Arena alloc (brief write lock).
+        // Step 1: Arena alloc (brief write lock — kept open for prev-link in step 2).
         let mut arena = self.arena.write();
         let idx = arena.alloc(version);
-        drop(arena);
 
-        // Step 2: CAS-based chain head install (lock-free).
+        // Step 2: CAS-based chain head install.
         // INV-3: Establish backward link BEFORE making the new head visible.
+        // We hold the arena write lock across the CAS loop to avoid a second
+        // lock acquisition for setting the prev pointer.  This is safe because
+        // readers take read locks (compatible with each other) and the CAS loop
+        // typically completes in 1 iteration under low contention.
         let shard = &self.chain_heads.shards[ChainHeadTable::shard_index(pgno)];
         let slot_idx = shard.ensure_slot(pgno);
         let new_raw = ChainHeadTable::pack_idx(idx);
@@ -576,11 +589,8 @@ impl VersionStore {
             let prev = ChainHeadTable::unpack_idx(current_raw);
 
             // Link the new version to the current head BEFORE trying to swap.
-            {
-                let mut arena = self.arena.write();
-                let v = arena.get_mut(idx).expect("just allocated");
-                v.prev = prev.map(idx_to_version_pointer);
-            }
+            let v = arena.get_mut(idx).expect("just allocated");
+            v.prev = prev.map(idx_to_version_pointer);
 
             match slots[slot_idx].compare_exchange_weak(
                 current_raw,
@@ -594,6 +604,7 @@ impl VersionStore {
                 }
             }
         };
+        drop(arena);
 
         record_cas_attempt(cas_attempts);
 
