@@ -4427,6 +4427,8 @@ impl VdbeEngine {
         self.version_store = None;
         self.time_travel_commit_log = None;
         self.time_travel_gc_horizon = None;
+        // table_index_meta: kept as-is — execute() overwrites it from the
+        // program at the start of each run (line ~4903).
         self.window_contexts.clear();
         self.register_subtypes.clear();
         self.bloom_filters.clear();
@@ -5707,7 +5709,12 @@ impl VdbeEngine {
                         );
 
                         if store_p2 {
-                            self.set_reg_int(op.p2, i64::from(should_jump));
+                            if cmp.is_none() {
+                                // Indeterminate comparison (e.g., NaN): store NULL, not 0.
+                                self.set_reg_fast(op.p2, SqliteValue::Null);
+                            } else {
+                                self.set_reg_int(op.p2, i64::from(should_jump));
+                            }
                             pc += 1;
                         } else if should_jump {
                             pc = op.p2 as usize;
@@ -8962,7 +8969,14 @@ impl VdbeEngine {
 
     /// Take the result rows, consuming them.
     pub fn take_results(&mut self) -> Vec<smallvec::SmallVec<[SqliteValue; 16]>> {
-        std::mem::take(&mut self.results)
+        let mut results = Vec::with_capacity(self.results.capacity());
+        std::mem::swap(&mut results, &mut self.results);
+        results
+    }
+
+    #[cfg(test)]
+    fn result_buffer_capacity(&self) -> usize {
+        self.results.capacity()
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -10971,6 +10985,36 @@ mod tests {
             .into_iter()
             .map(|v| v.into_vec())
             .collect()
+    }
+
+    #[test]
+    fn test_take_results_preserves_result_buffer_capacity_for_reuse() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 1, r, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        assert_eq!(
+            engine.result_buffer_capacity(),
+            64,
+            "new engines should keep the preallocated result-row buffer"
+        );
+
+        let outcome = engine.execute(&program).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows = engine.take_results();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            engine.result_buffer_capacity(),
+            64,
+            "taking results should preserve buffer capacity for the next execution"
+        );
     }
 
     #[test]

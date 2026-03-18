@@ -289,6 +289,23 @@ pub struct HotPathPageDataMotionProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathConnectionCeremonyProfile {
+    pub background_status_checks: u64,
+    pub op_cx_background_gates: u64,
+    pub statement_dispatch_background_gates: u64,
+    pub prepared_schema_refreshes: u64,
+    pub pager_publication_refreshes: u64,
+    pub memory_autocommit_fast_path_begins: u64,
+    pub cached_read_snapshot_reuses: u64,
+    pub cached_read_snapshot_parks: u64,
+    pub column_default_evaluation_passes: u64,
+    pub prepared_table_engine_fresh_allocs: u64,
+    pub prepared_table_engine_reuses: u64,
+    pub autoincrement_sequence_fast_path_updates: u64,
+    pub autoincrement_sequence_scan_refreshes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathOpcodeProfileEntry {
     pub opcode: String,
     pub total: u64,
@@ -336,6 +353,7 @@ pub struct HotPathSubsystemProfilePack {
     pub row_materialization: HotPathRowMaterializationProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
     pub page_data_motion: HotPathPageDataMotionProfile,
+    pub connection_ceremony: HotPathConnectionCeremonyProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -484,6 +502,7 @@ pub struct HotPathProfileReport {
     pub row_materialization: HotPathRowMaterializationProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
     pub page_data_motion: HotPathPageDataMotionProfile,
+    pub connection_ceremony: HotPathConnectionCeremonyProfile,
     pub opcode_profile: Vec<HotPathOpcodeProfileEntry>,
     pub type_profile: HotPathTypeProfile,
     pub subsystem_ranking: Vec<HotPathRankingEntry>,
@@ -835,6 +854,21 @@ fn build_hot_path_profile_report(
             .normalized_zero_fill_bytes_total,
         normalized_bytes_total: page_data_normalization_bytes_total,
     };
+    let connection_ceremony = HotPathConnectionCeremonyProfile {
+        background_status_checks: snapshot.background_status_checks,
+        op_cx_background_gates: snapshot.op_cx_background_gates,
+        statement_dispatch_background_gates: snapshot.statement_dispatch_background_gates,
+        prepared_schema_refreshes: snapshot.prepared_schema_refreshes,
+        pager_publication_refreshes: snapshot.pager_publication_refreshes,
+        memory_autocommit_fast_path_begins: snapshot.memory_autocommit_fast_path_begins,
+        cached_read_snapshot_reuses: snapshot.cached_read_snapshot_reuses,
+        cached_read_snapshot_parks: snapshot.cached_read_snapshot_parks,
+        column_default_evaluation_passes: snapshot.column_default_evaluation_passes,
+        prepared_table_engine_fresh_allocs: snapshot.prepared_table_engine_fresh_allocs,
+        prepared_table_engine_reuses: snapshot.prepared_table_engine_reuses,
+        autoincrement_sequence_fast_path_updates: snapshot.autoincrement_sequence_fast_path_updates,
+        autoincrement_sequence_scan_refreshes: snapshot.autoincrement_sequence_scan_refreshes,
+    };
 
     let parser_time_ns = parser
         .parse_time_ns
@@ -944,6 +978,7 @@ fn build_hot_path_profile_report(
         row_materialization,
         mvcc_write,
         page_data_motion,
+        connection_ceremony,
         opcode_profile,
         type_profile: HotPathTypeProfile {
             decoded: decoded_types,
@@ -1085,6 +1120,60 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     if let Some(diagnostic) = &report.engine_report.first_failure_diagnostic {
         let _ = writeln!(out, "- First failure diagnostic: `{diagnostic}`");
     }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Connection Ceremony\n");
+    let _ = writeln!(
+        out,
+        "- Background gates: status_checks={} op_cx={} dispatch={}",
+        report.connection_ceremony.background_status_checks,
+        report.connection_ceremony.op_cx_background_gates,
+        report
+            .connection_ceremony
+            .statement_dispatch_background_gates
+    );
+    let _ = writeln!(
+        out,
+        "- Schema/publication refreshes: prepared_schema={} pager_publication={}",
+        report.connection_ceremony.prepared_schema_refreshes,
+        report.connection_ceremony.pager_publication_refreshes
+    );
+    let _ = writeln!(
+        out,
+        "- Cached snapshot reuse/parks: {}/{}",
+        report.connection_ceremony.cached_read_snapshot_reuses,
+        report.connection_ceremony.cached_read_snapshot_parks
+    );
+    let _ = writeln!(
+        out,
+        "- Prepared engine fresh/reuse: {}/{}",
+        report
+            .connection_ceremony
+            .prepared_table_engine_fresh_allocs,
+        report.connection_ceremony.prepared_table_engine_reuses
+    );
+    let _ = writeln!(
+        out,
+        "- sqlite_sequence fast-path/scan refresh: {}/{}",
+        report
+            .connection_ceremony
+            .autoincrement_sequence_fast_path_updates,
+        report
+            .connection_ceremony
+            .autoincrement_sequence_scan_refreshes
+    );
+    let _ = writeln!(
+        out,
+        "- Column-default evaluation passes: {}",
+        report.connection_ceremony.column_default_evaluation_passes
+    );
+    let _ = writeln!(
+        out,
+        "- :memory: autocommit fast-path begins: {}",
+        report
+            .connection_ceremony
+            .memory_autocommit_fast_path_begins
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## MVCC Write Path\n");
@@ -1929,7 +2018,7 @@ fn baseline_reuse_implication(surface: &str) -> (&'static str, &'static [&'stati
             &["bd-db300.10.5"],
         ),
         "cursor_frame_reuse" => (
-            "J7 target: missing cursor/frame reuse evidence means VDBE setup churn is still treated as open baseline tax.",
+            "J7 target: prepared engine fresh-vs-reuse counters now expose setup churn directly, so the next cuts should drive the reuse rate up instead of treating frame setup as opaque.",
             &["bd-db300.10.7"],
         ),
         "page_buffer_pool_reuse" => (
@@ -2015,13 +2104,25 @@ fn build_hot_path_baseline_reuse_ledger(
         HotPathBaselineReuseLedgerEntry {
             rank: 0,
             surface: "cursor_frame_reuse".to_owned(),
-            supported: false,
-            hits: 0,
-            misses: 0,
-            hit_rate_basis_points: None,
-            rationale:
-                "runtime phase timing exists, but cursor/frame reuse versus fresh setup is not yet emitted as a machine-readable counter"
-                    .to_owned(),
+            supported: true,
+            hits: report.connection_ceremony.prepared_table_engine_reuses,
+            misses: report.connection_ceremony.prepared_table_engine_fresh_allocs,
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.connection_ceremony.prepared_table_engine_reuses,
+                report
+                    .connection_ceremony
+                    .prepared_table_engine_reuses
+                    .saturating_add(
+                        report
+                            .connection_ceremony
+                            .prepared_table_engine_fresh_allocs,
+                    ),
+            )),
+            rationale: format!(
+                "prepared table execution now reports fresh engine allocations ({}) versus reuse hits ({}) directly",
+                report.connection_ceremony.prepared_table_engine_fresh_allocs,
+                report.connection_ceremony.prepared_table_engine_reuses
+            ),
             implication: String::new(),
             mapped_beads: Vec::new(),
         },
@@ -2720,6 +2821,7 @@ pub fn build_hot_path_subsystem_profile(
         row_materialization: report.row_materialization.clone(),
         mvcc_write: report.mvcc_write.clone(),
         page_data_motion: report.page_data_motion.clone(),
+        connection_ceremony: report.connection_ceremony.clone(),
     }
 }
 
@@ -3259,6 +3361,8 @@ mod tests {
             column_default_evaluation_passes: 2,
             prepared_table_engine_fresh_allocs: 1,
             prepared_table_engine_reuses: 1,
+            autoincrement_sequence_fast_path_updates: 1,
+            autoincrement_sequence_scan_refreshes: 0,
             record_decode: RecordHotPathProfileSnapshot {
                 parse_record_calls: 4,
                 parse_record_into_calls: 2,
@@ -4001,6 +4105,18 @@ mod tests {
         assert_eq!(
             parse_cache_reuse.mapped_beads,
             vec!["bd-db300.10.4".to_owned()]
+        );
+
+        let cursor_frame_reuse = actionable_ranking
+            .baseline_reuse_ledger
+            .iter()
+            .find(|entry| entry.surface == "cursor_frame_reuse")
+            .unwrap();
+        assert!(cursor_frame_reuse.supported);
+        assert_eq!(cursor_frame_reuse.hit_rate_basis_points, Some(5_000));
+        assert_eq!(
+            cursor_frame_reuse.mapped_beads,
+            vec!["bd-db300.10.7".to_owned()]
         );
 
         let page_data_reuse = actionable_ranking

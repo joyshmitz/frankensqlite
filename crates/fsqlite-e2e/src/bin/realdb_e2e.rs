@@ -47,10 +47,11 @@ use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
     FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
-    HotPathArtifactProvenance, HotPathCounterCaptureManifestSummary,
-    HotPathMicroarchitecturalContext, HotPathProfileReport, build_hot_path_actionable_ranking,
-    build_hot_path_opcode_profile, build_hot_path_subsystem_profile, profile_fsqlite_hot_path,
-    render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
+    HotPathArtifactProvenance, HotPathConnectionCeremonyProfile,
+    HotPathCounterCaptureManifestSummary, HotPathMicroarchitecturalContext, HotPathProfileReport,
+    build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
+    build_hot_path_subsystem_profile, profile_fsqlite_hot_path, render_hot_path_profile_markdown,
+    write_hot_path_profile_artifacts,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
@@ -5329,6 +5330,21 @@ mod tests {
                 normalized_payload_bytes_total: 96,
                 normalized_zero_fill_bytes_total: 32,
                 normalized_bytes_total: 128,
+            },
+            connection_ceremony: HotPathConnectionCeremonyProfile {
+                background_status_checks: 1,
+                op_cx_background_gates: 1,
+                statement_dispatch_background_gates: 0,
+                prepared_schema_refreshes: 0,
+                pager_publication_refreshes: 1,
+                memory_autocommit_fast_path_begins: 1,
+                cached_read_snapshot_reuses: 1,
+                cached_read_snapshot_parks: 0,
+                column_default_evaluation_passes: 0,
+                prepared_table_engine_fresh_allocs: 1,
+                prepared_table_engine_reuses: 2,
+                autoincrement_sequence_fast_path_updates: 1,
+                autoincrement_sequence_scan_refreshes: 0,
             },
             opcode_profile: vec![HotPathOpcodeProfileEntry {
                 opcode: "Column".to_owned(),

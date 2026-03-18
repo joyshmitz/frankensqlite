@@ -245,6 +245,8 @@ static FSQLITE_CACHED_READ_SNAPSHOT_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_REUSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParserHotPathProfileSnapshot {
@@ -275,6 +277,8 @@ pub struct HotPathProfileSnapshot {
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
+    pub autoincrement_sequence_fast_path_updates: u64,
+    pub autoincrement_sequence_scan_refreshes: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
 }
@@ -313,6 +317,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_REUSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
     reset_vdbe_metrics();
 }
@@ -351,6 +357,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         prepared_table_engine_fresh_allocs: FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS
             .load(AtomicOrdering::Relaxed),
         prepared_table_engine_reuses: FSQLITE_PREPARED_TABLE_ENGINE_REUSES
+            .load(AtomicOrdering::Relaxed),
+        autoincrement_sequence_fast_path_updates: FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES
+            .load(AtomicOrdering::Relaxed),
+        autoincrement_sequence_scan_refreshes: FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES
             .load(AtomicOrdering::Relaxed),
         record_decode: record_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
@@ -1224,12 +1234,43 @@ enum PreparedDmlKind {
     Insert,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedInsertPostWriteAction {
+    None,
+    RefreshSqliteSequenceCache,
+    RefreshAutoincrementSequence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TableExecutionRuntimeRequirements {
+    autoincrement_root_page: Option<i32>,
+    needs_column_defaults: bool,
+}
+
+impl TableExecutionRuntimeRequirements {
+    const fn read_path() -> Self {
+        Self {
+            autoincrement_root_page: None,
+            needs_column_defaults: true,
+        }
+    }
+
+    const fn write_path(autoincrement_root_page: Option<i32>, needs_column_defaults: bool) -> Self {
+        Self {
+            autoincrement_root_page,
+            needs_column_defaults,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedPrecompiledDml {
     kind: PreparedDmlKind,
     table_name: String,
+    post_write_action: PreparedInsertPostWriteAction,
     rollback_on_constraint_violation: bool,
     preserve_prior_changes_on_constraint_violation: bool,
+    runtime_requirements: TableExecutionRuntimeRequirements,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,11 +1550,14 @@ impl PreparedStatement<'_> {
         let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
 
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
-        // Always populate column defaults — they are needed both for
-        // INSERT (to provide default values for omitted columns) and for
-        // SELECT (to fill in missing columns in rows written before an
-        // ALTER TABLE ADD COLUMN).
-        let runtime_inputs = self.conn.table_execution_runtime_inputs(true);
+        let runtime_requirements = self
+            .precompiled_dml()
+            .map_or(TableExecutionRuntimeRequirements::read_path(), |dispatch| {
+                dispatch.runtime_requirements
+            });
+        let runtime_inputs = self
+            .conn
+            .table_execution_runtime_inputs(runtime_requirements);
         let cookie = *self.conn.schema_cookie.borrow();
         let had_active_txn = self.conn.active_txn.borrow().is_some();
 
@@ -4938,6 +4982,7 @@ impl Connection {
                     &op_cx,
                     stmt,
                     &dispatch.table_name,
+                    dispatch.post_write_action,
                     dispatch.rollback_on_constraint_violation,
                     dispatch.preserve_prior_changes_on_constraint_violation,
                     p,
@@ -4983,6 +5028,7 @@ impl Connection {
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
         table_name: &str,
+        post_write_action: PreparedInsertPostWriteAction,
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
         params: Option<&[SqliteValue]>,
@@ -5045,6 +5091,7 @@ impl Connection {
                     execution_cx,
                     stmt,
                     table_name,
+                    post_write_action,
                     params,
                 )
             })
@@ -5053,6 +5100,7 @@ impl Connection {
                 execution_cx,
                 stmt,
                 table_name,
+                post_write_action,
                 params,
             )
         };
@@ -5135,14 +5183,23 @@ impl Connection {
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
         table_name: &str,
+        post_write_action: PreparedInsertPostWriteAction,
         params: Option<&[SqliteValue]>,
     ) -> Result<(Vec<Row>, usize)> {
-        let (rows, affected, _) =
+        let (rows, affected, last_insert_rowid) =
             stmt.execute_table_program_with_reuse(execution_cx, params, true)?;
-        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
-            self.refresh_sqlite_sequence_cache()?;
-        } else {
-            self.refresh_autoincrement_sequence_after_insert(table_name)?;
+        match post_write_action {
+            PreparedInsertPostWriteAction::None => {}
+            PreparedInsertPostWriteAction::RefreshSqliteSequenceCache => {
+                self.refresh_sqlite_sequence_cache()?;
+            }
+            PreparedInsertPostWriteAction::RefreshAutoincrementSequence => {
+                self.refresh_autoincrement_sequence_after_insert(
+                    table_name,
+                    affected,
+                    last_insert_rowid,
+                )?;
+            }
         }
         self.record_statement_changes(affected);
         Ok((rows, affected))
@@ -6214,8 +6271,13 @@ impl Connection {
                         &arc_prog
                     };
 
-                    let (mut rows, _, _) =
-                        self.execute_table_program_with_cx(program, params, false, cx)?;
+                    let (mut rows, _, _) = self.execute_table_program_with_cx(
+                        program,
+                        params,
+                        false,
+                        TableExecutionRuntimeRequirements::read_path(),
+                        cx,
+                    )?;
                     if distinct {
                         dedup_rows(&mut rows);
                         if let Some(limit_clause) = limit_clause.as_ref() {
@@ -6405,8 +6467,14 @@ impl Connection {
                     })?;
                     &arc_prog
                 };
-                let (rows, affected, _) =
-                    self.execute_table_program_with_cx(program, params, true, cx)?;
+                let runtime_requirements = self.insert_runtime_requirements(insert)?;
+                let (rows, affected, last_insert_rowid) = self.execute_table_program_with_cx(
+                    program,
+                    params,
+                    true,
+                    runtime_requirements,
+                    cx,
+                )?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 if self.fk_enforcement_enabled() {
@@ -6450,7 +6518,11 @@ impl Connection {
                 if table_name.eq_ignore_ascii_case("sqlite_sequence") {
                     self.refresh_sqlite_sequence_cache()?;
                 } else {
-                    self.refresh_autoincrement_sequence_after_insert(table_name)?;
+                    self.refresh_autoincrement_sequence_after_insert(
+                        table_name,
+                        affected,
+                        last_insert_rowid,
+                    )?;
                 }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
@@ -6572,8 +6644,13 @@ impl Connection {
                     })?;
                     &arc_prog
                 };
-                let (rows, affected, _) =
-                    self.execute_table_program_with_cx(program, params, false, cx)?;
+                let (rows, affected, _) = self.execute_table_program_with_cx(
+                    program,
+                    params,
+                    false,
+                    TableExecutionRuntimeRequirements::read_path(),
+                    cx,
+                )?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -6683,8 +6760,13 @@ impl Connection {
                     })?;
                     &arc_prog
                 };
-                let (rows, affected, _) =
-                    self.execute_table_program_with_cx(program, params, false, cx)?;
+                let (rows, affected, _) = self.execute_table_program_with_cx(
+                    program,
+                    params,
+                    false,
+                    TableExecutionRuntimeRequirements::read_path(),
+                    cx,
+                )?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -7557,11 +7639,15 @@ impl Connection {
                                 PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
                                     kind: PreparedDmlKind::Insert,
                                     table_name: insert.table.name.clone(),
+                                    post_write_action: self
+                                        .prepared_insert_post_write_action(&insert.table.name),
                                     rollback_on_constraint_violation: insert.or_conflict
                                         == Some(fsqlite_ast::ConflictAction::Rollback),
                                     preserve_prior_changes_on_constraint_violation: insert
                                         .or_conflict
                                         == Some(fsqlite_ast::ConflictAction::Fail),
+                                    runtime_requirements: self
+                                        .insert_runtime_requirements(insert)?,
                                 })
                             } else {
                                 PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))
@@ -7793,6 +7879,53 @@ impl Connection {
                 .where_clause
                 .as_ref()
                 .is_some_and(expr_contains_rewritable_subquery)
+    }
+
+    fn insert_runtime_requirements(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<TableExecutionRuntimeRequirements> {
+        let target_root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("no such table: {}", insert.table.name))
+                })?
+        };
+        let autoincrement_root_page = self
+            .autoincrement_tables
+            .borrow()
+            .contains(&insert.table.name.to_ascii_lowercase())
+            .then_some(target_root_page);
+        // Simple VALUES/DEFAULT VALUES inserts already have omitted-column
+        // defaults compiled directly into bytecode, so they do not need the
+        // connection-level legacy short-record default map.
+        let needs_column_defaults = match &insert.source {
+            fsqlite_ast::InsertSource::Values(_) | fsqlite_ast::InsertSource::DefaultValues => {
+                false
+            }
+            fsqlite_ast::InsertSource::Select(select_stmt) => {
+                !matches!(select_stmt.body.select, SelectCore::Values(_))
+                    || !select_stmt.body.compounds.is_empty()
+            }
+        };
+        Ok(TableExecutionRuntimeRequirements::write_path(
+            autoincrement_root_page,
+            needs_column_defaults,
+        ))
+    }
+
+    fn prepared_insert_post_write_action(&self, table_name: &str) -> PreparedInsertPostWriteAction {
+        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
+            PreparedInsertPostWriteAction::RefreshSqliteSequenceCache
+        } else if self.is_autoincrement_table(table_name) {
+            PreparedInsertPostWriteAction::RefreshAutoincrementSequence
+        } else {
+            PreparedInsertPostWriteAction::None
+        }
     }
 
     fn prepared_select_requires_dispatch(&self, statement: &Statement) -> bool {
@@ -9763,7 +9896,7 @@ impl Connection {
             }
             // Force serialized mode for :memory: — skip concurrent registry entirely.
             let effective_mode = if mode == TransactionMode::Concurrent {
-                TransactionMode::ReadWrite
+                TransactionMode::Immediate
             } else {
                 mode
             };
@@ -10908,9 +11041,67 @@ impl Connection {
         })
     }
 
-    fn refresh_autoincrement_sequence_after_insert(&self, table_name: &str) -> Result<()> {
+    fn try_fast_path_autoincrement_sequence_after_insert(
+        &self,
+        table_name: &str,
+        affected: usize,
+        last_insert_rowid: Option<i64>,
+    ) -> Result<bool> {
+        if affected != 1 {
+            return Ok(false);
+        }
+        let Some(inserted_rowid) = last_insert_rowid else {
+            return Ok(false);
+        };
+
+        self.ensure_sqlite_sequence_table_exists()?;
+        let key = table_name.to_ascii_lowercase();
+        let current_seq = self
+            .sqlite_sequence_cache
+            .borrow()
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if inserted_rowid > current_seq {
+            let key_for_cache = key.clone();
+            self.with_pager_write_txn(|cx, txn| {
+                self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, inserted_rowid)?;
+                self.sqlite_sequence_cache
+                    .borrow_mut()
+                    .insert(key_for_cache, inserted_rowid);
+                Ok(())
+            })?;
+        }
+        if hot_path_profile_enabled() {
+            FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        tracing::trace!(
+            table = table_name,
+            inserted_rowid,
+            current_seq,
+            "sqlite_sequence autoincrement fast path"
+        );
+        Ok(true)
+    }
+
+    fn refresh_autoincrement_sequence_after_insert(
+        &self,
+        table_name: &str,
+        affected: usize,
+        last_insert_rowid: Option<i64>,
+    ) -> Result<()> {
         if !self.is_autoincrement_table(table_name) {
             return Ok(());
+        }
+        if self.try_fast_path_autoincrement_sequence_after_insert(
+            table_name,
+            affected,
+            last_insert_rowid,
+        )? {
+            return Ok(());
+        }
+        if hot_path_profile_enabled() {
+            FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
         self.ensure_sqlite_sequence_table_exists()?;
         self.with_pager_write_txn(|cx, txn| {
@@ -10971,38 +11162,36 @@ impl Connection {
             .collect()
     }
 
-    fn table_execution_runtime_inputs(&self, needs_defaults: bool) -> TableExecutionRuntimeInputs {
+    fn table_execution_runtime_inputs(
+        &self,
+        requirements: TableExecutionRuntimeRequirements,
+    ) -> TableExecutionRuntimeInputs {
         let metadata = self.table_execution_metadata();
 
-        // Autoincrement metadata is only needed for INSERT programs. Skip the
-        // borrow+iterate+collect cycle entirely for read/update/delete paths,
-        // and also for schemas with no autoincrement tables at all.
         let autoincrement_seq_by_root_page =
-            if !needs_defaults || metadata.autoincrement_table_names_by_root_page.is_empty() {
-                HbHashMap::new()
-            } else {
-                let autoincrement_tables = self.autoincrement_tables.borrow();
-                let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
-                let map = metadata
+            if let Some(root_page) = requirements.autoincrement_root_page {
+                let mut map = HbHashMap::new();
+                if let Some((_, table_name)) = metadata
                     .autoincrement_table_names_by_root_page
                     .iter()
-                    .filter(|(_, table_name)| autoincrement_tables.contains(table_name))
-                    .map(|(root_page, table_name)| {
-                        let seq = sqlite_sequence_cache.get(table_name).copied().unwrap_or(0);
-                        (*root_page, seq)
-                    })
-                    .collect::<HbHashMap<_, _>>();
-                drop(sqlite_sequence_cache);
-                drop(autoincrement_tables);
+                    .find(|(candidate_root_page, _)| *candidate_root_page == root_page)
+                {
+                    let seq = self
+                        .sqlite_sequence_cache
+                        .borrow()
+                        .get(table_name)
+                        .copied()
+                        .unwrap_or(0);
+                    map.insert(root_page, seq);
+                }
                 map
+            } else {
+                HbHashMap::new()
             };
 
-        // Column defaults are needed for BOTH writes (INSERT with omitted
-        // columns) AND reads (SELECT on rows predating ALTER TABLE ADD COLUMN
-        // — those rows have fewer columns than the current schema, and the
-        // VDBE engine fills missing columns from this map).  Only skip when
-        // the schema has no defaults at all (fast short-circuit).
-        let column_defaults_by_root_page = if metadata.column_default_sql_by_root_page.is_empty() {
+        let column_defaults_by_root_page = if !requirements.needs_column_defaults
+            || metadata.column_default_sql_by_root_page.is_empty()
+        {
             empty_column_defaults_arc()
         } else {
             if hot_path_profile_enabled() {
@@ -19001,10 +19190,15 @@ impl Connection {
                                     continue;
                                 }
                                 let sep = separator.clone().or_else(|| {
-                                    separator_expr.as_ref().and_then(|expr| {
-                                        let sv = eval_join_expr(expr, row, &col_map).ok()?;
-                                        (!matches!(sv, SqliteValue::Null))
-                                            .then(|| sqlite_value_to_text(&sv))
+                                    separator_expr.as_ref().map(|expr| {
+                                        let sv = eval_join_expr(expr, row, &col_map)
+                                            .unwrap_or(SqliteValue::Null);
+                                        if sv.is_null() {
+                                            // C SQLite: NULL separator → no separator (empty).
+                                            String::new()
+                                        } else {
+                                            sqlite_value_to_text(&sv)
+                                        }
                                     })
                                 });
                                 let mut keys = Vec::with_capacity(order_by.len());
@@ -20303,10 +20497,15 @@ impl Connection {
                                     continue;
                                 }
                                 let sep = separator.clone().or_else(|| {
-                                    separator_expr.as_ref().and_then(|expr| {
-                                        let sv = eval_join_expr(expr, row, &col_map).ok()?;
-                                        (!matches!(sv, SqliteValue::Null))
-                                            .then(|| sqlite_value_to_text(&sv))
+                                    separator_expr.as_ref().map(|expr| {
+                                        let sv = eval_join_expr(expr, row, &col_map)
+                                            .unwrap_or(SqliteValue::Null);
+                                        if sv.is_null() {
+                                            // C SQLite: NULL separator → no separator (empty).
+                                            String::new()
+                                        } else {
+                                            sqlite_value_to_text(&sv)
+                                        }
                                     })
                                 });
                                 let mut keys = Vec::with_capacity(order_by.len());
@@ -23640,7 +23839,13 @@ impl Connection {
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         let execution_cx = self.op_cx()?;
         self.sync_change_tracking_context();
-        self.execute_table_program_with_cx(program, params, track_last_insert_rowid, &execution_cx)
+        self.execute_table_program_with_cx(
+            program,
+            params,
+            track_last_insert_rowid,
+            TableExecutionRuntimeRequirements::read_path(),
+            &execution_cx,
+        )
     }
 
     /// Execute a VDBE program with the in-memory database attached using a
@@ -23651,6 +23856,7 @@ impl Connection {
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
         track_last_insert_rowid: bool,
+        runtime_requirements: TableExecutionRuntimeRequirements,
         execution_cx: &Cx,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
@@ -23665,19 +23871,9 @@ impl Connection {
                 span
             });
         let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
-        // Collect column defaults BEFORE taking the active transaction.
-        // `column_defaults_by_root_page()` calls `evaluate_column_default_value()`
-        // which uses `execute_statement` internally.  If `active_txn` were already
-        // taken, that nested execute_statement would create a new pager
-        // transaction and overwrite `concurrent_txn`/`concurrent_session_id`,
-        // causing the outer concurrent commit to skip page-lock release.
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
-        // Always populate column defaults — needed for INSERT (default
-        // values for omitted columns) and SELECT/DELETE/UPDATE (to fill
-        // in missing columns from rows written before ALTER TABLE ADD
-        // COLUMN).
-        let runtime_inputs = self.table_execution_runtime_inputs(true);
+        let runtime_inputs = self.table_execution_runtime_inputs(runtime_requirements);
 
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
@@ -31115,9 +31311,9 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     }
 }
 
-/// Compare two `SqliteValue`s with an optional collation sequence.
-/// Text values consult the shared collation registry so dynamically loaded
-/// collations participate in fallback ORDER BY / GROUP BY / DISTINCT logic.
+/// Compare text bytes using a pre-snapshotted collation registry.
+/// Avoids mutex acquisition on every comparison in O(N log N) sort loops.
+#[cfg_attr(not(test), allow(dead_code))]
 fn compare_text_bytes_collated(
     left: &[u8],
     right: &[u8],
@@ -31133,9 +31329,8 @@ fn compare_text_bytes_collated(
     compare_with(&lock_unpoisoned(collation_registry)).unwrap_or_else(|| left.cmp(right))
 }
 
-/// Lock-free variant of [`compare_text_bytes_collated`] using a pre-snapshotted
-/// registry.  Avoids mutex acquisition on every comparison — critical for
-/// O(N log N) sort loops where the lock would be acquired millions of times.
+/// Compare text bytes using a pre-snapshotted collation registry.
+/// Avoids mutex acquisition on every comparison in O(N log N) sort loops.
 fn compare_text_bytes_collated_snapshot(
     left: &[u8],
     right: &[u8],
@@ -31148,6 +31343,8 @@ fn compare_text_bytes_collated_snapshot(
         .unwrap_or_else(|| left.cmp(right))
 }
 
+/// Lock-free variant using a pre-snapshotted registry.
+#[allow(dead_code)]
 fn cmp_sqlite_values_collated(
     a: &SqliteValue,
     b: &SqliteValue,
@@ -31809,12 +32006,15 @@ fn execute_table_program_with_db(
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
             return (
-                Err(TableProgramExecError {
-                    error: e,
-                    changes: 0,
-                    last_insert_rowid: None,
-                }),
-                txn,
+                (
+                    Err(TableProgramExecError {
+                        error: e,
+                        changes: 0,
+                        last_insert_rowid: None,
+                    }),
+                    txn,
+                ),
+                Some(engine),
             );
         }
         engine.set_bindings_slice(params);
@@ -31883,12 +32083,15 @@ fn execute_table_program_with_db(
         Ok(txn) => txn,
         Err(e) => {
             return (
-                Err(TableProgramExecError {
-                    error: e,
-                    changes: engine.changes(),
-                    last_insert_rowid: engine_rowid,
-                }),
-                None,
+                (
+                    Err(TableProgramExecError {
+                        error: e,
+                        changes: engine.changes(),
+                        last_insert_rowid: engine_rowid,
+                    }),
+                    None,
+                ),
+                Some(engine),
             );
         }
     };
@@ -36297,7 +36500,7 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
                 BinaryOp::Lt => cmp == std::cmp::Ordering::Less,
                 BinaryOp::Ge => cmp != std::cmp::Ordering::Less,
                 BinaryOp::Le => cmp != std::cmp::Ordering::Greater,
-                _ => unreachable!(),
+                _ => unreachable!("outer match filters to comparison ops only"),
             };
             SqliteValue::Integer(i64::from(result))
         }
@@ -36390,7 +36593,6 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
                 SqliteValue::Integer(left.to_integer().wrapping_shr(right.to_integer() as u32))
             }
         }
-        _ => SqliteValue::Null,
     }
 }
 
@@ -65419,6 +65621,39 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_insert_precomputes_post_write_action() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_plain (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE prep_ai (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);")
+            .unwrap();
+
+        let plain_stmt = conn
+            .prepare("INSERT INTO prep_plain (id, name) VALUES (?1, ?2)")
+            .unwrap();
+        let ai_stmt = conn
+            .prepare("INSERT INTO prep_ai (name) VALUES (?1)")
+            .unwrap();
+
+        assert!(matches!(
+            plain_stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
+                kind: PreparedDmlKind::Insert,
+                post_write_action: PreparedInsertPostWriteAction::None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ai_stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
+                kind: PreparedDmlKind::Insert,
+                post_write_action: PreparedInsertPostWriteAction::RefreshAutoincrementSequence,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn test_prepare_update_with_params() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_upd (id INTEGER PRIMARY KEY, val TEXT);")
@@ -66341,6 +66576,76 @@ mod pager_routing_tests {
             profile.prepared_table_engine_reuses, 1,
             "prepared table engine should be reused on the second execution: {profile:?}"
         );
+        assert_eq!(
+            profile.autoincrement_sequence_fast_path_updates, 0,
+            "ordinary prepared inserts should skip AUTOINCREMENT follow-up work: {profile:?}"
+        );
+        assert_eq!(
+            profile.autoincrement_sequence_scan_refreshes, 0,
+            "ordinary prepared inserts should skip sqlite_sequence scan refreshes: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepared_single_row_autoincrement_uses_sqlite_sequence_fast_path() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ai_fast (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO ai_fast (val) VALUES (?1)")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Text("alpha".into())])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.autoincrement_sequence_fast_path_updates, 1,
+            "single-row AUTOINCREMENT inserts should bypass sqlite_sequence scan refreshes: {profile:?}"
+        );
+        assert_eq!(
+            profile.autoincrement_sequence_scan_refreshes, 0,
+            "single-row AUTOINCREMENT inserts should not pay the scan fallback: {profile:?}"
+        );
+
+        let seq = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'ai_fast'")
+            .unwrap();
+        assert_eq!(seq.values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_multi_row_autoincrement_falls_back_to_sequence_scan_refresh() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ai_scan (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = conn
+            .execute("INSERT INTO ai_scan (val) VALUES ('alpha'), ('beta');")
+            .unwrap();
+        assert_eq!(affected, 2);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.autoincrement_sequence_fast_path_updates, 0,
+            "multi-row AUTOINCREMENT inserts must not use the single-row fast path: {profile:?}"
+        );
+        assert_eq!(
+            profile.autoincrement_sequence_scan_refreshes, 1,
+            "multi-row AUTOINCREMENT inserts should report the scan refresh fallback: {profile:?}"
+        );
+
+        let seq = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'ai_scan'")
+            .unwrap();
+        assert_eq!(seq.values()[0], SqliteValue::Integer(2));
     }
 
     #[test]
@@ -66417,6 +66722,42 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_insert_uses_compiled_defaults_without_connection_default_pass() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE compiled_defaults_fast (
+                id INTEGER PRIMARY KEY,
+                status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 7
+            );",
+        )
+        .unwrap();
+
+        let insert_stmt = conn
+            .prepare("INSERT INTO compiled_defaults_fast (id) VALUES (?1)")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = insert_stmt
+            .execute_with_params(&[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.column_default_evaluation_passes, 0,
+            "simple prepared inserts should use bytecode-compiled defaults instead of rebuilding the connection default map: {profile:?}"
+        );
+
+        let row = conn
+            .query_row("SELECT status, attempts FROM compiled_defaults_fast WHERE id = 1")
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Text("pending".into()));
+        assert_eq!(row.values()[1], SqliteValue::Integer(7));
+    }
+
+    #[test]
     fn test_table_execution_runtime_inputs_reuse_structural_metadata_maps() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE runtime_inputs_fast (id INTEGER PRIMARY KEY, val TEXT);")
@@ -66424,8 +66765,10 @@ mod pager_routing_tests {
         conn.execute("CREATE INDEX runtime_inputs_fast_val ON runtime_inputs_fast(val);")
             .unwrap();
 
-        let first = conn.table_execution_runtime_inputs(true);
-        let second = conn.table_execution_runtime_inputs(true);
+        let first =
+            conn.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
+        let second =
+            conn.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
 
         assert!(
             Arc::ptr_eq(
@@ -66451,7 +66794,7 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_table_execution_runtime_inputs_skip_insert_only_metadata_for_non_insert_paths() {
+    fn test_table_execution_runtime_inputs_scope_insert_only_metadata_to_target_table() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
             "CREATE TABLE runtime_inputs_insert_only (
@@ -66475,33 +66818,36 @@ mod pager_routing_tests {
             .map(|table| table.root_page)
             .expect("table root page should exist");
 
-        let non_insert = conn.table_execution_runtime_inputs(false);
+        let read_path =
+            conn.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
         assert!(
-            non_insert.autoincrement_seq_by_root_page.is_empty(),
-            "non-insert executions should not rebuild autoincrement sequence metadata"
+            read_path.autoincrement_seq_by_root_page.is_empty(),
+            "read/update/delete paths should not rebuild AUTOINCREMENT sequence metadata"
+        );
+        assert_eq!(
+            read_path.column_defaults_by_root_page.get(&root_page),
+            Some(&vec![None, Some(SqliteValue::Text("fallback".into())),]),
+            "read paths still need legacy short-record defaults for ALTER TABLE compatibility"
+        );
+
+        let simple_insert = conn.table_execution_runtime_inputs(
+            TableExecutionRuntimeRequirements::write_path(Some(root_page), false),
         );
         assert!(
-            non_insert.column_defaults_by_root_page.is_empty(),
-            "non-insert executions should not evaluate column defaults"
+            simple_insert.column_defaults_by_root_page.is_empty(),
+            "simple insert executions should not rebuild the legacy read-default map"
         );
         assert!(
             Arc::ptr_eq(
-                &non_insert.column_defaults_by_root_page,
+                &simple_insert.column_defaults_by_root_page,
                 &empty_column_defaults_arc()
             ),
-            "non-insert executions should reuse the shared empty defaults map"
+            "simple insert executions should reuse the shared empty defaults map"
         );
-
-        let insert = conn.table_execution_runtime_inputs(true);
         assert_eq!(
-            insert.autoincrement_seq_by_root_page.get(&root_page),
+            simple_insert.autoincrement_seq_by_root_page.get(&root_page),
             Some(&1),
-            "insert executions should still receive AUTOINCREMENT sequence state"
-        );
-        assert_eq!(
-            insert.column_defaults_by_root_page.get(&root_page),
-            Some(&vec![None, Some(SqliteValue::Text("fallback".into())),]),
-            "insert executions should still evaluate column defaults"
+            "simple insert executions should still receive target-table AUTOINCREMENT sequence state"
         );
     }
 
