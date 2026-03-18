@@ -343,7 +343,7 @@ fn bloom_hash(val: &SqliteValue) -> u64 {
             return h;
         }
         SqliteValue::Text(s) => s.as_bytes(),
-        SqliteValue::Blob(b) => &**b,
+        SqliteValue::Blob(b) => b,
     };
     for &b in bytes {
         h ^= u64::from(b);
@@ -937,7 +937,6 @@ impl SharedTxnPageIo {
     }
 
     fn restore_concurrent_page_state(
-        &self,
         ctx: &ConcurrentContext,
         page_state: &ConcurrentPageState,
         restore_label: &str,
@@ -972,7 +971,7 @@ impl SharedTxnPageIo {
             .borrow_mut()
             .write_page_data(cx, page_no, page_data_base)
         {
-            self.restore_concurrent_page_state(
+            Self::restore_concurrent_page_state(
                 ctx,
                 &prior_state,
                 &format!("pager write_page failed: {write_error}; MVCC fast-path restore failed"),
@@ -1023,7 +1022,7 @@ impl SharedTxnPageIo {
                 let error = FrankenError::BusySnapshot {
                     conflicting_pages: page_no.get().to_string(),
                 };
-                self.restore_concurrent_page_state(
+                Self::restore_concurrent_page_state(
                     ctx,
                     &prior_page_state,
                     &format!("{error}; MVCC state restore failed"),
@@ -1073,7 +1072,7 @@ impl SharedTxnPageIo {
                         }
                         Ok(false) => {
                             let error = FrankenError::Busy;
-                            self.restore_concurrent_page_state(
+                            Self::restore_concurrent_page_state(
                                 ctx,
                                 &prior_page_state,
                                 &format!("{error}; MVCC state restore failed"),
@@ -1092,7 +1091,7 @@ impl SharedTxnPageIo {
                             return Err(error);
                         }
                         Err(wait_error) => {
-                            self.restore_concurrent_page_state(
+                            Self::restore_concurrent_page_state(
                                 ctx,
                                 &prior_page_state,
                                 &format!("{wait_error}; MVCC state restore failed"),
@@ -1103,7 +1102,7 @@ impl SharedTxnPageIo {
                 }
                 Err(e) => {
                     let error = FrankenError::Internal(format!("MVCC write_page failed: {e}"));
-                    self.restore_concurrent_page_state(
+                    Self::restore_concurrent_page_state(
                         ctx,
                         &prior_page_state,
                         &format!("{error}; MVCC state restore failed"),
@@ -1128,7 +1127,7 @@ impl SharedTxnPageIo {
             if let Err(stage_error) =
                 concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
             {
-                self.restore_concurrent_page_state(
+                Self::restore_concurrent_page_state(
                     ctx,
                     &prior_page_state,
                     &format!("MVCC write staging failed: {stage_error}; MVCC state restore failed"),
@@ -1144,7 +1143,7 @@ impl SharedTxnPageIo {
             .borrow_mut()
             .write_page_data(cx, page_no, page_data_base)
         {
-            self.restore_concurrent_page_state(
+            Self::restore_concurrent_page_state(
                 ctx,
                 &prior_page_state,
                 &format!("pager write_page failed: {write_error}; MVCC state restore failed"),
@@ -9935,7 +9934,7 @@ fn encode_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
 /// Extract the raw bytes from a record blob value (output of `MakeRecord`).
 fn record_blob_bytes(val: &SqliteValue) -> &[u8] {
     match val {
-        SqliteValue::Blob(bytes) => &**bytes,
+        SqliteValue::Blob(bytes) => bytes,
         _ => &[],
     }
 }

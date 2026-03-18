@@ -3258,7 +3258,7 @@ fn expr_has_window(expr: &Expr) -> bool {
             else_expr,
             ..
         } => {
-            operand.as_deref().is_some_and(|e| expr_has_window(e))
+            operand.as_deref().is_some_and(expr_has_window)
                 || whens.iter().any(|(when_expr, then_expr)| {
                     expr_has_window(when_expr) || expr_has_window(then_expr)
                 })
@@ -3862,12 +3862,11 @@ fn resolve_join_column(
     let name_lower = name.to_ascii_lowercase();
     for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
         // Check if qualifier matches table name or alias.
-        let matches_qualifier = qualifier.is_none()
-            || qualifier.is_some_and(|q| {
-                let q_lower = q.to_ascii_lowercase();
-                alias.is_some_and(|a| a.eq_ignore_ascii_case(&q_lower))
-                    || table.name.eq_ignore_ascii_case(&q_lower)
-            });
+        let matches_qualifier = qualifier.is_none_or(|q| {
+            let q_lower = q.to_ascii_lowercase();
+            alias.is_some_and(|a| a.eq_ignore_ascii_case(&q_lower))
+                || table.name.eq_ignore_ascii_case(&q_lower)
+        });
         if !matches_qualifier {
             continue;
         }
