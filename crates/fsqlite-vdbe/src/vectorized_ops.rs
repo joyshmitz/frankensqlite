@@ -900,7 +900,7 @@ mod tests {
         let specs = vec![ColumnSpec::new("name", ColumnVectorType::Text)];
         let rows: Vec<Vec<SqliteValue>> = values
             .iter()
-            .map(|&v| vec![SqliteValue::Text(v.to_owned())])
+            .map(|&v| vec![SqliteValue::Text(v.into())])
             .collect();
         Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch should build")
     }
@@ -909,7 +909,7 @@ mod tests {
         let specs = vec![ColumnSpec::new("data", ColumnVectorType::Binary)];
         let rows: Vec<Vec<SqliteValue>> = values
             .iter()
-            .map(|v| vec![SqliteValue::Blob(v.to_vec())])
+            .map(|v| vec![SqliteValue::Blob(v.to_vec().into())])
             .collect();
         Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch should build")
     }

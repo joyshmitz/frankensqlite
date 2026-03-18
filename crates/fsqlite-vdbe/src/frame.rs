@@ -498,10 +498,10 @@ mod tests {
         // OLD values at registers [1..=3], NEW values at [4..=6].
         let mut parent_frame = make_frame(100, 7, 1, 0, "trg_update");
         parent_frame.registers[1] = SqliteValue::Integer(10); // OLD.a
-        parent_frame.registers[2] = SqliteValue::Text("hello".to_owned()); // OLD.b
+        parent_frame.registers[2] = SqliteValue::Text("hello".into()); // OLD.b
         parent_frame.registers[3] = SqliteValue::Float(std::f64::consts::PI); // OLD.c
         parent_frame.registers[4] = SqliteValue::Integer(20); // NEW.a
-        parent_frame.registers[5] = SqliteValue::Text("world".to_owned()); // NEW.b
+        parent_frame.registers[5] = SqliteValue::Text("world".into()); // NEW.b
         parent_frame.registers[6] = SqliteValue::Float(2.72); // NEW.c
         parent_frame.pseudo_tables = Some(PseudoTableMapping {
             old_base: Some(1),
@@ -529,7 +529,7 @@ mod tests {
         // Read NEW.b (register at new_base + 1).
         let new_base = usize::try_from(mapping.new_base.expect("new_base must exist"))
             .expect("new_base must be non-negative");
-        assert!(matches!(&parent.registers[new_base + 1], SqliteValue::Text(s) if s == "world"));
+        assert!(matches!(&parent.registers[new_base + 1], SqliteValue::Text(s) if &**s == "world"));
 
         // Modify NEW.a in parent frame (simulates trigger body setting NEW value).
         let parent_mut = &mut stack.frames[0].0;
@@ -594,7 +594,7 @@ mod tests {
 
         let err = stack
             .update_top(|frame| {
-                frame.registers[0] = SqliteValue::Text("x".repeat(512));
+                frame.registers[0] = SqliteValue::Text("x".repeat(512).into());
             })
             .expect_err("budget-busting top mutation must fail");
         assert!(matches!(err, FrankenError::OutOfMemory));
@@ -636,7 +636,7 @@ mod tests {
         stack
             .update_top(|frame| {
                 frame.trigger_name.push_str("_expanded");
-                frame.registers[0] = SqliteValue::Blob(vec![7; 128]);
+                frame.registers[0] = SqliteValue::Blob(vec![7; 128].into());
             })
             .expect("top mutation should succeed");
 
@@ -724,8 +724,8 @@ mod tests {
     #[test]
     fn test_frame_estimated_memory_with_text_blob() {
         let mut frame = make_frame(0, 3, 0, 0, "trg_mem_test");
-        frame.registers[0] = SqliteValue::Text("a".repeat(1024));
-        frame.registers[1] = SqliteValue::Blob(vec![0u8; 2048]);
+        frame.registers[0] = SqliteValue::Text("a".repeat(1024).into());
+        frame.registers[1] = SqliteValue::Blob(vec![0u8; 2048].into());
         frame.registers[2] = SqliteValue::Integer(42);
 
         let mem = frame.estimated_memory();

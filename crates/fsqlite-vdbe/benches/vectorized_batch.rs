@@ -25,8 +25,8 @@ fn build_rows(row_count: usize) -> Vec<Vec<SqliteValue>> {
         rows.push(vec![
             SqliteValue::Integer(i64::try_from(row_id).expect("row id should fit into i64")),
             SqliteValue::Float(row_id as f64 * 1.25),
-            SqliteValue::Blob(payload),
-            SqliteValue::Text(format!("row-{row_id:04}")),
+            SqliteValue::Blob(payload.into()),
+            SqliteValue::Text(format!("row-{row_id:04}").into()),
         ]);
     }
     rows

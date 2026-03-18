@@ -10984,12 +10984,9 @@ mod tests {
                 b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
                 b.resolve_label(end);
             },
-            vec![
-                SqliteValue::Integer(11),
-                SqliteValue::Text("bound".to_owned()),
-            ],
+            vec![SqliteValue::Integer(11), SqliteValue::Text("bound".into())],
         );
-        assert_eq!(rows, vec![vec![SqliteValue::Text("bound".to_owned())]]);
+        assert_eq!(rows, vec![vec![SqliteValue::Text("bound".into())]]);
     }
 
     #[test]
@@ -11083,7 +11080,7 @@ mod tests {
         });
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![SqliteValue::Integer(3)]);
-        assert_eq!(rows[1], vec![SqliteValue::Text("abcdef".to_owned())]);
+        assert_eq!(rows[1], vec![SqliteValue::Text("abcdef".into())]);
     }
 
     // ── test_select_multi_column ────────────────────────────────────────
@@ -11115,10 +11112,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0],
-            vec![
-                SqliteValue::Integer(3),
-                SqliteValue::Text("abcdef".to_owned()),
-            ]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("abcdef".into()),]
         );
     }
 
@@ -12369,7 +12363,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Text("hello".to_owned())]);
+        assert_eq!(rows[0], vec![SqliteValue::Text("hello".into())]);
     }
 
     #[test]
@@ -12392,7 +12386,7 @@ mod tests {
         });
         assert_eq!(
             rows[0],
-            vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])]
+            vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into())]
         );
     }
 
@@ -12472,8 +12466,8 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Text("copy_me".to_owned())]);
-        assert_eq!(rows[1], vec![SqliteValue::Text("copy_me".to_owned())]);
+        assert_eq!(rows[0], vec![SqliteValue::Text("copy_me".into())]);
+        assert_eq!(rows[1], vec![SqliteValue::Text("copy_me".into())]);
     }
 
     #[test]
@@ -12889,7 +12883,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Text("hello world".to_owned())]);
+        assert_eq!(rows[0], vec![SqliteValue::Text("hello world".into())]);
     }
 
     #[test]
@@ -12907,7 +12901,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Text("test".to_owned())]);
+        assert_eq!(rows[0], vec![SqliteValue::Text("test".into())]);
     }
 
     // ── Comparison Ops (all 6 + NULL) ──────────────────────────────────
@@ -13440,7 +13434,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Text("42".to_owned())]);
+        assert_eq!(rows[0], vec![SqliteValue::Text("42".into())]);
     }
 
     #[test]
@@ -13488,7 +13482,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Blob(b"hi".to_vec())]);
+        assert_eq!(rows[0], vec![SqliteValue::Blob(b"hi".to_vec().into())]);
     }
 
     #[test]
@@ -13898,7 +13892,7 @@ mod tests {
             rows[0],
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("two".to_owned()),
+                SqliteValue::Text("two".into()),
                 SqliteValue::Float(3.0),
             ]
         );
@@ -14031,7 +14025,7 @@ mod tests {
         let decoded = decode_record(&rows[0][0]).unwrap();
         assert_eq!(
             decoded,
-            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())]
         );
     }
 
@@ -14074,7 +14068,7 @@ mod tests {
             b.resolve_label(end);
         });
 
-        assert_eq!(rows, vec![vec![SqliteValue::Text("null".to_owned())]]);
+        assert_eq!(rows, vec![vec![SqliteValue::Text("null".into())]]);
     }
 
     #[test]
@@ -14225,11 +14219,11 @@ mod tests {
         let table = db.get_table_mut(root).unwrap();
         table.insert(
             1,
-            vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
+            vec![SqliteValue::Integer(10), SqliteValue::Text("a".into())],
         );
         table.insert(
             2,
-            vec![SqliteValue::Integer(20), SqliteValue::Text("b".to_owned())],
+            vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
         );
 
         let rows = run_with_storage_cursors(db, |b| {
@@ -14253,9 +14247,9 @@ mod tests {
 
         assert_eq!(rows.len(), 2, "should return 2 rows via storage cursor");
         assert_eq!(rows[0][0], SqliteValue::Integer(10));
-        assert_eq!(rows[0][1], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0][1], SqliteValue::Text("a".into()));
         assert_eq!(rows[1][0], SqliteValue::Integer(20));
-        assert_eq!(rows[1][1], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[1][1], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -14405,7 +14399,7 @@ mod tests {
             "should read back exactly one row from B-tree"
         );
         assert_eq!(rows[0][0], SqliteValue::Integer(42));
-        assert_eq!(rows[0][1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0][1], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -15103,9 +15097,9 @@ mod tests {
 
     #[test]
     fn test_distinct_key_collated_honors_rtrim() {
-        let base = distinct_key_collated(&[SqliteValue::Text("abc".to_owned())], Some("RTRIM"));
-        let padded = distinct_key_collated(&[SqliteValue::Text("abc  ".to_owned())], Some("rtrim"));
-        let tabbed = distinct_key_collated(&[SqliteValue::Text("abc\t".to_owned())], Some("RTRIM"));
+        let base = distinct_key_collated(&[SqliteValue::Text("abc".into())], Some("RTRIM"));
+        let padded = distinct_key_collated(&[SqliteValue::Text("abc  ".into())], Some("rtrim"));
+        let tabbed = distinct_key_collated(&[SqliteValue::Text("abc\t".into())], Some("RTRIM"));
 
         assert_eq!(
             base, padded,
@@ -15670,10 +15664,9 @@ mod tests {
         reset_vdbe_metrics();
         set_vdbe_metrics_enabled(false);
 
-        let record = SqliteValue::Blob(encode_record(&[
-            SqliteValue::Integer(7),
-            SqliteValue::Text("hello".to_owned()),
-        ]));
+        let record = SqliteValue::Blob(
+            encode_record(&[SqliteValue::Integer(7), SqliteValue::Text("hello".into())]).into(),
+        );
 
         let before = vdbe_metrics_snapshot();
         let decoded_without_metrics =
@@ -15681,10 +15674,7 @@ mod tests {
         let after_without_metrics = vdbe_metrics_snapshot();
         assert_eq!(
             decoded_without_metrics,
-            vec![
-                SqliteValue::Integer(7),
-                SqliteValue::Text("hello".to_owned())
-            ]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("hello".into())]
         );
         assert_eq!(
             after_without_metrics.record_decode_calls_total,
@@ -15912,10 +15902,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(
-            alpha_rows,
-            vec![vec![SqliteValue::Text("alpha".to_owned())]]
-        );
+        assert_eq!(alpha_rows, vec![vec![SqliteValue::Text("alpha".into())]]);
 
         let beta_rows = run_program(|b| {
             let end = b.emit_label();
@@ -15925,7 +15912,7 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(beta_rows, vec![vec![SqliteValue::Text("beta".to_owned())]]);
+        assert_eq!(beta_rows, vec![vec![SqliteValue::Text("beta".into())]]);
 
         let after = vdbe_jit_metrics_snapshot();
         let delta_compilations = after.jit_compilations_total - before.jit_compilations_total;
@@ -16888,7 +16875,7 @@ mod tests {
             b.resolve_label(end);
         });
 
-        assert_eq!(rows, vec![vec![SqliteValue::Text("wal".to_owned())]]);
+        assert_eq!(rows, vec![vec![SqliteValue::Text("wal".into())]]);
     }
 
     #[test]
@@ -16906,7 +16893,7 @@ mod tests {
             b.resolve_label(end);
         });
 
-        assert_eq!(rows, vec![vec![SqliteValue::Text("ok".to_owned())]]);
+        assert_eq!(rows, vec![vec![SqliteValue::Text("ok".into())]]);
     }
 
     // ── Vacuum and IncrVacuum ────────────────────────────────────
@@ -17313,8 +17300,8 @@ mod tests {
     #[test]
     fn test_vfilter_vcolumn_vnext_scan_loop() {
         let cursor = MockVtabCursor::new(vec![
-            vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
-            vec![SqliteValue::Integer(20), SqliteValue::Text("b".to_owned())],
+            vec![SqliteValue::Integer(10), SqliteValue::Text("a".into())],
+            vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
         ]);
         let (rows, outcome) = run_vtab_program(0, cursor, |b| {
             let end = b.emit_label();
@@ -17338,8 +17325,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
-                vec![SqliteValue::Integer(20), SqliteValue::Text("b".to_owned())],
+                vec![SqliteValue::Integer(10), SqliteValue::Text("a".into())],
+                vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
             ]
         );
     }
@@ -18779,10 +18766,10 @@ mod tests {
     #[test]
     fn test_take_reg_clears_subtype_metadata() {
         let mut engine = VdbeEngine::new(4);
-        engine.set_reg(1, SqliteValue::Text("payload".to_owned()));
+        engine.set_reg(1, SqliteValue::Text("payload".into()));
         engine.register_subtypes.insert(1, 74);
 
-        assert_eq!(engine.take_reg(1), SqliteValue::Text("payload".to_owned()));
+        assert_eq!(engine.take_reg(1), SqliteValue::Text("payload".into()));
         assert_eq!(engine.get_reg(1), &SqliteValue::Null);
         assert!(
             !engine.register_subtypes.contains_key(&1),
@@ -18948,8 +18935,8 @@ mod tests {
 
     #[test]
     fn test_execute_reuse_clears_bloom_filters() {
-        let added_value = SqliteValue::Text("hello".to_owned());
-        let missing_value = SqliteValue::Text("world".to_owned());
+        let added_value = SqliteValue::Text("hello".into());
+        let missing_value = SqliteValue::Text("world".into());
         let bloom_bits = (BLOOM_FILTER_WORDS * 64) as u64;
         assert_ne!(
             bloom_hash(&added_value) % bloom_bits,

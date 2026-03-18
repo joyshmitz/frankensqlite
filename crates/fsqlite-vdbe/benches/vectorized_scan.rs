@@ -74,13 +74,16 @@ fn row_for_rowid(rowid: i64) -> Vec<SqliteValue> {
     vec![
         SqliteValue::Integer(rowid),
         SqliteValue::Float(rowid as f64 * 0.25),
-        SqliteValue::Text(format!("bench-row-{rowid:06}")),
-        SqliteValue::Blob(vec![
-            u8::try_from(rowid.rem_euclid(251)).expect("mod value should fit into u8"),
-            u8::try_from((rowid * 3).rem_euclid(251)).expect("mod value should fit into u8"),
-            u8::try_from((rowid * 11).rem_euclid(251)).expect("mod value should fit into u8"),
-            u8::try_from((rowid * 19).rem_euclid(251)).expect("mod value should fit into u8"),
-        ]),
+        SqliteValue::Text(format!("bench-row-{rowid:06}").into()),
+        SqliteValue::Blob(
+            vec![
+                u8::try_from(rowid.rem_euclid(251)).expect("mod value should fit into u8"),
+                u8::try_from((rowid * 3).rem_euclid(251)).expect("mod value should fit into u8"),
+                u8::try_from((rowid * 11).rem_euclid(251)).expect("mod value should fit into u8"),
+                u8::try_from((rowid * 19).rem_euclid(251)).expect("mod value should fit into u8"),
+            ]
+            .into(),
+        ),
     ]
 }
 

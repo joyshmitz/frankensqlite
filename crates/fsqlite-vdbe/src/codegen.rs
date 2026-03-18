@@ -3833,16 +3833,17 @@ fn emit_join_expr(
             Ok(())
         }
         Expr::IsNull {
-            expr: inner,
-            not: _,
-            ..
+            expr: inner, not, ..
         } => {
             let inner_reg = b.alloc_regs(1);
             emit_join_expr(b, inner, inner_reg, tables, _ctx)?;
             let skip = b.emit_label();
-            b.emit_op(Opcode::Integer, 1, target, 0, P4::None, 0);
+            // IS NULL: result is 1 when inner is null, 0 otherwise.
+            // IS NOT NULL: result is 0 when inner is null, 1 otherwise.
+            let (val_if_null, val_if_not_null) = if *not { (0, 1) } else { (1, 0) };
+            b.emit_op(Opcode::Integer, val_if_null, target, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::IsNull, inner_reg, 0, skip, P4::None, 0);
-            b.emit_op(Opcode::Integer, 0, target, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, val_if_not_null, target, 0, P4::None, 0);
             b.resolve_label(skip);
             Ok(())
         }

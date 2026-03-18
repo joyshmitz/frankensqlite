@@ -565,12 +565,17 @@ mod tests {
         vec![
             SqliteValue::Integer(rowid * 7),
             SqliteValue::Float(rowid as f64 * 0.5),
-            SqliteValue::Text(format!("row-{rowid:05}")),
-            SqliteValue::Blob(vec![
-                u8::try_from(rowid.rem_euclid(251)).expect("mod value should fit into u8"),
-                u8::try_from((rowid * 3).rem_euclid(251)).expect("mod value should fit into u8"),
-                u8::try_from((rowid * 7).rem_euclid(251)).expect("mod value should fit into u8"),
-            ]),
+            SqliteValue::Text(format!("row-{rowid:05}").into()),
+            SqliteValue::Blob(
+                vec![
+                    u8::try_from(rowid.rem_euclid(251)).expect("mod value should fit into u8"),
+                    u8::try_from((rowid * 3).rem_euclid(251))
+                        .expect("mod value should fit into u8"),
+                    u8::try_from((rowid * 7).rem_euclid(251))
+                        .expect("mod value should fit into u8"),
+                ]
+                .into(),
+            ),
         ]
     }
 

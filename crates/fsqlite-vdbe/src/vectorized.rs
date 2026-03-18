@@ -1020,14 +1020,14 @@ mod tests {
             vec![
                 SqliteValue::Integer(1),
                 SqliteValue::Float(1.5),
-                SqliteValue::Blob(vec![1, 2, 3]),
-                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Blob(vec![1, 2, 3].into()),
+                SqliteValue::Text("alice".into()),
             ],
             vec![
                 SqliteValue::Integer(2),
                 SqliteValue::Null,
-                SqliteValue::Blob(vec![9, 8]),
-                SqliteValue::Text("bob".to_owned()),
+                SqliteValue::Blob(vec![9, 8].into()),
+                SqliteValue::Text("bob".into()),
             ],
         ]
     }
