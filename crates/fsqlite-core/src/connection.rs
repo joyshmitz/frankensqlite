@@ -4477,6 +4477,11 @@ impl Connection {
         let trace_registration = self.trace_registration.get_mut().clone();
 
         let cx = self.teardown_cx();
+        // Rollback any cached read-only snapshot before closing.
+        if let Some(mut cached) = self.cached_read_snapshot.get_mut().take() {
+            let _ = cached.rollback(&cx);
+        }
+
         let live_vtab_txn_open = !self.live_vtab_transactions.get_mut().is_empty();
         let had_active_txn = self.active_txn.get_mut().is_some();
         let txn_was_open = *self.in_transaction.get_mut() || had_active_txn || live_vtab_txn_open;
@@ -9692,10 +9697,13 @@ impl Connection {
         // pager transaction from a prior autocommit SELECT, reuse it instead
         // of creating a new one.  This eliminates per-statement begin/commit
         // overhead for consecutive reads.  Only valid when:
+        //   - Backend is :memory: (no external writers that could commit
+        //     between our cached reads and make the snapshot stale)
         //   - Requested mode is ReadOnly (not write/concurrent)
         //   - Schema cookie hasn't changed (no DDL since cache)
         //   - No explicit transaction is active
-        if mode == TransactionMode::ReadOnly
+        if self.pager.is_memory()
+            && mode == TransactionMode::ReadOnly
             && self.cached_read_snapshot.borrow().is_some()
             && self.cached_read_snapshot_cookie.get() == *self.schema_cookie.borrow()
         {
@@ -9867,11 +9875,19 @@ impl Connection {
         // Persistent read-only snapshot: if the autocommit transaction was
         // read-only and succeeded, park it for reuse by the next autocommit
         // read instead of committing (which is a no-op for readers anyway).
+        // Only for :memory: — file-backed databases may have external writers.
         if ok
+            && self.pager.is_memory()
             && !txn_has_pending_writes
             && !*self.concurrent_txn.borrow()
             && self.live_vtab_transactions.borrow().is_empty()
         {
+            // Rollback any previously parked snapshot (possible if a
+            // re-entrant connection-fallback subquery parked its own
+            // read snapshot while the outer VDBE was executing).
+            if let Some(mut old) = self.cached_read_snapshot.borrow_mut().take() {
+                let _ = old.rollback(cx);
+            }
             let cookie = *self.schema_cookie.borrow();
             *self.cached_read_snapshot.borrow_mut() = Some(txn);
             self.cached_read_snapshot_cookie.set(cookie);
@@ -13506,6 +13522,15 @@ impl Connection {
         // body that modifies the same table must NOT re-fire triggers on
         // that table.  Check if we are already inside a trigger for this
         // table; if so, and recursive_triggers is off, skip firing.
+        //
+        // NOTE: SQLite checks by trigger NAME (the same trigger cannot
+        // re-enter itself), which allows trigger A on table T to fire
+        // trigger B on table T during A's body.  Our check uses TABLE
+        // NAME, which is more conservative — it suppresses ALL triggers
+        // on the same table.  This is safe (no false infinite-recursion)
+        // and correct for the common single-trigger-per-table case; full
+        // per-trigger-name tracking would require adding a trigger_name
+        // field to TriggerFrame.
         if !self.pragma_state.borrow().recursive_triggers
             && self
                 .trigger_frame_stack
@@ -13571,6 +13596,7 @@ impl Connection {
 
         // PRAGMA recursive_triggers (default OFF): skip when already inside
         // a trigger for the same table and recursion is disabled.
+        // (See fire_before_triggers for the table-name vs trigger-name note.)
         if !self.pragma_state.borrow().recursive_triggers
             && self
                 .trigger_frame_stack
@@ -15134,6 +15160,8 @@ impl Connection {
         // If no explicit transaction, implicitly begin one.
         let started_implicit_txn = !*self.in_transaction.borrow();
         if started_implicit_txn {
+            // Discard cached read snapshot — implicit transaction starts fresh.
+            self.invalidate_cached_read_snapshot(&cx);
             let is_concurrent = *self.concurrent_mode_default.borrow();
             let pager_mode = if is_concurrent {
                 TransactionMode::Concurrent
@@ -34209,10 +34237,18 @@ fn bind_trigger_columns_in_expr_inner(expr: &mut Expr, frame: &TriggerFrame, pre
         Expr::Literal(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {}
         Expr::Column(col_ref, _) => {
             let table_prefix = col_ref.table.as_deref();
-            // In prefix_only mode, skip bare column references (no table
-            // qualifier) so they resolve against the DML target table.
-            if prefix_only && table_prefix.is_none() {
-                return;
+            if prefix_only {
+                // In prefix_only mode (DML WHERE/SET inside trigger bodies),
+                // only replace column references with an explicit OLD or NEW
+                // qualifier.  Bare names (`id`) and table-qualified names
+                // (`t.id`) must resolve against the DML's target table at
+                // execution time — they are NOT trigger pseudo-columns.
+                let is_old_or_new = table_prefix.is_some_and(|p| {
+                    p.eq_ignore_ascii_case("old") || p.eq_ignore_ascii_case("new")
+                });
+                if !is_old_or_new {
+                    return;
+                }
             }
             let column_name = col_ref.column.clone();
             if frame.references_pseudo_column(table_prefix, &column_name) {

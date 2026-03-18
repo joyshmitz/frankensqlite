@@ -32,7 +32,7 @@ use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_ben
 use crate::fixture_select::{BenchmarkArtifactCommand, BenchmarkArtifactToolVersion};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
-use crate::report::EngineRunReport;
+use crate::report::{EngineRunReport, HotPathRetryBreakdown};
 use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use crate::sqlite_executor::run_oplog_sqlite;
 
@@ -259,6 +259,36 @@ pub struct HotPathRowMaterializationProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathMvccWriteProfile {
+    pub total_write_attempts: u64,
+    pub tier0_already_owned_writes_total: u64,
+    pub tier1_first_touch_writes_total: u64,
+    pub tier2_commit_surface_writes_total: u64,
+    pub page_lock_waits_total: u64,
+    pub page_lock_wait_time_ns_total: u64,
+    pub write_busy_retries_total: u64,
+    pub write_busy_timeouts_total: u64,
+    pub stale_snapshot_rejects_total: u64,
+    pub page_one_conflict_tracks_total: u64,
+    pub page_one_conflict_track_time_ns_total: u64,
+    pub pending_commit_surface_clears_total: u64,
+    pub pending_commit_surface_clear_time_ns_total: u64,
+    pub runtime_retry: HotPathRetryBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathPageDataMotionProfile {
+    pub borrowed_write_normalization_calls_total: u64,
+    pub borrowed_exact_size_copies_total: u64,
+    pub owned_write_normalization_calls_total: u64,
+    pub owned_passthrough_total: u64,
+    pub owned_resized_copies_total: u64,
+    pub normalized_payload_bytes_total: u64,
+    pub normalized_zero_fill_bytes_total: u64,
+    pub normalized_bytes_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathOpcodeProfileEntry {
     pub opcode: String,
     pub total: u64,
@@ -304,6 +334,8 @@ pub struct HotPathSubsystemProfilePack {
     pub parser: HotPathParserProfile,
     pub record_decode: HotPathRecordDecodeProfile,
     pub row_materialization: HotPathRowMaterializationProfile,
+    pub mvcc_write: HotPathMvccWriteProfile,
+    pub page_data_motion: HotPathPageDataMotionProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,6 +457,7 @@ pub struct HotPathAllocatorPressure {
     pub decoded_value_heap_bytes_total: u64,
     pub result_value_heap_bytes_total: u64,
     pub record_vec_capacity_slots: u64,
+    pub page_data_normalization_bytes_total: u64,
     pub ranked_sources: Vec<HotPathRankingEntry>,
 }
 
@@ -449,6 +482,8 @@ pub struct HotPathProfileReport {
     pub parser: HotPathParserProfile,
     pub record_decode: HotPathRecordDecodeProfile,
     pub row_materialization: HotPathRowMaterializationProfile,
+    pub mvcc_write: HotPathMvccWriteProfile,
+    pub page_data_motion: HotPathPageDataMotionProfile,
     pub opcode_profile: Vec<HotPathOpcodeProfileEntry>,
     pub type_profile: HotPathTypeProfile,
     pub subsystem_ranking: Vec<HotPathRankingEntry>,
@@ -709,6 +744,97 @@ fn build_hot_path_profile_report(
         make_record_blob_bytes_total: snapshot.vdbe.make_record_blob_bytes_total,
         value_types: materialized_types.clone(),
     };
+    let runtime_retry = engine_report
+        .hot_path_profile
+        .as_ref()
+        .map(|profile| profile.runtime_retry.clone())
+        .unwrap_or_else(|| HotPathRetryBreakdown {
+            total_retries: engine_report.retries,
+            total_aborts: engine_report.aborts,
+            ..HotPathRetryBreakdown::default()
+        });
+    let mvcc_write = HotPathMvccWriteProfile {
+        total_write_attempts: snapshot
+            .vdbe
+            .mvcc_write_path
+            .tier0_already_owned_writes_total
+            .saturating_add(snapshot.vdbe.mvcc_write_path.tier1_first_touch_writes_total)
+            .saturating_add(
+                snapshot
+                    .vdbe
+                    .mvcc_write_path
+                    .tier2_commit_surface_writes_total,
+            ),
+        tier0_already_owned_writes_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .tier0_already_owned_writes_total,
+        tier1_first_touch_writes_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .tier1_first_touch_writes_total,
+        tier2_commit_surface_writes_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .tier2_commit_surface_writes_total,
+        page_lock_waits_total: snapshot.vdbe.mvcc_write_path.page_lock_waits_total,
+        page_lock_wait_time_ns_total: snapshot.vdbe.mvcc_write_path.page_lock_wait_time_ns_total,
+        write_busy_retries_total: snapshot.vdbe.mvcc_write_path.write_busy_retries_total,
+        write_busy_timeouts_total: snapshot.vdbe.mvcc_write_path.write_busy_timeouts_total,
+        stale_snapshot_rejects_total: snapshot.vdbe.mvcc_write_path.stale_snapshot_rejects_total,
+        page_one_conflict_tracks_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .page_one_conflict_tracks_total,
+        page_one_conflict_track_time_ns_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .page_one_conflict_track_time_ns_total,
+        pending_commit_surface_clears_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .pending_commit_surface_clears_total,
+        pending_commit_surface_clear_time_ns_total: snapshot
+            .vdbe
+            .mvcc_write_path
+            .pending_commit_surface_clear_time_ns_total,
+        runtime_retry,
+    };
+    let page_data_normalization_bytes_total = snapshot
+        .vdbe
+        .page_data_motion
+        .normalized_payload_bytes_total
+        .saturating_add(
+            snapshot
+                .vdbe
+                .page_data_motion
+                .normalized_zero_fill_bytes_total,
+        );
+    let page_data_motion = HotPathPageDataMotionProfile {
+        borrowed_write_normalization_calls_total: snapshot
+            .vdbe
+            .page_data_motion
+            .borrowed_write_normalization_calls_total,
+        borrowed_exact_size_copies_total: snapshot
+            .vdbe
+            .page_data_motion
+            .borrowed_exact_size_copies_total,
+        owned_write_normalization_calls_total: snapshot
+            .vdbe
+            .page_data_motion
+            .owned_write_normalization_calls_total,
+        owned_passthrough_total: snapshot.vdbe.page_data_motion.owned_passthrough_total,
+        owned_resized_copies_total: snapshot.vdbe.page_data_motion.owned_resized_copies_total,
+        normalized_payload_bytes_total: snapshot
+            .vdbe
+            .page_data_motion
+            .normalized_payload_bytes_total,
+        normalized_zero_fill_bytes_total: snapshot
+            .vdbe
+            .page_data_motion
+            .normalized_zero_fill_bytes_total,
+        normalized_bytes_total: page_data_normalization_bytes_total,
+    };
 
     let parser_time_ns = parser
         .parse_time_ns
@@ -732,6 +858,28 @@ fn build_hot_path_profile_report(
             metric_kind: "time_ns".to_owned(),
             metric_value: row_materialization.result_row_materialization_time_ns_total,
             rationale: "time spent cloning registers into emitted result rows".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "mvcc_page_lock_wait".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: mvcc_write.page_lock_wait_time_ns_total,
+            rationale: "time spent waiting for MVCC page-lock ownership changes".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "mvcc_page_one_conflict_tracking".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: mvcc_write.page_one_conflict_track_time_ns_total,
+            rationale:
+                "time spent recording conflict-only page-one tracking on the MVCC write surface"
+                    .to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "mvcc_pending_commit_surface_clear".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: mvcc_write.pending_commit_surface_clear_time_ns_total,
+            rationale:
+                "time spent clearing stale synthetic pending-commit-surface state after writes"
+                    .to_owned(),
         },
     ];
     subsystem_ranking.sort_by(|lhs, rhs| {
@@ -758,6 +906,14 @@ fn build_hot_path_profile_report(
             metric_kind: "bytes".to_owned(),
             metric_value: parser.parsed_sql_bytes,
             rationale: "SQL text volume parsed on cache-miss paths".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "page_data_normalization_bytes".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: page_data_normalization_bytes_total,
+            rationale:
+                "payload + zero-fill bytes materialized while normalizing page images before writes"
+                    .to_owned(),
         },
     ];
     allocator_ranking.sort_by(|lhs, rhs| {
@@ -786,6 +942,8 @@ fn build_hot_path_profile_report(
         parser,
         record_decode,
         row_materialization,
+        mvcc_write,
+        page_data_motion,
         opcode_profile,
         type_profile: HotPathTypeProfile {
             decoded: decoded_types,
@@ -797,6 +955,7 @@ fn build_hot_path_profile_report(
             decoded_value_heap_bytes_total: snapshot.vdbe.decoded_value_heap_bytes_total,
             result_value_heap_bytes_total: snapshot.vdbe.result_value_heap_bytes_total,
             record_vec_capacity_slots: snapshot.record_decode.record_vec_capacity_slots,
+            page_data_normalization_bytes_total,
             ranked_sources: allocator_ranking,
         },
     }
@@ -926,6 +1085,114 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     if let Some(diagnostic) = &report.engine_report.first_failure_diagnostic {
         let _ = writeln!(out, "- First failure diagnostic: `{diagnostic}`");
     }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## MVCC Write Path\n");
+    let _ = writeln!(
+        out,
+        "- Writes total: {} (tier0={}, tier1={}, tier2={})",
+        report.mvcc_write.total_write_attempts,
+        report.mvcc_write.tier0_already_owned_writes_total,
+        report.mvcc_write.tier1_first_touch_writes_total,
+        report.mvcc_write.tier2_commit_surface_writes_total
+    );
+    let _ = writeln!(
+        out,
+        "- Page-touch classes: already_owned={} first_touch={} commit_surface={} page_one_tracks={} pending_surface_clears={}",
+        report.mvcc_write.tier0_already_owned_writes_total,
+        report.mvcc_write.tier1_first_touch_writes_total,
+        report.mvcc_write.tier2_commit_surface_writes_total,
+        report.mvcc_write.page_one_conflict_tracks_total,
+        report.mvcc_write.pending_commit_surface_clears_total
+    );
+    let _ = writeln!(
+        out,
+        "- Page-lock waits: {} (time_ns={})",
+        report.mvcc_write.page_lock_waits_total, report.mvcc_write.page_lock_wait_time_ns_total
+    );
+    let _ = writeln!(
+        out,
+        "- BUSY retries/timeouts: {}/{}",
+        report.mvcc_write.write_busy_retries_total, report.mvcc_write.write_busy_timeouts_total
+    );
+    let _ = writeln!(
+        out,
+        "- Runtime retry taxonomy: total={} aborts={} kind[busy={},busy_snapshot={},busy_recovery={},other={}] phase[begin={},body={},commit={},rollback={}] max_batch_attempts={}",
+        report.mvcc_write.runtime_retry.total_retries,
+        report.mvcc_write.runtime_retry.total_aborts,
+        report.mvcc_write.runtime_retry.kind.busy,
+        report.mvcc_write.runtime_retry.kind.busy_snapshot,
+        report.mvcc_write.runtime_retry.kind.busy_recovery,
+        report.mvcc_write.runtime_retry.kind.busy_other,
+        report.mvcc_write.runtime_retry.phase.begin,
+        report.mvcc_write.runtime_retry.phase.body,
+        report.mvcc_write.runtime_retry.phase.commit,
+        report.mvcc_write.runtime_retry.phase.rollback,
+        report.mvcc_write.runtime_retry.max_batch_attempts
+    );
+    if !report
+        .mvcc_write
+        .runtime_retry
+        .top_snapshot_conflict_pages
+        .is_empty()
+    {
+        let top_pages = report
+            .mvcc_write
+            .runtime_retry
+            .top_snapshot_conflict_pages
+            .iter()
+            .map(|entry| format!("p{}:{}", entry.page_no, entry.retries))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "- Top snapshot conflict pages: {top_pages}");
+    }
+    if let Some(last_busy_message) = &report.mvcc_write.runtime_retry.last_busy_message {
+        let _ = writeln!(out, "- Last retry message: `{last_busy_message}`");
+    }
+    let _ = writeln!(
+        out,
+        "- Stale snapshot rejects: {}",
+        report.mvcc_write.stale_snapshot_rejects_total
+    );
+    let _ = writeln!(
+        out,
+        "- Page-one conflict tracking: {} (time_ns={})",
+        report.mvcc_write.page_one_conflict_tracks_total,
+        report.mvcc_write.page_one_conflict_track_time_ns_total
+    );
+    let _ = writeln!(
+        out,
+        "- Pending surface clears: {} (time_ns={})",
+        report.mvcc_write.pending_commit_surface_clears_total,
+        report.mvcc_write.pending_commit_surface_clear_time_ns_total
+    );
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## PageData Motion\n");
+    let _ = writeln!(
+        out,
+        "- Borrowed normalization calls: {} (exact-size copies={})",
+        report
+            .page_data_motion
+            .borrowed_write_normalization_calls_total,
+        report.page_data_motion.borrowed_exact_size_copies_total
+    );
+    let _ = writeln!(
+        out,
+        "- Owned normalization calls: {} (passthrough={}, resized_copies={})",
+        report
+            .page_data_motion
+            .owned_write_normalization_calls_total,
+        report.page_data_motion.owned_passthrough_total,
+        report.page_data_motion.owned_resized_copies_total
+    );
+    let _ = writeln!(
+        out,
+        "- Normalized bytes: {} (payload={}, zero_fill={})",
+        report.page_data_motion.normalized_bytes_total,
+        report.page_data_motion.normalized_payload_bytes_total,
+        report.page_data_motion.normalized_zero_fill_bytes_total
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Ranked Hotspots\n");
@@ -1091,7 +1358,7 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(
         out,
-        "- `actionable_ranking.json` — hotspot, reuse, and baseline-waste ledger for follow-on Track I/Track J work"
+        "- `actionable_ranking.json` — hotspot, MVCC, reuse, and baseline-waste ledger for follow-on Track E/Track J work"
     );
     let _ = writeln!(
         out,
@@ -1114,6 +1381,18 @@ fn hotspot_implication(subsystem: &str) -> (&'static str, &'static [&'static str
             "J2/J6/J7 target: result-row materialization is still paying avoidable clone/allocation and reusable-frame cost in the mixed hot path.",
             &["bd-db300.10.2", "bd-db300.10.6", "bd-db300.10.7"],
         ),
+        "mvcc_page_lock_wait" => (
+            "E2.1/E5.1 target: measured page-lock wait time is a first-class MVCC tax, so publish shrink and disjoint-page topology should move before deeper executor tuning.",
+            &["bd-db300.5.2.1", "bd-db300.5.5.1"],
+        ),
+        "mvcc_page_one_conflict_tracking" => (
+            "E5.1/E5.2 target: page-one conflict-only tracking is visible enough to justify home-lane/extent runway work that keeps disjoint inserts physically disjoint longer.",
+            &["bd-db300.5.5.1", "bd-db300.5.5.2"],
+        ),
+        "mvcc_pending_commit_surface_clear" => (
+            "E2.1/E2.2 target: synthetic pending-surface cleanup is now measured directly, so the next metadata-plane cut should shrink or bypass this publish-side maintenance.",
+            &["bd-db300.5.2.1", "bd-db300.5.2.2"],
+        ),
         _ => (
             "Secondary follow-up bucket after the named Track J hotspots.",
             &[],
@@ -1135,6 +1414,10 @@ fn allocator_implication(subsystem: &str) -> (&'static str, &'static [&'static s
             "J2/J4 target: parse-volume churn is visible and should be reduced with reuse rather than repeated prepare work.",
             &["bd-db300.10.2", "bd-db300.10.4"],
         ),
+        "page_data_normalization_bytes" => (
+            "J3/J6 target: full-page normalization is materializing avoidable bytes before writes, so owned passthrough and reusable page buffers are still live optimization work.",
+            &["bd-db300.10.3", "bd-db300.10.6"],
+        ),
         _ => (
             "Secondary allocator-pressure source after the named Track J hotspots.",
             &[],
@@ -1155,6 +1438,10 @@ fn cost_component_implication(component: &str) -> (&'static str, &'static [&'sta
         "row_materialization" => (
             "J2/J6/J7 target: emitted-row cloning and transient value ownership remain a first-class hot-path cost.",
             &["bd-db300.10.2", "bd-db300.10.6", "bd-db300.10.7"],
+        ),
+        "page_data_motion" => (
+            "J3/J6 target: page-image normalization is now visible as its own copy lane, so reusable page buffers and owned passthrough should move before more speculative executor surgery.",
+            &["bd-db300.10.3", "bd-db300.10.6"],
         ),
         _ => (
             "Secondary cost component after the named Track J follow-on buckets.",
@@ -1201,6 +1488,14 @@ fn wall_time_component_implication(component: &str) -> (&'static str, &'static [
             "E target: commit durability is now an explicit measured lane, so future architecture work can separate durable ordering from general executor service cost.",
             &["bd-db300.5.1"],
         ),
+        "mvcc_wait" => (
+            "E2.1/E5.1 target: page-lock wait time is now explicit in the wall-time story, so tiny-publish and topological disjointness can be judged against a real synchronization lane instead of guesses.",
+            &["bd-db300.5.2.1", "bd-db300.5.5.1"],
+        ),
+        "mvcc_commit_surface" => (
+            "E2.1/E5.1 target: page-one tracking plus pending-surface maintenance are an explicit wall-time lane, which is the right steering signal for publish-plane shrink versus page-topology work.",
+            &["bd-db300.5.2.1", "bd-db300.5.5.1"],
+        ),
         _ => (
             "Secondary wall-time bucket after the named Track A steering categories.",
             &[],
@@ -1226,13 +1521,14 @@ fn push_unique_signature_evidence(values: &mut Vec<String>, value: impl Into<Str
 fn top_subsystem_for_service(report: &HotPathProfileReport) -> &'static str {
     report
         .subsystem_ranking
-        .first()
-        .map_or("service_mixed", |entry| match entry.subsystem.as_str() {
-            "parser_ast_churn" => "parser_ast_churn",
-            "record_decode" => "record_decode",
-            "row_materialization" => "row_materialization",
-            _ => "service_mixed",
+        .iter()
+        .find_map(|entry| match entry.subsystem.as_str() {
+            "parser_ast_churn" => Some("parser_ast_churn"),
+            "record_decode" => Some("record_decode"),
+            "row_materialization" => Some("row_materialization"),
+            _ => None,
         })
+        .unwrap_or("service_mixed")
 }
 
 fn component_signature_shape(
@@ -1339,6 +1635,67 @@ fn component_signature_shape(
                 evidence_sources,
                 String::from(
                     "BEGIN/COMMIT/ROLLBACK boundary time is visible, and the topology-aware capture set points at coordination traffic, but without raw counter values this remains an honest mixed synchronization story rather than a fabricated single cause.",
+                ),
+            )
+        }
+        "mvcc_wait" => {
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "mvcc:page_lock_wait_time_ns_total",
+            );
+            let mut secondary = Vec::new();
+            if has_capture("remote_access") || has_capture("migration") {
+                secondary.push("remote_numa_traffic");
+            }
+            (
+                if has_capture("cache_to_cache") {
+                    "ownership_ping_pong_hitm"
+                } else {
+                    "mixed_or_ambiguous"
+                },
+                secondary,
+                if has_capture("cache_to_cache") {
+                    7_400
+                } else if has_capture("remote_access") {
+                    5_600
+                } else {
+                    4_200
+                },
+                true,
+                evidence_sources,
+                String::from(
+                    "Measured page-lock wait time is the clearest MVCC coordination lane, and cache-to-cache or remote-access captures determine whether we can say more than an explicit mixed contention story.",
+                ),
+            )
+        }
+        "mvcc_commit_surface" => {
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "mvcc:page_one_conflict_track_time_ns_total",
+            );
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "mvcc:pending_commit_surface_clear_time_ns_total",
+            );
+            let mut secondary = Vec::new();
+            if has_capture("cache_to_cache") {
+                secondary.push("ownership_ping_pong_hitm");
+            }
+            if has_capture("remote_access") || has_capture("migration") {
+                secondary.push("remote_numa_traffic");
+            }
+            (
+                "mixed_or_ambiguous",
+                secondary,
+                if has_capture("cache_to_cache") || has_capture("remote_access") {
+                    5_800
+                } else {
+                    4_300
+                },
+                true,
+                evidence_sources,
+                String::from(
+                    "Page-one conflict tracking plus synthetic pending-surface maintenance are measured directly, but the honest microarchitectural reading is still a mixed metadata/coordination lane unless stronger counter evidence is present.",
                 ),
             )
         }
@@ -1580,7 +1937,7 @@ fn baseline_reuse_implication(surface: &str) -> (&'static str, &'static [&'stati
             &["bd-db300.10.3", "bd-db300.10.8"],
         ),
         "page_data_ownership_reuse" => (
-            "J6 target: PageData ownership reuse is still not measured directly, so clone/vec/arc churn remains a first-class suspect.",
+            "J6 target: PageData ownership reuse is now measured directly, so next cuts can use passthrough versus resized-copy evidence instead of treating ownership churn as a blind spot.",
             &["bd-db300.10.6"],
         ),
         _ => (
@@ -1601,7 +1958,6 @@ fn build_hot_path_baseline_reuse_ledger(
         .record_decode
         .parse_record_into_calls
         .saturating_add(report.record_decode.parse_record_column_calls);
-    let result_rows = report.row_materialization.result_rows_total;
     let mut entries = vec![
         HotPathBaselineReuseLedgerEntry {
             rank: 0,
@@ -1685,13 +2041,20 @@ fn build_hot_path_baseline_reuse_ledger(
         HotPathBaselineReuseLedgerEntry {
             rank: 0,
             surface: "page_data_ownership_reuse".to_owned(),
-            supported: false,
-            hits: 0,
-            misses: 0,
-            hit_rate_basis_points: None,
+            supported: true,
+            hits: report.page_data_motion.owned_passthrough_total,
+            misses: report
+                .page_data_motion
+                .owned_write_normalization_calls_total
+                .saturating_sub(report.page_data_motion.owned_passthrough_total),
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.page_data_motion.owned_passthrough_total,
+                report.page_data_motion.owned_write_normalization_calls_total,
+            )),
             rationale: format!(
-                "row materialization emitted {} rows, but PageData ownership reuse versus clone/vec/arc churn is still uninstrumented",
-                result_rows
+                "owned PageData writes now report passthrough versus resized-copy outcomes ({} passthrough, {} resized copies); borrowed writes remain a separate explicit copy lane",
+                report.page_data_motion.owned_passthrough_total,
+                report.page_data_motion.owned_resized_copies_total
             ),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -1753,6 +2116,18 @@ fn baseline_waste_implication(component: &str) -> (&'static str, &'static [&'sta
             "Mixed lane: durability must stay explicit so later baseline work does not overclaim gains that really belong to WAL/commit-path changes.",
             &["bd-db300.5.1"],
         ),
+        "mvcc_page_lock_wait" => (
+            "Structural spillover: measured page-lock wait is explicit MVCC contention tax and should steer tiny-publish and topology work before generic baseline cleanup.",
+            &["bd-db300.5.2.1", "bd-db300.5.5.1"],
+        ),
+        "mvcc_commit_surface_maintenance" => (
+            "Mixed lane: page-one tracking plus pending-surface maintenance are now measurable enough to steer publish-shrink versus topology work without hiding them inside generic service time.",
+            &["bd-db300.5.2.1", "bd-db300.5.5.1"],
+        ),
+        "page_data_normalization" => (
+            "J3/J6 target: page normalization bytes are now explicit baseline tax, so reusable page buffers and ownership-preserving writes can be prioritized with real evidence.",
+            &["bd-db300.10.3", "bd-db300.10.6"],
+        ),
         _ => (
             "Secondary baseline or spillover bucket after the named Track J categories.",
             &[],
@@ -1811,6 +2186,10 @@ fn build_hot_path_baseline_waste_ledger(
                 .row_materialization
                 .result_row_materialization_time_ns_total,
         );
+    let mvcc_commit_surface_time_ns = report
+        .mvcc_write
+        .page_one_conflict_track_time_ns_total
+        .saturating_add(report.mvcc_write.pending_commit_surface_clear_time_ns_total);
     let busy_retry_queueing_time_ns = runtime_phase_timing
         .busy_attempt_time_ns
         .saturating_add(runtime_phase_timing.retry_backoff_time_ns);
@@ -1939,6 +2318,63 @@ fn build_hot_path_baseline_waste_ledger(
             implication: String::new(),
             mapped_beads: Vec::new(),
         },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "mvcc_page_lock_wait".to_owned(),
+            classification: "structural_side_effect".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: report.mvcc_write.page_lock_wait_time_ns_total,
+            wall_share_basis_points: Some(ratio_basis_points(
+                report.mvcc_write.page_lock_wait_time_ns_total,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: 0,
+            activity_count: report.mvcc_write.page_lock_waits_total,
+            rationale:
+                "page-lock handoff wait time is measured directly inside the MVCC write helpers instead of being inferred from aggregate retries"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "mvcc_commit_surface_maintenance".to_owned(),
+            classification: "mixed_or_residual".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: mvcc_commit_surface_time_ns,
+            wall_share_basis_points: Some(ratio_basis_points(
+                mvcc_commit_surface_time_ns,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: 0,
+            activity_count: report
+                .mvcc_write
+                .page_one_conflict_tracks_total
+                .saturating_add(report.mvcc_write.pending_commit_surface_clears_total),
+            rationale:
+                "page-one conflict tracking plus synthetic pending-surface cleanup are now explicit MVCC maintenance lanes"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "page_data_normalization".to_owned(),
+            classification: "baseline_tax".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: report.page_data_motion.normalized_bytes_total,
+            wall_share_basis_points: None,
+            allocator_pressure_bytes: report.page_data_motion.normalized_bytes_total,
+            activity_count: report
+                .page_data_motion
+                .borrowed_write_normalization_calls_total
+                .saturating_add(report.page_data_motion.owned_write_normalization_calls_total),
+            rationale:
+                "page writes now expose the full payload + zero-fill byte volume materialized while normalizing page images before pager entry"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
     ];
     entries.sort_by(|lhs, rhs| {
         rhs.metric_value
@@ -1978,7 +2414,12 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
     let total_allocator_pressure_bytes = report
         .allocator_pressure
         .decoded_value_heap_bytes_total
-        .saturating_add(report.allocator_pressure.result_value_heap_bytes_total);
+        .saturating_add(report.allocator_pressure.result_value_heap_bytes_total)
+        .saturating_add(
+            report
+                .allocator_pressure
+                .page_data_normalization_bytes_total,
+        );
 
     let mut entries = vec![
         HotPathCostComponentEntry {
@@ -2037,6 +2478,26 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
             implication: String::new(),
             mapped_beads: Vec::new(),
         },
+        HotPathCostComponentEntry {
+            rank: 0,
+            component: "page_data_motion".to_owned(),
+            time_ns: 0,
+            time_share_basis_points: 0,
+            allocator_pressure_bytes: report.allocator_pressure.page_data_normalization_bytes_total,
+            allocator_share_basis_points: ratio_basis_points(
+                report.allocator_pressure.page_data_normalization_bytes_total,
+                total_allocator_pressure_bytes,
+            ),
+            activity_count: report
+                .page_data_motion
+                .borrowed_write_normalization_calls_total
+                .saturating_add(report.page_data_motion.owned_write_normalization_calls_total),
+            rationale:
+                "write-path page normalization now surfaces full payload + zero-fill byte motion even when time attribution remains in the surrounding executor body"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
     ];
     entries.sort_by(|lhs, rhs| {
         rhs.time_ns
@@ -2089,6 +2550,11 @@ fn build_hot_path_wall_time_components(
                 .commit_finalize_time_ns
                 .saturating_sub(durability_time_ns),
         );
+    let mvcc_wait_time_ns = report.mvcc_write.page_lock_wait_time_ns_total;
+    let mvcc_commit_surface_time_ns = report
+        .mvcc_write
+        .page_one_conflict_track_time_ns_total
+        .saturating_add(report.mvcc_write.pending_commit_surface_clear_time_ns_total);
     let service_time_ns = runtime_phase_timing
         .body_execution_time_ns
         .saturating_sub(allocator_copy_time_ns);
@@ -2166,6 +2632,31 @@ fn build_hot_path_wall_time_components(
             implication: String::new(),
             mapped_beads: Vec::new(),
         },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "mvcc_wait".to_owned(),
+            time_ns: mvcc_wait_time_ns,
+            wall_share_basis_points: ratio_basis_points(mvcc_wait_time_ns, wall_time_ns),
+            rationale:
+                "page-lock handoff time measured inside the MVCC write helpers, separate from coarse retry/backoff wall time"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "mvcc_commit_surface".to_owned(),
+            time_ns: mvcc_commit_surface_time_ns,
+            wall_share_basis_points: ratio_basis_points(
+                mvcc_commit_surface_time_ns,
+                wall_time_ns,
+            ),
+            rationale:
+                "page-one conflict tracking plus synthetic pending-surface cleanup now form an explicit MVCC maintenance lane"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
     ];
     entries.sort_by(|lhs, rhs| {
         rhs.time_ns
@@ -2227,6 +2718,8 @@ pub fn build_hot_path_subsystem_profile(
         parser: report.parser.clone(),
         record_decode: report.record_decode.clone(),
         row_materialization: report.row_materialization.clone(),
+        mvcc_write: report.mvcc_write.clone(),
+        page_data_motion: report.page_data_motion.clone(),
     }
 }
 
@@ -2664,7 +3157,8 @@ mod tests {
     use crate::report::StorageWiringReport;
     use fsqlite_types::record::{RecordHotPathProfileSnapshot, ValueTypeProfileSnapshot};
     use fsqlite_vdbe::engine::{
-        OpcodeExecutionCount, ValueTypeMetricsSnapshot, VdbeMetricsSnapshot,
+        MvccWritePathMetricsSnapshot, OpcodeExecutionCount, PageDataMotionMetricsSnapshot,
+        ValueTypeMetricsSnapshot, VdbeMetricsSnapshot,
     };
 
     fn hot_path_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -2831,6 +3325,29 @@ mod tests {
                     blobs: 1,
                     text_bytes_total: 48,
                     blob_bytes_total: 24,
+                },
+                mvcc_write_path: MvccWritePathMetricsSnapshot {
+                    tier0_already_owned_writes_total: 1,
+                    tier1_first_touch_writes_total: 3,
+                    tier2_commit_surface_writes_total: 2,
+                    page_lock_waits_total: 4,
+                    page_lock_wait_time_ns_total: 2_400_000,
+                    write_busy_retries_total: 3,
+                    write_busy_timeouts_total: 1,
+                    stale_snapshot_rejects_total: 2,
+                    page_one_conflict_tracks_total: 2,
+                    page_one_conflict_track_time_ns_total: 650_000,
+                    pending_commit_surface_clears_total: 1,
+                    pending_commit_surface_clear_time_ns_total: 250_000,
+                },
+                page_data_motion: PageDataMotionMetricsSnapshot {
+                    borrowed_write_normalization_calls_total: 3,
+                    borrowed_exact_size_copies_total: 2,
+                    owned_write_normalization_calls_total: 5,
+                    owned_passthrough_total: 3,
+                    owned_resized_copies_total: 2,
+                    normalized_payload_bytes_total: 1_120,
+                    normalized_zero_fill_bytes_total: 384,
                 },
             },
         };
@@ -3196,6 +3713,8 @@ mod tests {
             report.record_decode.parse_record_column_calls > 0
                 || report.record_decode.parse_record_into_calls > 0
         );
+        assert!(report.mvcc_write.page_lock_wait_time_ns_total > 0);
+        assert!(report.page_data_motion.normalized_bytes_total > 0);
 
         let artifact_dir = tempdir.path().join("artifacts");
         let counter_capture_summary = HotPathCounterCaptureManifestSummary {
@@ -3304,13 +3823,15 @@ mod tests {
         );
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
+        assert!(subsystem_profile.mvcc_write.page_lock_waits_total > 0);
+        assert!(subsystem_profile.page_data_motion.normalized_bytes_total > 0);
         assert!(!actionable_ranking.baseline_reuse_ledger.is_empty());
         assert!(!actionable_ranking.baseline_waste_ledger.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
-        assert_eq!(actionable_ranking.microarchitectural_signatures.len(), 6);
-        assert_eq!(actionable_ranking.wall_time_components.len(), 6);
+        assert_eq!(actionable_ranking.microarchitectural_signatures.len(), 8);
+        assert_eq!(actionable_ranking.wall_time_components.len(), 8);
         assert!(!actionable_ranking.cost_components.is_empty());
-        assert_eq!(actionable_ranking.allocator_pressure.len(), 3);
+        assert_eq!(actionable_ranking.allocator_pressure.len(), 4);
         assert_eq!(
             actionable_ranking.top_opcodes,
             opcode_profile
@@ -3328,6 +3849,16 @@ mod tests {
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
+                .contains("## MVCC Write Path")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## PageData Motion")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
                 .contains("## Baseline Waste Ledger")
         );
         assert!(
@@ -3341,12 +3872,15 @@ mod tests {
                 .iter()
                 .flat_map(|entry| entry.mapped_beads.iter())
                 .any(|bead| bead == "bd-db300.10.2"
+                    || bead == "bd-db300.5.2.1"
+                    || bead == "bd-db300.5.5.1"
+                    || bead == "bd-db300.10.3"
                     || bead == "bd-db300.10.4"
                     || bead == "bd-db300.10.5"
                     || bead == "bd-db300.10.6"
                     || bead == "bd-db300.10.7")
         );
-        assert_eq!(actionable_ranking.cost_components.len(), 3);
+        assert_eq!(actionable_ranking.cost_components.len(), 4);
         let wall_component_names = actionable_ranking
             .wall_time_components
             .iter()
@@ -3358,6 +3892,8 @@ mod tests {
         assert!(wall_component_names.contains(&"service"));
         assert!(wall_component_names.contains(&"allocator_copy"));
         assert!(wall_component_names.contains(&"durability"));
+        assert!(wall_component_names.contains(&"mvcc_wait"));
+        assert!(wall_component_names.contains(&"mvcc_commit_surface"));
         assert!(
             actionable_ranking
                 .microarchitectural_signatures
@@ -3397,6 +3933,7 @@ mod tests {
         assert!(component_names.contains(&"parser_ast_churn"));
         assert!(component_names.contains(&"record_decode"));
         assert!(component_names.contains(&"row_materialization"));
+        assert!(component_names.contains(&"page_data_motion"));
         assert!(
             actionable_ranking
                 .allocator_pressure
@@ -3441,6 +3978,17 @@ mod tests {
         );
         assert!(!row_materialization_component.implication.is_empty());
 
+        let page_data_motion_component = actionable_ranking
+            .cost_components
+            .iter()
+            .find(|entry| entry.component == "page_data_motion")
+            .unwrap();
+        assert_eq!(
+            page_data_motion_component.mapped_beads,
+            vec!["bd-db300.10.3".to_owned(), "bd-db300.10.6".to_owned()]
+        );
+        assert!(!page_data_motion_component.implication.is_empty());
+
         let parse_cache_reuse = actionable_ranking
             .baseline_reuse_ledger
             .iter()
@@ -3453,15 +4001,15 @@ mod tests {
             vec!["bd-db300.10.4".to_owned()]
         );
 
-        let page_data_reuse_gap = actionable_ranking
+        let page_data_reuse = actionable_ranking
             .baseline_reuse_ledger
             .iter()
             .find(|entry| entry.surface == "page_data_ownership_reuse")
             .unwrap();
-        assert!(!page_data_reuse_gap.supported);
-        assert_eq!(page_data_reuse_gap.hit_rate_basis_points, None);
+        assert!(page_data_reuse.supported);
+        assert_eq!(page_data_reuse.hit_rate_basis_points, Some(6_000));
         assert_eq!(
-            page_data_reuse_gap.mapped_beads,
+            page_data_reuse.mapped_beads,
             vec!["bd-db300.10.6".to_owned()]
         );
 
@@ -3490,6 +4038,31 @@ mod tests {
         assert_eq!(
             busy_retry_spillover.mapped_beads,
             vec!["bd-db300.2.4".to_owned()]
+        );
+
+        let mvcc_wait = actionable_ranking
+            .baseline_waste_ledger
+            .iter()
+            .find(|entry| entry.component == "mvcc_page_lock_wait")
+            .unwrap();
+        assert_eq!(mvcc_wait.classification, "structural_side_effect");
+        assert_eq!(mvcc_wait.metric_value, 2_400_000);
+        assert_eq!(
+            mvcc_wait.mapped_beads,
+            vec!["bd-db300.5.2.1".to_owned(), "bd-db300.5.5.1".to_owned()]
+        );
+
+        let page_data_normalization = actionable_ranking
+            .baseline_waste_ledger
+            .iter()
+            .find(|entry| entry.component == "page_data_normalization")
+            .unwrap();
+        assert_eq!(page_data_normalization.classification, "baseline_tax");
+        assert_eq!(page_data_normalization.metric_kind, "bytes");
+        assert_eq!(page_data_normalization.metric_value, 1_504);
+        assert_eq!(
+            page_data_normalization.mapped_beads,
+            vec!["bd-db300.10.3".to_owned(), "bd-db300.10.6".to_owned()]
         );
     }
 

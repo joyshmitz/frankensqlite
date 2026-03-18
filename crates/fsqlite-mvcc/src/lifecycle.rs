@@ -1068,10 +1068,12 @@ impl TransactionManager {
 
         txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
 
-        // Track in write_set.  Use the page_locks insert result to avoid an
-        // O(n) Vec::contains scan — if the page was newly locked, it cannot
-        // already be in write_set (locks are acquired before writes).
-        if newly_locked {
+        // Track in write_set — check write_set_data (HashMap, O(1)) instead of
+        // write_set (Vec, O(n)) to avoid linear scan on repeated page writes.
+        // NOTE: Cannot use `newly_locked` here because ROLLBACK TO SAVEPOINT
+        // truncates write_set but retains page_locks (spec §5.4), which would
+        // desynchronize the two and silently drop pages from the commit.
+        if !txn.write_set_data.contains_key(&pgno) {
             txn.write_set.push(pgno);
         }
         Arc::make_mut(&mut txn.write_set_data).insert(pgno, data);
@@ -1133,7 +1135,8 @@ impl TransactionManager {
 
         // Step 2: FCW freshness validation with merge-retry (§5.8, §5.10).
         // First pass: collect conflicting pages.
-        let mut conflicts = Vec::new();
+        // SmallVec avoids heap allocation for typical transactions (≤8 conflicts).
+        let mut conflicts = smallvec::SmallVec::<[PageNumber; 8]>::new();
         for &pgno in &txn.write_set {
             if let Some(latest) = self.commit_index.latest(pgno) {
                 if latest > txn.snapshot.high {
@@ -1378,15 +1381,19 @@ impl TransactionManager {
 
         let commit_seq = self.txn_manager.alloc_commit_seq();
 
+        // Move the write_set_data HashMap out of the Arc to avoid cloning
+        // 4KB PageData per page.  If refcount=1 (common case — no savepoints
+        // hold a snapshot), Arc::try_unwrap succeeds and the HashMap is moved
+        // at zero cost.  If refcount>1, fall back to a single HashMap clone
+        // (still cheaper than N per-page clones).
+        let mut data_map = Arc::try_unwrap(std::mem::take(&mut txn.write_set_data))
+            .unwrap_or_else(|arc| (*arc).clone());
+
         for pgno in pages {
-            if let Some(data) = txn.write_set_data.get(&pgno).cloned() {
+            if let Some(data) = data_map.remove(&pgno) {
                 // Look up existing chain head for prev pointer.
                 let prev_idx = self.version_store.chain_head(pgno);
                 let prev = prev_idx.map(crate::invariants::idx_to_version_pointer);
-
-                if let Some(idx) = prev_idx {
-                    txn.defer_retire_version(idx);
-                }
 
                 let version = PageVersion {
                     pgno,
@@ -5479,24 +5486,52 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_write_set_retires_superseded_version_via_ebr() {
-        // No reset — test already uses delta-based before/after snapshots.
+    fn test_publish_write_set_keeps_superseded_version_visible_until_gc() {
         let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
         let pgno = PageNumber::new(6_001).expect("valid page number");
 
         let mut txn1 = mgr.begin(BeginKind::Concurrent).unwrap();
-        mgr.write_page(&mut txn1, pgno, test_data(0x11)).unwrap();
-        let _ = mgr.commit(&mut txn1).unwrap();
+        let first_data = test_data(0x11);
+        mgr.write_page(&mut txn1, pgno, first_data.clone()).unwrap();
+        let first_commit = mgr.commit(&mut txn1).unwrap();
 
-        let before = GLOBAL_EBR_METRICS.snapshot();
         let mut txn2 = mgr.begin(BeginKind::Concurrent).unwrap();
-        mgr.write_page(&mut txn2, pgno, test_data(0x22)).unwrap();
-        let _ = mgr.commit(&mut txn2).unwrap();
-        let after = GLOBAL_EBR_METRICS.snapshot();
+        let snapshot_before_second_commit = txn2.snapshot;
+        let second_data = test_data(0x22);
+        mgr.write_page(&mut txn2, pgno, second_data.clone())
+            .unwrap();
+        let second_commit = mgr.commit(&mut txn2).unwrap();
 
+        assert_eq!(
+            mgr.version_store().chain_length(pgno),
+            2,
+            "publishing a replacement version must keep the superseded version in the chain until GC"
+        );
+        let version_before_second_commit = mgr
+            .version_store()
+            .resolve(pgno, &snapshot_before_second_commit)
+            .expect("snapshot taken before second commit should still resolve the first version");
+        assert_eq!(
+            mgr.version_store()
+                .get_version(version_before_second_commit)
+                .expect("resolved version")
+                .data,
+            first_data
+        );
+        let latest_version = mgr
+            .version_store()
+            .resolve(pgno, &Snapshot::new(second_commit, SchemaEpoch::ZERO))
+            .expect("latest snapshot should resolve the replacement version");
         assert!(
-            after.retirements_deferred_total > before.retirements_deferred_total,
-            "publishing a replacement version should defer retirement of previous chain head"
+            second_commit > first_commit,
+            "replacement commit should advance the global commit sequence"
+        );
+        assert_eq!(
+            mgr.version_store()
+                .get_version(latest_version)
+                .expect("latest resolved version")
+                .data,
+            second_data
         );
         assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);
     }

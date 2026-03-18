@@ -38,10 +38,11 @@ use fsqlite_wal::{WalTelemetrySnapshot, wal_telemetry_snapshot};
 use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
 use crate::report::{
     AllocatorPressureHotPathProfile, BtreeRuntimeHotPathProfile, CorrectnessReport,
-    EngineRunReport, FsqliteHotPathProfile, HotPathEvidence, HotPathOpcodeCount,
-    HotPathValueHistogram, ParserHotPathProfile, ResultRowHotPathProfile,
-    RuntimePhaseTimingEvidence, StorageWiringReport, VdbeHotPathProfile, VfsHotPathProfile,
-    WalHotPathProfile,
+    EngineRunReport, FsqliteHotPathProfile, HotPathConflictPageCount, HotPathEvidence,
+    HotPathOpcodeCount, HotPathRetryBreakdown, HotPathRetryKindBreakdown,
+    HotPathRetryPhaseBreakdown, HotPathValueHistogram, ParserHotPathProfile,
+    ResultRowHotPathProfile, RuntimePhaseTimingEvidence, StorageWiringReport, VdbeHotPathProfile,
+    VfsHotPathProfile, WalHotPathProfile,
 };
 use crate::sqlite_executor;
 use crate::{E2eError, E2eResult};
@@ -634,6 +635,7 @@ fn build_hot_path_profile(inputs: HotPathProfileInputs<'_>) -> FsqliteHotPathPro
             swizzle_in_total: btree.fsqlite_swizzle_in_total,
             swizzle_out_total: btree.fsqlite_swizzle_out_total,
         }),
+        runtime_retry: HotPathRetryBreakdown::default(),
         statement_hotspots: Vec::new(),
     }
 }
@@ -694,7 +696,11 @@ pub fn run_oplog_fsqlite(
         conflict_diagnostics = query_conflict_stats_note(&conn)?;
         stats
     };
-    let hot_path_profile = metrics_capture.snapshot(oplog);
+    let retry_breakdown = retry_breakdown_from_stats(&stats);
+    let hot_path_profile = metrics_capture.snapshot(oplog).map(|mut profile| {
+        profile.runtime_retry = retry_breakdown.clone();
+        profile
+    });
 
     let integrity_check_ok = if config.run_integrity_check && db_path != Path::new(":memory:") {
         // Best-effort verification: validate the resulting DB file with
@@ -2458,16 +2464,52 @@ fn retry_diagnostics_note(stats: &WorkerStats) -> Option<String> {
     Some(note)
 }
 
-fn format_top_conflict_pages(conflicts: &HashMap<u32, u64>) -> String {
-    let mut ranked: Vec<(u32, u64)> = conflicts
+fn retry_breakdown_from_stats(stats: &WorkerStats) -> HotPathRetryBreakdown {
+    HotPathRetryBreakdown {
+        total_retries: stats.retries,
+        total_aborts: stats.aborts,
+        kind: HotPathRetryKindBreakdown {
+            busy: stats.busy_retries,
+            busy_snapshot: stats.busy_snapshot_retries,
+            busy_recovery: stats.busy_recovery_retries,
+            busy_other: stats.busy_other_retries,
+        },
+        phase: HotPathRetryPhaseBreakdown {
+            begin: stats.begin_busy_retries,
+            body: stats.body_busy_retries,
+            commit: stats.commit_busy_retries,
+            rollback: stats.rollback_busy_retries,
+        },
+        max_batch_attempts: stats.max_batch_attempts,
+        top_snapshot_conflict_pages: top_snapshot_conflict_pages(&stats.snapshot_conflict_pages, 5),
+        last_busy_message: stats
+            .last_busy_message
+            .as_deref()
+            .map(sanitize_retry_message),
+    }
+}
+
+fn top_snapshot_conflict_pages(
+    conflicts: &HashMap<u32, u64>,
+    limit: usize,
+) -> Vec<HotPathConflictPageCount> {
+    let mut ranked: Vec<HotPathConflictPageCount> = conflicts
         .iter()
-        .map(|(&page, &count)| (page, count))
+        .map(|(&page_no, &retries)| HotPathConflictPageCount { page_no, retries })
         .collect();
-    ranked.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
-    ranked.truncate(5);
+    ranked.sort_by(|lhs, rhs| {
+        rhs.retries
+            .cmp(&lhs.retries)
+            .then_with(|| lhs.page_no.cmp(&rhs.page_no))
+    });
+    ranked.truncate(limit);
     ranked
+}
+
+fn format_top_conflict_pages(conflicts: &HashMap<u32, u64>) -> String {
+    top_snapshot_conflict_pages(conflicts, 5)
         .into_iter()
-        .map(|(page, count)| format!("p{page}:{count}"))
+        .map(|entry| format!("p{}:{}", entry.page_no, entry.retries))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -2558,6 +2600,9 @@ mod tests {
         assert!(profile.vdbe.actual_opcodes_executed_total > 0);
         assert!(profile.allocator_pressure.is_some());
         assert!(profile.btree.is_some());
+        assert_eq!(profile.runtime_retry.total_retries, 0);
+        assert_eq!(profile.runtime_retry.max_batch_attempts, 0);
+        assert!(profile.runtime_retry.top_snapshot_conflict_pages.is_empty());
     }
 
     #[test]

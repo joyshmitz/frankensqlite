@@ -253,6 +253,8 @@ pub struct FsqliteHotPathProfile {
     pub allocator_pressure: Option<AllocatorPressureHotPathProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub btree: Option<BtreeRuntimeHotPathProfile>,
+    #[serde(default)]
+    pub runtime_retry: HotPathRetryBreakdown,
     pub statement_hotspots: Vec<StatementHotspot>,
 }
 
@@ -357,6 +359,45 @@ pub struct HotPathEvidence {
     pub label: String,
     pub value: u64,
     pub detail: String,
+}
+
+/// Structured retry taxonomy captured during a hot-path profiled run.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HotPathRetryBreakdown {
+    pub total_retries: u64,
+    pub total_aborts: u64,
+    pub kind: HotPathRetryKindBreakdown,
+    pub phase: HotPathRetryPhaseBreakdown,
+    pub max_batch_attempts: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_snapshot_conflict_pages: Vec<HotPathConflictPageCount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_busy_message: Option<String>,
+}
+
+/// Retry counts bucketed by transient-error family.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HotPathRetryKindBreakdown {
+    pub busy: u64,
+    pub busy_snapshot: u64,
+    pub busy_recovery: u64,
+    pub busy_other: u64,
+}
+
+/// Retry counts bucketed by transaction batch phase.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HotPathRetryPhaseBreakdown {
+    pub begin: u64,
+    pub body: u64,
+    pub commit: u64,
+    pub rollback: u64,
+}
+
+/// Snapshot-conflict pages ranked by how often they appeared in retries.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HotPathConflictPageCount {
+    pub page_no: u32,
+    pub retries: u64,
 }
 
 /// VFS delta observed during the profiled run.
@@ -944,6 +985,28 @@ mod tests {
                 swizzle_in_total: 0,
                 swizzle_out_total: 0,
             }),
+            runtime_retry: HotPathRetryBreakdown {
+                total_retries: 2,
+                total_aborts: 2,
+                kind: HotPathRetryKindBreakdown {
+                    busy: 1,
+                    busy_snapshot: 1,
+                    busy_recovery: 0,
+                    busy_other: 0,
+                },
+                phase: HotPathRetryPhaseBreakdown {
+                    begin: 0,
+                    body: 1,
+                    commit: 1,
+                    rollback: 0,
+                },
+                max_batch_attempts: 3,
+                top_snapshot_conflict_pages: vec![HotPathConflictPageCount {
+                    page_no: 7,
+                    retries: 1,
+                }],
+                last_busy_message: Some("database is locked".to_owned()),
+            },
             statement_hotspots: vec![StatementHotspot {
                 sql: "SELECT 1;".to_owned(),
                 execution_count: 2,
@@ -971,6 +1034,16 @@ mod tests {
         assert_eq!(parsed.fixture_id, "fixture-a");
         assert!(parsed.concurrent_mode);
         assert_eq!(parsed.profile.vdbe.estimated_total_opcodes, 72);
+        assert_eq!(parsed.profile.runtime_retry.total_retries, 2);
+        assert_eq!(parsed.profile.runtime_retry.kind.busy_snapshot, 1);
+        assert_eq!(parsed.profile.runtime_retry.phase.commit, 1);
+        assert_eq!(
+            parsed.profile.runtime_retry.top_snapshot_conflict_pages,
+            vec![HotPathConflictPageCount {
+                page_no: 7,
+                retries: 1,
+            }]
+        );
         assert_eq!(parsed.profile.statement_hotspots.len(), 1);
     }
 

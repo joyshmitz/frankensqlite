@@ -648,9 +648,20 @@ impl InProcessPageLockTable {
     /// Checks both active and draining tables.
     #[must_use]
     pub fn holder(&self, page: PageNumber) -> Option<TxnId> {
-        let shard_idx = Self::shard_index_static(page);
+        let pgno = page.get() as usize;
 
-        // Check active table.
+        // Fast path: check flat atomic array for pages 1..=65536.
+        if pgno <= FAST_LOCK_ARRAY_SIZE {
+            let val = self.fast_locks[pgno - 1].load(Ordering::Acquire);
+            return if val == 0 {
+                None
+            } else {
+                Some(TxnId::new(val).expect("page lock slot held non-zero non-TxnId"))
+            };
+        }
+
+        // Fallback: check sharded active table.
+        let shard_idx = Self::shard_index_static(page);
         let shard = &self.shards[shard_idx];
         let map = shard.lock();
         if let Some(&holder) = map.get(&page) {
@@ -658,18 +669,20 @@ impl InProcessPageLockTable {
         }
         drop(map);
 
-        // Check draining table.
-        let draining_guard = self.draining.lock();
-        if let Some(ref draining) = *draining_guard {
-            let drain_map = draining.shards[shard_idx].lock();
-            if let Some(&holder) = drain_map.get(&page) {
+        // Check draining table (only if rebuild in progress).
+        if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
+            let draining_guard = self.draining.lock();
+            if let Some(ref draining) = *draining_guard {
+                let drain_map = draining.shards[shard_idx].lock();
+                if let Some(&holder) = drain_map.get(&page) {
+                    drop(drain_map);
+                    drop(draining_guard);
+                    return Some(holder);
+                }
                 drop(drain_map);
-                drop(draining_guard);
-                return Some(holder);
             }
-            drop(drain_map);
+            drop(draining_guard);
         }
-        drop(draining_guard);
         None
     }
 
@@ -961,6 +974,23 @@ impl InProcessPageLockTable {
         is_active_txn: impl Fn(TxnId) -> bool,
         timeout: Duration,
     ) -> Result<DrainResult, RebuildError> {
+        // Clean orphaned entries in the fast_locks flat array BEFORE rotating
+        // the shard tables.  This ensures stale locks from crashed transactions
+        // are cleared regardless of whether they were in the fast path or the
+        // sharded fallback path.
+        for slot in self.fast_locks.iter() {
+            let raw = slot.load(Ordering::Relaxed);
+            if raw != 0 {
+                if let Some(holder) = TxnId::new(raw) {
+                    if !is_active_txn(holder) {
+                        // Orphaned: CAS to 0.  Failure means another thread
+                        // already released or re-acquired — both are fine.
+                        let _ = slot.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
         self.begin_rebuild()?;
         let mut elapsed_ms = 0_u64;
         let mut remaining_budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
@@ -1272,19 +1302,36 @@ impl Transaction {
         }
     }
 
+    /// Threshold for auto-promoting from Exact to Bloom read-set mode.
+    /// When the exact read-set HashMap exceeds this size, further inserts
+    /// go into the Bloom filter only, saving ~50 bytes/entry in HashMap
+    /// overhead for large analytical scans.
+    const READ_SET_AUTO_BLOOM_THRESHOLD: usize = 1024;
+
     /// Record a page read with the visible committed version.
     pub fn record_page_read(&mut self, page: PageNumber, version: CommitSeq) {
         if let Some(bloom) = self.read_set_bloom.as_mut() {
+            // Bloom mode active: only Bloom + witness key tracking.
             bloom.insert(page);
+        } else if self.read_set_versions.len() >= Self::READ_SET_AUTO_BLOOM_THRESHOLD {
+            // Auto-promote to Bloom mode: the exact read set has grown large
+            // enough that the HashMap overhead dominates.  Switch to Bloom for
+            // all future inserts; existing entries remain for version lookups.
+            let mut bloom = ReadSetBloom::new(ReadSetBloom::DEFAULT_BITS);
+            bloom.insert(page);
+            self.read_set_bloom = Some(bloom);
+            self.read_set_storage_mode = ReadSetStorageMode::Bloom;
+        } else {
+            // Exact mode: track in HashMap for precise version lookups.
+            self.read_set_versions
+                .entry(page)
+                .and_modify(|existing| {
+                    if version > *existing {
+                        *existing = version;
+                    }
+                })
+                .or_insert(version);
         }
-        self.read_set_versions
-            .entry(page)
-            .and_modify(|existing| {
-                if version > *existing {
-                    *existing = version;
-                }
-            })
-            .or_insert(version);
         self.read_keys.insert(WitnessKey::Page(page));
     }
 
@@ -1663,6 +1710,31 @@ impl CommitIndex {
         shard.update(page, seq);
     }
 
+    /// Record that multiple pages were committed at `seq` in a single batch.
+    ///
+    /// Each fast-array publication keeps the same `Release` ordering as
+    /// [`CommitIndex::update`]. Readers query individual pages, so there is no
+    /// shared "last page" synchronization point that can safely publish other
+    /// pages' stores.
+    ///
+    /// Pages that exceed `FAST_COMMIT_ARRAY_SIZE` fall through to the
+    /// per-page sharded path (which takes its own locks).
+    pub fn batch_update(&self, pages: &[PageNumber], seq: CommitSeq) {
+        debug_assert!(
+            seq.get() != 0,
+            "CommitIndex::batch_update called with CommitSeq(0)"
+        );
+        for &page in pages {
+            let pgno = page.get() as usize;
+            if pgno <= FAST_COMMIT_ARRAY_SIZE {
+                self.fast_array[pgno - 1].store(seq.get(), Ordering::Release);
+            } else {
+                let shard = &self.shards[self.shard_index(page)];
+                shard.update(page, seq);
+            }
+        }
+    }
+
     /// Get the latest `CommitSeq` for `page`.
     ///
     /// For page numbers <= 65536 this is a single `AtomicU64::load(Acquire)`.
@@ -1696,14 +1768,15 @@ impl Default for CommitIndex {
 
 impl std::fmt::Debug for CommitIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total: usize = self.shards.iter().map(|s| s.len()).sum();
+        let sharded_pages: usize = self.shards.iter().map(|s| s.len()).sum();
         let fast_populated = self
             .fast_array
             .iter()
             .filter(|a| a.load(Ordering::Relaxed) != 0)
             .count();
         f.debug_struct("CommitIndex")
-            .field("page_count", &total)
+            .field("page_count", &(sharded_pages + fast_populated))
+            .field("sharded_page_count", &sharded_pages)
             .field("fast_array_populated", &fast_populated)
             .field("fast_array_capacity", &self.fast_array.len())
             .finish()
@@ -2912,6 +2985,36 @@ mod tests {
             assert_eq!(reader.join().unwrap(), FINAL_SEQ);
         }
         assert_eq!(index.latest(page), Some(CommitSeq::new(FINAL_SEQ)));
+    }
+
+    #[test]
+    fn test_commit_index_debug_counts_fast_and_sharded_pages() {
+        let index = CommitIndex::new();
+        let fast_page = PageNumber::new(42).unwrap();
+        let sharded_page =
+            PageNumber::new(u32::try_from(FAST_COMMIT_ARRAY_SIZE + 1).unwrap()).unwrap();
+
+        index.update(fast_page, CommitSeq::new(11));
+        index.update(sharded_page, CommitSeq::new(12));
+
+        let debug = format!("{index:?}");
+        assert!(debug.contains("page_count: 2"));
+        assert!(debug.contains("sharded_page_count: 1"));
+        assert!(debug.contains("fast_array_populated: 1"));
+    }
+
+    #[test]
+    fn test_commit_index_batch_update_updates_fast_and_sharded_pages() {
+        let index = CommitIndex::new();
+        let fast_page = PageNumber::new(7).unwrap();
+        let sharded_page =
+            PageNumber::new(u32::try_from(FAST_COMMIT_ARRAY_SIZE + 9).unwrap()).unwrap();
+        let seq = CommitSeq::new(13);
+
+        index.batch_update(&[fast_page, sharded_page], seq);
+
+        assert_eq!(index.latest(fast_page), Some(seq));
+        assert_eq!(index.latest(sharded_page), Some(seq));
     }
 
     #[test]

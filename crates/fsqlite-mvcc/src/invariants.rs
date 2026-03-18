@@ -631,6 +631,14 @@ impl VersionStore {
     }
 
     /// Resolve with traversal diagnostics for snapshot-read instrumentation.
+    ///
+    /// Fast path: walks the version chain using only the arena RwLock and
+    /// simple `commit_seq <= snapshot.high` visibility.  This avoids the
+    /// `visibility_ranges` RwLock + HashMap lookup that the windowed-range
+    /// path requires.  The fast path is correct because we walk newest→oldest
+    /// and return the first visible version — exactly the same result as the
+    /// range-based check, just without the early-termination optimization
+    /// that ranges provide for very deep chains (10+).
     #[must_use]
     #[allow(clippy::significant_drop_tightening)]
     pub fn resolve_with_trace(
@@ -647,40 +655,18 @@ impl VersionStore {
             };
 
             let arena = self.arena.read();
-            let ranges = self.visibility_ranges.read();
             let mut current_idx = head_idx;
             let mut traversed = 0_u64;
 
             loop {
                 let Some(version) = arena.get(current_idx) else {
-                    // Race condition: the version was valid when we read the head pointer
-                    // (or prev pointer), but was GC'd before we could read it from the arena.
-                    // This implies a newer version exists (making this one stale).
-                    // We must retry the lookup from the top to find the new head.
+                    // Race: version GC'd between head read and arena read.
+                    // Retry from the top to pick up the new chain head.
                     continue 'retry;
                 };
                 traversed = traversed.saturating_add(1);
 
-                let range = ranges.get(&current_idx).copied();
-                let begin_ts = range.map_or(version.commit_seq, |window| window.begin_ts);
-                let end_ts = range.and_then(|window| window.end_ts);
-                let is_visible = range.map_or_else(
-                    || visible(version, snapshot),
-                    |window| window.contains(snapshot.high),
-                );
-
-                tracing::trace!(
-                    page = page.get(),
-                    snapshot_ts = snapshot.high.get(),
-                    version_commit_ts = version.commit_seq.get(),
-                    begin_ts = begin_ts.get(),
-                    end_ts = end_ts.map(CommitSeq::get),
-                    versions_traversed = traversed,
-                    visible = is_visible,
-                    "snapshot version visibility check"
-                );
-
-                if is_visible {
+                if visible(version, snapshot) {
                     return SnapshotResolveTrace {
                         version_idx: Some(current_idx),
                         versions_traversed: traversed,

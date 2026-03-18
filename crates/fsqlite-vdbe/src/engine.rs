@@ -74,6 +74,35 @@ fn vtab_exec_outcome(opcode: &str, err: FrankenError) -> Result<ExecOutcome> {
     })
 }
 
+#[inline]
+fn duration_ns_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[inline]
+fn add_vdbe_counter(counter: &AtomicU64, delta: u64) {
+    if FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed) {
+        counter.fetch_add(delta, AtomicOrdering::Relaxed);
+    }
+}
+
+#[inline]
+fn add_vdbe_counter_if(enabled: bool, counter: &AtomicU64, delta: u64) {
+    if enabled {
+        counter.fetch_add(delta, AtomicOrdering::Relaxed);
+    }
+}
+
+#[inline]
+fn add_vdbe_duration_if(enabled: bool, counter: &AtomicU64, started: Instant) {
+    if enabled {
+        counter.fetch_add(
+            duration_ns_saturating(started.elapsed()),
+            AtomicOrdering::Relaxed,
+        );
+    }
+}
+
 // ── In-Memory Table Store ──────────────────────────────────────────────────
 //
 // Phase 4 in-memory cursor backend. Allows the VDBE engine to execute
@@ -896,6 +925,8 @@ impl SharedTxnPageIo {
             return Ok(());
         }
 
+        let metrics_enabled = vdbe_metrics_enabled();
+        let clear_started = metrics_enabled.then(Instant::now);
         let mut handle = ctx.handle.lock();
         if concurrent_page_state(&handle, PageNumber::ONE).is_synthetic_conflict_only() {
             concurrent_clear_page_state(
@@ -910,6 +941,18 @@ impl SharedTxnPageIo {
                     PageNumber::ONE.get()
                 ))
             })?;
+            add_vdbe_counter_if(
+                metrics_enabled,
+                &FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEARS_TOTAL,
+                1,
+            );
+            if let Some(clear_started) = clear_started {
+                add_vdbe_duration_if(
+                    metrics_enabled,
+                    &FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEAR_TIME_NS_TOTAL,
+                    clear_started,
+                );
+            }
         }
 
         Ok(())
@@ -955,6 +998,7 @@ impl SharedTxnPageIo {
         page_no: PageNumber,
         page_data_base: PageData,
     ) -> Result<()> {
+        add_vdbe_counter(&FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL, 1);
         let mut handle = ctx.handle.lock();
         let prior_state = concurrent_page_state(&handle, page_no);
         if let Err(stage_error) =
@@ -990,6 +1034,7 @@ impl SharedTxnPageIo {
         page_no: PageNumber,
         page_data_base: PageData,
     ) -> Result<()> {
+        add_vdbe_counter(&FSQLITE_VDBE_MVCC_TIER1_FIRST_TOUCH_WRITES_TOTAL, 1);
         let prior_page_state = {
             let handle = ctx.handle.lock();
             concurrent_page_state(&handle, page_no)
@@ -1019,6 +1064,7 @@ impl SharedTxnPageIo {
             let snapshot_high = ctx.snapshot_high.get();
 
             if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                add_vdbe_counter(&FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL, 1);
                 let error = FrankenError::BusySnapshot {
                     conflicting_pages: page_no.get().to_string(),
                 };
@@ -1057,6 +1103,7 @@ impl SharedTxnPageIo {
                     let remaining = deadline.saturating_sub(started.elapsed());
                     match wait_for_page_lock_holder_change(cx, ctx, page_no, remaining) {
                         Ok(true) => {
+                            add_vdbe_counter(&FSQLITE_VDBE_MVCC_WRITE_BUSY_RETRIES_TOTAL, 1);
                             tracing::warn!(
                                 txn_id,
                                 commit_seq = snapshot_high,
@@ -1071,6 +1118,7 @@ impl SharedTxnPageIo {
                             );
                         }
                         Ok(false) => {
+                            add_vdbe_counter(&FSQLITE_VDBE_MVCC_WRITE_BUSY_TIMEOUTS_TOTAL, 1);
                             let error = FrankenError::Busy;
                             Self::restore_concurrent_page_state(
                                 ctx,
@@ -1162,6 +1210,7 @@ impl SharedTxnPageIo {
         page_no: PageNumber,
         page_data_base: PageData,
     ) -> Result<()> {
+        add_vdbe_counter(&FSQLITE_VDBE_MVCC_TIER2_COMMIT_SURFACE_WRITES_TOTAL, 1);
         let page_one_tracking_required = if page_no == PageNumber::ONE {
             false
         } else {
@@ -1232,6 +1281,7 @@ impl SharedTxnPageIo {
             let snapshot_high = ctx.snapshot_high.get();
 
             if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                add_vdbe_counter(&FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL, 1);
                 let error = FrankenError::BusySnapshot {
                     conflicting_pages: page_no.get().to_string(),
                 };
@@ -1269,6 +1319,7 @@ impl SharedTxnPageIo {
                     let remaining = deadline.saturating_sub(started.elapsed());
                     match wait_for_page_lock_holder_change(cx, ctx, page_no, remaining) {
                         Ok(true) => {
+                            add_vdbe_counter(&FSQLITE_VDBE_MVCC_WRITE_BUSY_RETRIES_TOTAL, 1);
                             tracing::warn!(
                                 txn_id,
                                 commit_seq = snapshot_high,
@@ -1283,6 +1334,7 @@ impl SharedTxnPageIo {
                             );
                         }
                         Ok(false) => {
+                            add_vdbe_counter(&FSQLITE_VDBE_MVCC_WRITE_BUSY_TIMEOUTS_TOTAL, 1);
                             let error = FrankenError::Busy;
                             if let Err(restore_error) = restore_concurrent_state() {
                                 return Err(FrankenError::Internal(format!(
@@ -1411,7 +1463,23 @@ impl SharedTxnPageIo {
 const PAGE_LOCK_WAIT_CANCELLATION_POLL: Duration = Duration::from_millis(5);
 
 fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> {
+    let metrics_enabled = vdbe_metrics_enabled();
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_BORROWED_NORMALIZATION_CALLS_TOTAL,
+        1,
+    );
     if data.len() == page_size {
+        add_vdbe_counter_if(
+            metrics_enabled,
+            &FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL,
+            1,
+        );
+        add_vdbe_counter_if(
+            metrics_enabled,
+            &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL,
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+        );
         return Ok(PageData::from_vec(data.to_vec()));
     }
     if data.len() > page_size {
@@ -1424,11 +1492,32 @@ fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> 
 
     let mut page = vec![0_u8; page_size];
     page[..data.len()].copy_from_slice(data);
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL,
+        u64::try_from(data.len()).unwrap_or(u64::MAX),
+    );
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL,
+        u64::try_from(page_size.saturating_sub(data.len())).unwrap_or(u64::MAX),
+    );
     Ok(PageData::from_vec(page))
 }
 
 fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageData> {
+    let metrics_enabled = vdbe_metrics_enabled();
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL,
+        1,
+    );
     if data.len() == page_size {
+        add_vdbe_counter_if(
+            metrics_enabled,
+            &FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL,
+            1,
+        );
         return Ok(data);
     }
     if data.len() > page_size {
@@ -1439,7 +1528,25 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
         )));
     }
 
-    normalize_owned_page_data(page_size, data.as_bytes())
+    let payload_len = data.len();
+    let mut page = vec![0_u8; page_size];
+    page[..payload_len].copy_from_slice(data.as_bytes());
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL,
+        1,
+    );
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL,
+        u64::try_from(payload_len).unwrap_or(u64::MAX),
+    );
+    add_vdbe_counter_if(
+        metrics_enabled,
+        &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL,
+        u64::try_from(page_size.saturating_sub(payload_len)).unwrap_or(u64::MAX),
+    );
+    Ok(PageData::from_vec(page))
 }
 
 fn wait_for_page_lock_holder_change(
@@ -1457,6 +1564,7 @@ fn wait_for_page_lock_holder_change(
         return Ok(false);
     }
 
+    let metrics_enabled = vdbe_metrics_enabled();
     let started = Instant::now();
     loop {
         observe_execution_cancellation(cx)?;
@@ -1471,11 +1579,33 @@ fn wait_for_page_lock_holder_change(
             .lock_table
             .wait_for_holder_change(page_no, holder, wait_slice)
         {
+            add_vdbe_counter_if(metrics_enabled, &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL, 1);
+            add_vdbe_duration_if(
+                metrics_enabled,
+                &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL,
+                started,
+            );
             return Ok(true);
         }
 
         if ctx.lock_table.holder(page_no) != Some(holder) {
+            add_vdbe_counter_if(metrics_enabled, &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL, 1);
+            add_vdbe_duration_if(
+                metrics_enabled,
+                &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL,
+                started,
+            );
             return Ok(true);
+        }
+
+        if wait_budget == wait_slice {
+            add_vdbe_counter_if(metrics_enabled, &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL, 1);
+            add_vdbe_duration_if(
+                metrics_enabled,
+                &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL,
+                started,
+            );
+            return Ok(false);
         }
     }
 }
@@ -1486,6 +1616,8 @@ fn track_concurrent_conflict_only_page(
     page_no: PageNumber,
     operation: &str,
 ) -> Result<()> {
+    let metrics_enabled = vdbe_metrics_enabled();
+    let track_started = metrics_enabled.then(Instant::now);
     let started = Instant::now();
     let deadline = Duration::from_millis(ctx.busy_timeout_ms);
 
@@ -1543,6 +1675,18 @@ fn track_concurrent_conflict_only_page(
 
         match track_result.expect("track result must exist when snapshot is valid") {
             Ok(()) => {
+                add_vdbe_counter_if(
+                    metrics_enabled,
+                    &FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACKS_TOTAL,
+                    1,
+                );
+                if let Some(track_started) = track_started {
+                    add_vdbe_duration_if(
+                        metrics_enabled,
+                        &FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACK_TIME_NS_TOTAL,
+                        track_started,
+                    );
+                }
                 tracing::debug!(
                     txn_id,
                     commit_seq = snapshot_high,
@@ -2990,6 +3134,44 @@ pub fn reset_vdbe_jit_metrics() {
 static FSQLITE_SORT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total pages spilled to disk by sorters.
 static FSQLITE_SORT_SPILL_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total MVCC write-path executions that reused an already-owned page lock.
+static FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total MVCC write-path executions that acquired a page lock on first touch.
+static FSQLITE_VDBE_MVCC_TIER1_FIRST_TOUCH_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total MVCC write-path executions that crossed the commit-surface/page-one lane.
+static FSQLITE_VDBE_MVCC_TIER2_COMMIT_SURFACE_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total page-lock wait episodes observed on the MVCC path.
+static FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds spent waiting for page-lock ownership changes.
+static FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total BUSY retries on MVCC write paths after waiting for a page lock.
+static FSQLITE_VDBE_MVCC_WRITE_BUSY_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total BUSY timeouts on MVCC write paths after exhausting the wait budget.
+static FSQLITE_VDBE_MVCC_WRITE_BUSY_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total MVCC write rejections caused by stale snapshots.
+static FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total conflict-only page-one tracking acquisitions.
+static FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds spent recording conflict-only page-one tracking.
+static FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACK_TIME_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total stale synthetic pending-commit-surface clears.
+static FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEARS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds spent clearing stale synthetic pending-commit surface state.
+static FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEAR_TIME_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total borrowed `write_page(&[u8])` normalization calls.
+static FSQLITE_VDBE_PAGE_DATA_BORROWED_NORMALIZATION_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total borrowed `write_page(&[u8])` calls that still copied a full page even though input was exact-size.
+static FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total owned `write_page_data(PageData)` normalization calls.
+static FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total owned `PageData` writes that passed through without resizing/copying.
+static FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total owned `PageData` writes that required allocating a resized page image.
+static FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total payload bytes copied while normalizing page data before writes.
+static FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total zero-fill bytes synthesized while normalizing short page writes.
+static FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Point-in-time breakdown of materialized value storage classes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3019,6 +3201,54 @@ pub struct OpcodeExecutionCount {
     pub opcode: String,
     /// Total dynamic executions observed.
     pub total: u64,
+}
+
+/// Snapshot of MVCC write-path counters captured inside the VDBE write helpers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MvccWritePathMetricsSnapshot {
+    /// Total tier-0 writes that reused an already-owned page lock.
+    pub tier0_already_owned_writes_total: u64,
+    /// Total tier-1 writes that acquired a page lock on first touch.
+    pub tier1_first_touch_writes_total: u64,
+    /// Total tier-2 writes that crossed the commit-surface/page-one lane.
+    pub tier2_commit_surface_writes_total: u64,
+    /// Total wait episodes on page-lock handoff.
+    pub page_lock_waits_total: u64,
+    /// Cumulative nanoseconds spent waiting for page-lock handoff.
+    pub page_lock_wait_time_ns_total: u64,
+    /// Total BUSY retries after a completed page-lock wait.
+    pub write_busy_retries_total: u64,
+    /// Total BUSY timeouts after exhausting the page-lock wait budget.
+    pub write_busy_timeouts_total: u64,
+    /// Total stale-snapshot rejections on MVCC writes.
+    pub stale_snapshot_rejects_total: u64,
+    /// Total conflict-only page-one tracking operations.
+    pub page_one_conflict_tracks_total: u64,
+    /// Cumulative nanoseconds spent in conflict-only page-one tracking.
+    pub page_one_conflict_track_time_ns_total: u64,
+    /// Total stale synthetic pending-surface clears.
+    pub pending_commit_surface_clears_total: u64,
+    /// Cumulative nanoseconds spent clearing stale synthetic pending-surface state.
+    pub pending_commit_surface_clear_time_ns_total: u64,
+}
+
+/// Snapshot of page-data normalization and copy/motion counters on the write path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PageDataMotionMetricsSnapshot {
+    /// Total borrowed `write_page(&[u8])` normalization calls.
+    pub borrowed_write_normalization_calls_total: u64,
+    /// Total borrowed exact-size writes that still copied a full page image.
+    pub borrowed_exact_size_copies_total: u64,
+    /// Total owned `write_page_data(PageData)` normalization calls.
+    pub owned_write_normalization_calls_total: u64,
+    /// Total owned writes that passed through without resizing/copying.
+    pub owned_passthrough_total: u64,
+    /// Total owned writes that required resizing/copying.
+    pub owned_resized_copies_total: u64,
+    /// Total payload bytes copied into normalized page images.
+    pub normalized_payload_bytes_total: u64,
+    /// Total zero-fill bytes synthesized while normalizing short writes.
+    pub normalized_zero_fill_bytes_total: u64,
 }
 
 /// Snapshot of VDBE execution metrics.
@@ -3064,6 +3294,10 @@ pub struct VdbeMetricsSnapshot {
     pub decoded_value_types: ValueTypeMetricsSnapshot,
     /// Storage-class breakdown of emitted result values.
     pub result_value_types: ValueTypeMetricsSnapshot,
+    /// MVCC write-path timing and retry counters captured inside the VDBE layer.
+    pub mvcc_write_path: MvccWritePathMetricsSnapshot,
+    /// Page-data normalization/copy counters captured on write entry.
+    pub page_data_motion: PageDataMotionMetricsSnapshot,
 }
 
 /// Enable/disable VDBE execution metrics collection.
@@ -3149,6 +3383,52 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
             text_bytes_total: FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL.load(AtomicOrdering::Relaxed),
             blob_bytes_total: FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL.load(AtomicOrdering::Relaxed),
         },
+        mvcc_write_path: MvccWritePathMetricsSnapshot {
+            tier0_already_owned_writes_total: FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            tier1_first_touch_writes_total: FSQLITE_VDBE_MVCC_TIER1_FIRST_TOUCH_WRITES_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            tier2_commit_surface_writes_total: FSQLITE_VDBE_MVCC_TIER2_COMMIT_SURFACE_WRITES_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            page_lock_waits_total: FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            page_lock_wait_time_ns_total: FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            write_busy_retries_total: FSQLITE_VDBE_MVCC_WRITE_BUSY_RETRIES_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            write_busy_timeouts_total: FSQLITE_VDBE_MVCC_WRITE_BUSY_TIMEOUTS_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            stale_snapshot_rejects_total: FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            page_one_conflict_tracks_total: FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACKS_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            page_one_conflict_track_time_ns_total:
+                FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACK_TIME_NS_TOTAL
+                    .load(AtomicOrdering::Relaxed),
+            pending_commit_surface_clears_total: FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEARS_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            pending_commit_surface_clear_time_ns_total:
+                FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEAR_TIME_NS_TOTAL.load(AtomicOrdering::Relaxed),
+        },
+        page_data_motion: PageDataMotionMetricsSnapshot {
+            borrowed_write_normalization_calls_total:
+                FSQLITE_VDBE_PAGE_DATA_BORROWED_NORMALIZATION_CALLS_TOTAL
+                    .load(AtomicOrdering::Relaxed),
+            borrowed_exact_size_copies_total:
+                FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL
+                    .load(AtomicOrdering::Relaxed),
+            owned_write_normalization_calls_total:
+                FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL.load(AtomicOrdering::Relaxed),
+            owned_passthrough_total: FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            owned_resized_copies_total: FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            normalized_payload_bytes_total: FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL
+                .load(AtomicOrdering::Relaxed),
+            normalized_zero_fill_bytes_total:
+                FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL
+                    .load(AtomicOrdering::Relaxed),
+        },
     }
 }
 
@@ -3188,6 +3468,25 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_SPILL_PAGES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_TIER1_FIRST_TOUCH_WRITES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_TIER2_COMMIT_SURFACE_WRITES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_WRITE_BUSY_RETRIES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_WRITE_BUSY_TIMEOUTS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_STALE_SNAPSHOT_REJECTS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACKS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_PAGE_ONE_CONFLICT_TRACK_TIME_NS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEARS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MVCC_PENDING_SURFACE_CLEAR_TIME_NS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_BORROWED_NORMALIZATION_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     reset_vdbe_jit_metrics();
 }
 

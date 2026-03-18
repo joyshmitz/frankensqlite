@@ -5118,9 +5118,10 @@ mod tests {
         HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3,
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
         HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
-        HotPathArtifactManifest, HotPathOpcodeProfileEntry, HotPathParserProfile,
-        HotPathProfileReport, HotPathRankingEntry, HotPathRecordDecodeProfile,
-        HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
+        HotPathArtifactManifest, HotPathMvccWriteProfile, HotPathOpcodeProfileEntry,
+        HotPathPageDataMotionProfile, HotPathParserProfile, HotPathProfileReport,
+        HotPathRankingEntry, HotPathRecordDecodeProfile, HotPathRowMaterializationProfile,
+        HotPathTypeProfile, HotPathValueTypeProfile,
     };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
     use jsonschema::{Draft, options};
@@ -5280,6 +5281,55 @@ mod tests {
                 make_record_blob_bytes_total: 0,
                 value_types: decoded_values.clone(),
             },
+            mvcc_write: HotPathMvccWriteProfile {
+                total_write_attempts: 4,
+                tier0_already_owned_writes_total: 1,
+                tier1_first_touch_writes_total: 2,
+                tier2_commit_surface_writes_total: 1,
+                page_lock_waits_total: 2,
+                page_lock_wait_time_ns_total: 48,
+                write_busy_retries_total: 1,
+                write_busy_timeouts_total: 0,
+                stale_snapshot_rejects_total: 0,
+                page_one_conflict_tracks_total: 1,
+                page_one_conflict_track_time_ns_total: 12,
+                pending_commit_surface_clears_total: 1,
+                pending_commit_surface_clear_time_ns_total: 8,
+                runtime_retry: fsqlite_e2e::report::HotPathRetryBreakdown {
+                    total_retries: 3,
+                    total_aborts: 3,
+                    kind: fsqlite_e2e::report::HotPathRetryKindBreakdown {
+                        busy: 1,
+                        busy_snapshot: 2,
+                        busy_recovery: 0,
+                        busy_other: 0,
+                    },
+                    phase: fsqlite_e2e::report::HotPathRetryPhaseBreakdown {
+                        begin: 0,
+                        body: 2,
+                        commit: 1,
+                        rollback: 0,
+                    },
+                    max_batch_attempts: 4,
+                    top_snapshot_conflict_pages: vec![fsqlite_e2e::report::HotPathConflictPageCount {
+                        page_no: 9,
+                        retries: 2,
+                    }],
+                    last_busy_message: Some(
+                        "SQLITE_BUSY_SNAPSHOT on page 9".to_owned(),
+                    ),
+                },
+            },
+            page_data_motion: HotPathPageDataMotionProfile {
+                borrowed_write_normalization_calls_total: 1,
+                borrowed_exact_size_copies_total: 1,
+                owned_write_normalization_calls_total: 2,
+                owned_passthrough_total: 1,
+                owned_resized_copies_total: 1,
+                normalized_payload_bytes_total: 96,
+                normalized_zero_fill_bytes_total: 32,
+                normalized_bytes_total: 128,
+            },
             opcode_profile: vec![HotPathOpcodeProfileEntry {
                 opcode: "Column".to_owned(),
                 total: 3,
@@ -5299,6 +5349,7 @@ mod tests {
                 decoded_value_heap_bytes_total: 16,
                 result_value_heap_bytes_total: 8,
                 record_vec_capacity_slots: 4,
+                page_data_normalization_bytes_total: 128,
                 ranked_sources: vec![HotPathRankingEntry {
                     subsystem: "record_decode_values".to_owned(),
                     metric_kind: "bytes".to_owned(),
@@ -5956,6 +6007,16 @@ mod tests {
             value["summary_markdown"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("## Microarchitectural Signatures"))
+        );
+        assert!(
+            value["summary_markdown"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("Runtime retry taxonomy"))
+        );
+        assert!(
+            value["summary_markdown"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("Page-touch classes"))
         );
     }
 
