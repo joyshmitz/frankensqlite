@@ -255,6 +255,7 @@
       "required": [
         "path",
         "bytes",
+        "sha256",
         "description"
       ],
       "properties": {
@@ -264,6 +265,9 @@
         "bytes": {
           "type": "integer",
           "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
         },
         "description": {
           "$ref": "#/$defs/non_empty_string"

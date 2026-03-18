@@ -20,6 +20,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use fsqlite_core::connection::{
     HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
@@ -481,6 +482,7 @@ pub struct HotPathActionableRanking {
 pub struct HotPathArtifactFile {
     pub path: String,
     pub bytes: u64,
+    pub sha256: String,
     pub description: String,
 }
 
@@ -1534,6 +1536,10 @@ fn ratio_basis_points(value: u64, total: u64) -> u32 {
     u32::try_from(rounded).unwrap_or(u32::MAX)
 }
 
+fn hot_path_artifact_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn actionable_entry(
     rank: usize,
     entry: &HotPathRankingEntry,
@@ -2346,27 +2352,32 @@ pub fn write_hot_path_profile_artifacts(
             HotPathArtifactFile {
                 path: "profile.json".to_owned(),
                 bytes: u64::try_from(report_json.len()).unwrap_or(u64::MAX),
+                sha256: hot_path_artifact_sha256(report_json.as_bytes()),
                 description: "structured hot-path profile report".to_owned(),
             },
             HotPathArtifactFile {
                 path: "opcode_profile.json".to_owned(),
                 bytes: u64::try_from(opcode_profile_json.len()).unwrap_or(u64::MAX),
+                sha256: hot_path_artifact_sha256(opcode_profile_json.as_bytes()),
                 description: "raw opcode totals for the profiled run".to_owned(),
             },
             HotPathArtifactFile {
                 path: "subsystem_profile.json".to_owned(),
                 bytes: u64::try_from(subsystem_profile_json.len()).unwrap_or(u64::MAX),
+                sha256: hot_path_artifact_sha256(subsystem_profile_json.as_bytes()),
                 description: "raw execution-subsystem timing and heap profile for the run"
                     .to_owned(),
             },
             HotPathArtifactFile {
                 path: "summary.md".to_owned(),
                 bytes: u64::try_from(summary_md.len()).unwrap_or(u64::MAX),
+                sha256: hot_path_artifact_sha256(summary_md.as_bytes()),
                 description: "human-readable hotspot ranking summary".to_owned(),
             },
             HotPathArtifactFile {
                 path: "actionable_ranking.json".to_owned(),
                 bytes: u64::try_from(actionable_ranking_json.len()).unwrap_or(u64::MAX),
+                sha256: hot_path_artifact_sha256(actionable_ranking_json.as_bytes()),
                 description:
                     "structured hotspot, reuse, and baseline-waste ledger for follow-on implementation work"
                         .to_owned(),
@@ -2381,6 +2392,7 @@ pub fn write_hot_path_profile_artifacts(
     files.push(HotPathArtifactFile {
         path: "manifest.json".to_owned(),
         bytes: u64::try_from(manifest_json.len()).unwrap_or(u64::MAX),
+        sha256: hot_path_artifact_sha256(manifest_json.as_bytes()),
         description: "artifact manifest with replay metadata".to_owned(),
     });
     Ok(HotPathArtifactManifest { files, ..manifest })

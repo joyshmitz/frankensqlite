@@ -16574,6 +16574,49 @@ fn test_conformance_drop_table_view_index_s141() {
 }
 
 #[test]
+fn test_diag_sqlite_master_after_drop() {
+    let fconn = Connection::open(":memory:").unwrap();
+    fconn
+        .execute("CREATE TABLE dt(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    fconn
+        .execute("INSERT INTO dt VALUES(1,'a'),(2,'b')")
+        .unwrap();
+
+    // Pre-drop: check sqlite_master has entries
+    let pre = fconn
+        .query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master")
+        .unwrap();
+    eprintln!("PRE-DROP sqlite_master ({} rows):", pre.len());
+    for r in &pre {
+        eprintln!("  {:?}", r.values());
+    }
+
+    // Drop the table
+    fconn.execute("DROP TABLE dt").unwrap();
+
+    // Post-drop: check sqlite_master
+    let post = fconn
+        .query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master")
+        .unwrap();
+    eprintln!("POST-DROP sqlite_master ({} rows):", post.len());
+    for r in &post {
+        eprintln!("  {:?}", r.values());
+    }
+
+    // Also try with count
+    let cnt = fconn.query("SELECT COUNT(*) FROM sqlite_master").unwrap();
+    eprintln!("POST-DROP COUNT(*): {:?}", cnt.first().map(|r| r.values()));
+
+    assert_eq!(
+        post.len(),
+        0,
+        "sqlite_master should be empty after DROP TABLE"
+    );
+    assert_eq!(cnt.len(), 1, "COUNT(*) should always produce one row");
+}
+
+#[test]
 fn test_conformance_cte_insert_s142() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -29618,7 +29661,6 @@ fn test_conformance_probe_nested_cte_s500() {
 }
 
 #[test]
-#[ignore = "multi-column IN tuple (a,b) IN ((1,10),(3,30)) not supported"]
 fn test_conformance_probe_multicolumn_in_s501() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

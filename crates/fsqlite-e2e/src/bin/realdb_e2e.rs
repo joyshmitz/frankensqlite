@@ -862,14 +862,21 @@ fn build_hot_path_command_pack(
 fn write_hot_path_command_pack(
     output_dir: &Path,
     command_pack: &HotPathEvidenceCommandPack,
-) -> io::Result<u64> {
+) -> io::Result<HotPathArtifactFile> {
     let command_pack_json = serde_json::to_string_pretty(command_pack)
         .map_err(|error| io::Error::other(format!("command pack JSON: {error}")))?;
     fs::write(
         output_dir.join(HOT_PATH_COMMAND_PACK_NAME),
         command_pack_json.as_bytes(),
     )?;
-    Ok(u64::try_from(command_pack_json.len()).unwrap_or(u64::MAX))
+    Ok(HotPathArtifactFile {
+        path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+        bytes: u64::try_from(command_pack_json.len()).unwrap_or(u64::MAX),
+        sha256: hot_path_artifact_sha256(command_pack_json.as_bytes()),
+        description:
+            "structured replay/evidence capture commands for profiler-safe and full-validation runs"
+                .to_owned(),
+    })
 }
 
 fn push_unique_string(values: &mut Vec<String>, value: impl Into<String>) {
@@ -1276,6 +1283,20 @@ fn build_hot_path_artifact_provenance(
     }
 }
 
+fn hot_path_artifact_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn refresh_hot_path_artifact_metadata(
+    output_dir: &Path,
+    file: &mut HotPathArtifactFile,
+) -> io::Result<()> {
+    let bytes = fs::read(output_dir.join(&file.path))?;
+    file.bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    file.sha256 = hot_path_artifact_sha256(&bytes);
+    Ok(())
+}
+
 fn finalize_hot_path_manifest(
     output_dir: &Path,
     manifest: HotPathArtifactManifest,
@@ -1294,6 +1315,9 @@ fn finalize_hot_path_manifest(
             files.push(extra);
         }
     }
+    for file in &mut files {
+        refresh_hot_path_artifact_metadata(output_dir, file)?;
+    }
     let mut disk_manifest = HotPathArtifactManifest {
         files,
         counter_capture_summary,
@@ -1305,6 +1329,7 @@ fn finalize_hot_path_manifest(
     disk_manifest.files.push(HotPathArtifactFile {
         path: "manifest.json".to_owned(),
         bytes: u64::try_from(manifest_json.len()).unwrap_or(u64::MAX),
+        sha256: hot_path_artifact_sha256(manifest_json.as_bytes()),
         description: "artifact manifest with replay metadata".to_owned(),
     });
     Ok(disk_manifest)
@@ -3890,8 +3915,8 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let command_pack_bytes = match write_hot_path_command_pack(&output_dir, &command_pack) {
-        Ok(bytes) => bytes,
+    let command_pack_file = match write_hot_path_command_pack(&output_dir, &command_pack) {
+        Ok(file) => file,
         Err(error) => {
             eprintln!("error: failed to write hot-path command pack: {error}");
             return 1;
@@ -3901,13 +3926,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         &output_dir,
         manifest,
         counter_capture_summary,
-        vec![HotPathArtifactFile {
-            path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
-            bytes: command_pack_bytes,
-            description:
-                "structured replay/evidence capture commands for profiler-safe and full-validation runs"
-                    .to_owned(),
-        }],
+        vec![command_pack_file],
     ) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -5102,7 +5121,7 @@ mod tests {
     const BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_PATH: &str =
         "sample_sqlite_db_files/manifests/beads_benchmark_artifact_manifest.v1.schema.json";
     #[allow(clippy::needless_raw_string_hashes)]
-    const HOT_PATH_MANIFEST_SCHEMA_RAW: &str = r###"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://frankensqlite.dev/schemas/hot_path_profile_manifest.v1.schema.json","title":"FrankenSQLite Hot Path Profile Manifest v1","type":"object","additionalProperties":false,"required":["schema_version","bead_id","run_id","trace_id","scenario_id","fixture_id","workload","seed","scale","concurrency","concurrent_mode","run_integrity_check","replay_command","files"],"properties":{"schema_version":{"type":"string","const":"fsqlite-e2e.hot_path_profile_manifest.v1"},"bead_id":{"$ref":"#/$defs/id"},"run_id":{"$ref":"#/$defs/id"},"trace_id":{"$ref":"#/$defs/id"},"scenario_id":{"$ref":"#/$defs/id"},"fixture_id":{"$ref":"#/$defs/id"},"workload":{"$ref":"#/$defs/non_empty_string"},"seed":{"type":"integer","minimum":0},"scale":{"type":"integer","minimum":1},"concurrency":{"type":"integer","minimum":1},"concurrent_mode":{"type":"boolean"},"run_integrity_check":{"type":"boolean"},"golden_dir":{"$ref":"#/$defs/nullable_non_empty_string"},"working_base":{"$ref":"#/$defs/nullable_non_empty_string"},"replay_command":{"$ref":"#/$defs/non_empty_string"},"counter_capture_summary":{"$ref":"#/$defs/counter_capture_summary"},"provenance":{"$ref":"#/$defs/provenance"},"files":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/artifact_file"}}},"$defs":{"id":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]*$"},"non_empty_string":{"type":"string","minLength":1},"nullable_non_empty_string":{"type":["string","null"],"minLength":1},"string_list":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}},"counter_capture_summary":{"type":"object","additionalProperties":false,"required":["host_capability_sensitive_captures","topology_sensitive_captures","fallback_tools","fallback_metric_pack","fallback_notes","raw_output_relpaths"],"properties":{"host_capability_sensitive_captures":{"$ref":"#/$defs/string_list"},"topology_sensitive_captures":{"$ref":"#/$defs/string_list"},"fallback_tools":{"$ref":"#/$defs/string_list"},"fallback_metric_pack":{"$ref":"#/$defs/string_list"},"fallback_notes":{"$ref":"#/$defs/string_list"},"raw_output_relpaths":{"$ref":"#/$defs/string_list"}}},"command":{"type":"object","additionalProperties":false,"required":["tool","command_line"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"command_line":{"$ref":"#/$defs/non_empty_string"}}},"tool_version":{"type":"object","additionalProperties":false,"required":["tool","version"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"version":{"$ref":"#/$defs/non_empty_string"}}},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"provenance":{"type":"object","additionalProperties":false,"required":["row_id","mode_id","artifact_root","command_entrypoint","kernel_release","rustc_version","cargo_profile","commands","tool_versions","fallback_notes"],"properties":{"row_id":{"$ref":"#/$defs/id"},"mode_id":{"$ref":"#/$defs/id"},"artifact_root":{"$ref":"#/$defs/non_empty_string"},"command_entrypoint":{"$ref":"#/$defs/non_empty_string"},"workspace_root":{"$ref":"#/$defs/nullable_non_empty_string"},"campaign_manifest_path":{"$ref":"#/$defs/nullable_non_empty_string"},"source_revision":{"$ref":"#/$defs/nullable_non_empty_string"},"beads_data_hash":{"oneOf":[{"$ref":"#/$defs/sha256"},{"type":"null"}]},"kernel_release":{"$ref":"#/$defs/non_empty_string"},"rustc_version":{"$ref":"#/$defs/non_empty_string"},"cargo_profile":{"$ref":"#/$defs/non_empty_string"},"commands":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/command"}},"tool_versions":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/tool_version"}},"fallback_notes":{"$ref":"#/$defs/string_list"}}},"artifact_file":{"type":"object","additionalProperties":false,"required":["path","bytes","description"],"properties":{"path":{"$ref":"#/$defs/non_empty_string"},"bytes":{"type":"integer","minimum":0},"description":{"$ref":"#/$defs/non_empty_string"}}}}}"###;
+    const HOT_PATH_MANIFEST_SCHEMA_RAW: &str = r###"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://frankensqlite.dev/schemas/hot_path_profile_manifest.v1.schema.json","title":"FrankenSQLite Hot Path Profile Manifest v1","type":"object","additionalProperties":false,"required":["schema_version","bead_id","run_id","trace_id","scenario_id","fixture_id","workload","seed","scale","concurrency","concurrent_mode","run_integrity_check","replay_command","files"],"properties":{"schema_version":{"type":"string","const":"fsqlite-e2e.hot_path_profile_manifest.v1"},"bead_id":{"$ref":"#/$defs/id"},"run_id":{"$ref":"#/$defs/id"},"trace_id":{"$ref":"#/$defs/id"},"scenario_id":{"$ref":"#/$defs/id"},"fixture_id":{"$ref":"#/$defs/id"},"workload":{"$ref":"#/$defs/non_empty_string"},"seed":{"type":"integer","minimum":0},"scale":{"type":"integer","minimum":1},"concurrency":{"type":"integer","minimum":1},"concurrent_mode":{"type":"boolean"},"run_integrity_check":{"type":"boolean"},"golden_dir":{"$ref":"#/$defs/nullable_non_empty_string"},"working_base":{"$ref":"#/$defs/nullable_non_empty_string"},"replay_command":{"$ref":"#/$defs/non_empty_string"},"counter_capture_summary":{"$ref":"#/$defs/counter_capture_summary"},"provenance":{"$ref":"#/$defs/provenance"},"files":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/artifact_file"}}},"$defs":{"id":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]*$"},"non_empty_string":{"type":"string","minLength":1},"nullable_non_empty_string":{"type":["string","null"],"minLength":1},"string_list":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}},"counter_capture_summary":{"type":"object","additionalProperties":false,"required":["host_capability_sensitive_captures","topology_sensitive_captures","fallback_tools","fallback_metric_pack","fallback_notes","raw_output_relpaths"],"properties":{"host_capability_sensitive_captures":{"$ref":"#/$defs/string_list"},"topology_sensitive_captures":{"$ref":"#/$defs/string_list"},"fallback_tools":{"$ref":"#/$defs/string_list"},"fallback_metric_pack":{"$ref":"#/$defs/string_list"},"fallback_notes":{"$ref":"#/$defs/string_list"},"raw_output_relpaths":{"$ref":"#/$defs/string_list"}}},"command":{"type":"object","additionalProperties":false,"required":["tool","command_line"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"command_line":{"$ref":"#/$defs/non_empty_string"}}},"tool_version":{"type":"object","additionalProperties":false,"required":["tool","version"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"version":{"$ref":"#/$defs/non_empty_string"}}},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"provenance":{"type":"object","additionalProperties":false,"required":["row_id","mode_id","artifact_root","command_entrypoint","kernel_release","rustc_version","cargo_profile","commands","tool_versions","fallback_notes"],"properties":{"row_id":{"$ref":"#/$defs/id"},"mode_id":{"$ref":"#/$defs/id"},"artifact_root":{"$ref":"#/$defs/non_empty_string"},"command_entrypoint":{"$ref":"#/$defs/non_empty_string"},"workspace_root":{"$ref":"#/$defs/nullable_non_empty_string"},"campaign_manifest_path":{"$ref":"#/$defs/nullable_non_empty_string"},"source_revision":{"$ref":"#/$defs/nullable_non_empty_string"},"beads_data_hash":{"oneOf":[{"$ref":"#/$defs/sha256"},{"type":"null"}]},"kernel_release":{"$ref":"#/$defs/non_empty_string"},"rustc_version":{"$ref":"#/$defs/non_empty_string"},"cargo_profile":{"$ref":"#/$defs/non_empty_string"},"commands":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/command"}},"tool_versions":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/tool_version"}},"fallback_notes":{"$ref":"#/$defs/string_list"}}},"artifact_file":{"type":"object","additionalProperties":false,"required":["path","bytes","sha256","description"],"properties":{"path":{"$ref":"#/$defs/non_empty_string"},"bytes":{"type":"integer","minimum":0},"sha256":{"$ref":"#/$defs/sha256"},"description":{"$ref":"#/$defs/non_empty_string"}}}}}"###;
     #[allow(clippy::needless_raw_string_hashes)]
     const BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_RAW: &str = r###"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://frankensqlite.local/schemas/sample_sqlite_db_files/beads_benchmark_artifact_manifest.v1.schema.json","title":"FrankenSQLite Beads Benchmark Artifact Manifest (v1)","type":"object","additionalProperties":false,"required":["schema_version","campaign_id","campaign_manifest_path","row_id","fixture_id","workload","concurrency","mode","placement_profile_id","hardware_class_id","retry_policy_id","build_profile_id","seed_policy_id","run_id","artifact_bundle_key","artifact_bundle_name","artifact_bundle_dir","artifact_bundle_relpath","artifact_names","retention_policy","provenance"],"properties":{"schema_version":{"type":"string","const":"fsqlite-e2e.beads_benchmark_artifact_manifest.v1"},"campaign_id":{"$ref":"#/$defs/id"},"campaign_manifest_path":{"$ref":"#/$defs/non_empty_string"},"row_id":{"$ref":"#/$defs/id"},"fixture_id":{"$ref":"#/$defs/id"},"workload":{"$ref":"#/$defs/id"},"concurrency":{"type":"integer","minimum":1},"mode":{"type":"string","enum":["sqlite_reference","fsqlite_mvcc","fsqlite_single_writer"]},"placement_profile_id":{"$ref":"#/$defs/id"},"hardware_class_id":{"$ref":"#/$defs/id"},"retry_policy_id":{"$ref":"#/$defs/id"},"build_profile_id":{"$ref":"#/$defs/id"},"seed_policy_id":{"$ref":"#/$defs/id"},"run_id":{"$ref":"#/$defs/id"},"artifact_bundle_key":{"$ref":"#/$defs/non_empty_string"},"artifact_bundle_name":{"$ref":"#/$defs/non_empty_string"},"artifact_bundle_dir":{"$ref":"#/$defs/non_empty_string"},"artifact_bundle_relpath":{"$ref":"#/$defs/non_empty_string"},"artifact_names":{"$ref":"#/$defs/artifact_names"},"retention_policy":{"$ref":"#/$defs/retention_policy"},"provenance":{"$ref":"#/$defs/provenance"}},"$defs":{"id":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]*$"},"non_empty_string":{"type":"string","minLength":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"retention_class":{"type":"string","enum":["quick_run","full_proof","failure_bundle","final_scorecard"]},"artifact_names":{"type":"object","additionalProperties":false,"required":["result_jsonl","summary_md","manifest_json","hardware_discovery_bundle_json","hardware_discovery_summary_md","logs_dir","profiles_dir"],"properties":{"result_jsonl":{"$ref":"#/$defs/non_empty_string"},"summary_md":{"$ref":"#/$defs/non_empty_string"},"manifest_json":{"$ref":"#/$defs/non_empty_string"},"hardware_discovery_bundle_json":{"$ref":"#/$defs/non_empty_string"},"hardware_discovery_summary_md":{"$ref":"#/$defs/non_empty_string"},"logs_dir":{"$ref":"#/$defs/non_empty_string"},"profiles_dir":{"$ref":"#/$defs/non_empty_string"}}},"retention_policy":{"type":"object","additionalProperties":false,"required":["class","description","superseded_by_newer","immutable","authoritative"],"properties":{"class":{"$ref":"#/$defs/retention_class"},"description":{"$ref":"#/$defs/non_empty_string"},"superseded_by_newer":{"type":"boolean"},"immutable":{"type":"boolean"},"authoritative":{"type":"boolean"}}},"command":{"type":"object","additionalProperties":false,"required":["tool","command_line"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"command_line":{"$ref":"#/$defs/non_empty_string"}}},"tool_version":{"type":"object","additionalProperties":false,"required":["tool","version"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"version":{"$ref":"#/$defs/non_empty_string"}}},"placement_cpu_affinity_policy":{"type":"string","enum":["scheduler_default","dedicated_local_one_thread_per_core","split_across_locality_domains"]},"placement_smt_policy":{"type":"string","enum":["host_default","one_thread_per_core","avoid_primary_sibling_reuse"]},"placement_memory_policy":{"type":"string","enum":["host_default","bind_local","match_cross_domain_placement"]},"placement_helper_lane_policy":{"type":"string","enum":["disclose_host_default","same_locality_housekeeping_core","outside_primary_worker_domains"]},"placement_suite_selector_kind":{"type":"string","enum":["matrix_placement_variant"]},"placement_focused_rerun_selector_kind":{"type":"string","enum":["explicit_bindings"]},"placement_violation_disposition":{"type":"string","enum":["not_comparable"]},"placement_suite_selection_contract":{"type":"object","additionalProperties":false,"required":["selector_kind","selector_field"],"properties":{"selector_kind":{"$ref":"#/$defs/placement_suite_selector_kind"},"selector_field":{"$ref":"#/$defs/non_empty_string"}}},"placement_focused_rerun_contract":{"type":"object","additionalProperties":false,"required":["selector_kind","required_bindings"],"properties":{"selector_kind":{"$ref":"#/$defs/placement_focused_rerun_selector_kind"},"required_bindings":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}}}},"placement_claim_contract":{"type":"object","additionalProperties":false,"required":["mandatory_for","optional_for","avoid_for"],"properties":{"mandatory_for":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"optional_for":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"avoid_for":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}}}},"placement_execution_contract":{"type":"object","additionalProperties":false,"required":["cpu_affinity_policy","smt_policy","memory_policy","helper_lane_policy","required_environment_disclosures","suite_selection","focused_rerun","fixed_knobs","optional_knobs","claim_contract","violation_disposition"],"properties":{"cpu_affinity_policy":{"$ref":"#/$defs/placement_cpu_affinity_policy"},"smt_policy":{"$ref":"#/$defs/placement_smt_policy"},"memory_policy":{"$ref":"#/$defs/placement_memory_policy"},"helper_lane_policy":{"$ref":"#/$defs/placement_helper_lane_policy"},"required_environment_disclosures":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"suite_selection":{"$ref":"#/$defs/placement_suite_selection_contract"},"focused_rerun":{"$ref":"#/$defs/placement_focused_rerun_contract"},"fixed_knobs":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"optional_knobs":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"claim_contract":{"$ref":"#/$defs/placement_claim_contract"},"violation_disposition":{"$ref":"#/$defs/placement_violation_disposition"}}},"hardware_os_family":{"type":"string","enum":["linux"]},"hardware_cpu_architecture":{"type":"string","enum":["x86_64"]},"hardware_topology_class":{"type":"string","enum":["any","many_core_numa"]},"hardware_class_id_fields":{"type":"object","additionalProperties":false,"required":["os_family","cpu_arch","topology_class"],"properties":{"os_family":{"$ref":"#/$defs/hardware_os_family"},"cpu_arch":{"$ref":"#/$defs/hardware_cpu_architecture"},"topology_class":{"$ref":"#/$defs/hardware_topology_class"}}},"hardware_class":{"type":"object","additionalProperties":false,"required":["id","id_fields","min_logical_cores","min_numa_nodes","description"],"properties":{"id":{"$ref":"#/$defs/id"},"id_fields":{"$ref":"#/$defs/hardware_class_id_fields"},"min_logical_cores":{"type":"integer","minimum":1},"min_numa_nodes":{"type":["integer","null"],"minimum":1},"description":{"$ref":"#/$defs/non_empty_string"}}},"build_profile":{"type":"object","additionalProperties":false,"required":["id","cargo_profile","cargo_args","notes"],"properties":{"id":{"$ref":"#/$defs/id"},"cargo_profile":{"$ref":"#/$defs/non_empty_string"},"cargo_args":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}},"notes":{"$ref":"#/$defs/non_empty_string"}}},"fixture":{"type":"object","additionalProperties":false,"required":["fixture_id","source_path","source_sha256","source_size_bytes","working_copy_relpath","working_copy_sha256","working_copy_size_bytes","page_size","journal_mode","capture_rule"],"properties":{"fixture_id":{"$ref":"#/$defs/id"},"source_path":{"$ref":"#/$defs/non_empty_string"},"source_sha256":{"$ref":"#/$defs/sha256"},"source_size_bytes":{"type":"integer","minimum":1},"working_copy_relpath":{"$ref":"#/$defs/non_empty_string"},"working_copy_sha256":{"$ref":"#/$defs/sha256"},"working_copy_size_bytes":{"type":"integer","minimum":1},"page_size":{"type":"integer","minimum":1},"journal_mode":{"$ref":"#/$defs/non_empty_string"},"capture_rule":{"$ref":"#/$defs/non_empty_string"}}},"placement_policy":{"type":"object","additionalProperties":false,"required":["placement_profile_id","hardware_class_id","availability","command_hint","required","execution_contract"],"properties":{"placement_profile_id":{"$ref":"#/$defs/id"},"hardware_class_id":{"$ref":"#/$defs/id"},"availability":{"type":"string","enum":["universal","topology_aware"]},"command_hint":{"$ref":"#/$defs/non_empty_string"},"required":{"type":"boolean"},"execution_contract":{"$ref":"#/$defs/placement_execution_contract"}}},"provenance":{"type":"object","additionalProperties":false,"required":["command_entrypoint","source_revision","beads_data_hash","kernel_release","fixture","build_profile","hardware_class","placement_policy","commands","tool_versions","fallback_notes"],"properties":{"command_entrypoint":{"$ref":"#/$defs/non_empty_string"},"source_revision":{"$ref":"#/$defs/non_empty_string"},"beads_data_hash":{"$ref":"#/$defs/sha256"},"kernel_release":{"$ref":"#/$defs/non_empty_string"},"fixture":{"$ref":"#/$defs/fixture"},"build_profile":{"$ref":"#/$defs/build_profile"},"hardware_class":{"$ref":"#/$defs/hardware_class"},"placement_policy":{"$ref":"#/$defs/placement_policy"},"commands":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/command"}},"tool_versions":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/tool_version"}},"fallback_notes":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}}}}}}"###;
 
@@ -5481,39 +5500,60 @@ mod tests {
                 HotPathArtifactFile {
                     path: "profile.json".to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "report".to_owned(),
                 },
                 HotPathArtifactFile {
                     path: "opcode_profile.json".to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "opcode pack".to_owned(),
                 },
                 HotPathArtifactFile {
                     path: "subsystem_profile.json".to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "subsystem pack".to_owned(),
                 },
                 HotPathArtifactFile {
                     path: "summary.md".to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "summary".to_owned(),
                 },
                 HotPathArtifactFile {
                     path: "actionable_ranking.json".to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "ranking".to_owned(),
                 },
                 HotPathArtifactFile {
                     path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "command pack".to_owned(),
                 },
                 HotPathArtifactFile {
                     path: "manifest.json".to_owned(),
                     bytes: 1,
+                    sha256: "0".repeat(64),
                     description: "manifest".to_owned(),
                 },
             ],
+        }
+    }
+
+    fn write_sample_hot_path_artifacts(output_dir: &Path, files: &[HotPathArtifactFile]) {
+        for file in files {
+            if file.path == "manifest.json" {
+                continue;
+            }
+            let path = output_dir.join(&file.path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("artifact parent should be creatable");
+            }
+            let body = format!("artifact fixture for {}", file.path);
+            fs::write(&path, body.as_bytes()).expect("artifact fixture should be writable");
         }
     }
 
@@ -5753,6 +5793,7 @@ mod tests {
         );
         let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
         let mut base_manifest = sample_hot_path_manifest();
+        write_sample_hot_path_artifacts(tempdir.path(), &base_manifest.files);
         base_manifest.provenance = Some(build_hot_path_artifact_provenance(
             &report,
             &command_pack,
@@ -5766,6 +5807,7 @@ mod tests {
             vec![HotPathArtifactFile {
                 path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
                 bytes: 1,
+                sha256: "0".repeat(64),
                 description: "command pack".to_owned(),
             }],
         )
@@ -6154,6 +6196,7 @@ mod tests {
             sample_hot_path_provenance_inputs(),
         );
         manifest.provenance = Some(provenance.clone());
+        write_sample_hot_path_artifacts(tempdir.path(), &manifest.files);
         let counter_capture_summary = HotPathCounterCaptureManifestSummary {
             host_capability_sensitive_captures: vec!["topdown".to_owned()],
             topology_sensitive_captures: vec!["cache_to_cache".to_owned()],
@@ -6169,6 +6212,7 @@ mod tests {
             vec![HotPathArtifactFile {
                 path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
                 bytes: 77,
+                sha256: "0".repeat(64),
                 description: "command pack".to_owned(),
             }],
         )
@@ -6196,12 +6240,23 @@ mod tests {
             Some(counter_capture_summary.clone())
         );
         assert_eq!(disk_manifest.provenance, Some(provenance.clone()));
+        for file in &disk_manifest.files {
+            let path = tempdir.path().join(&file.path);
+            let bytes = fs::read(&path).expect("artifact file should exist on disk");
+            assert_eq!(file.bytes, u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            assert_eq!(file.sha256, hot_path_artifact_sha256(&bytes));
+        }
         assert!(
             finalized
                 .files
                 .iter()
                 .any(|file| file.path == "manifest.json" && file.bytes > 0)
         );
+        assert!(finalized.files.iter().any(|file| {
+            file.path == HOT_PATH_COMMAND_PACK_NAME
+                && file.sha256
+                    == hot_path_artifact_sha256(b"artifact fixture for command_pack.json")
+        }));
         assert_eq!(
             finalized.counter_capture_summary,
             Some(counter_capture_summary)
@@ -6254,6 +6309,7 @@ mod tests {
             Some(&counter_capture_summary),
             sample_hot_path_provenance_inputs(),
         ));
+        write_sample_hot_path_artifacts(tempdir.path(), &manifest.files);
         let finalized = finalize_hot_path_manifest(
             tempdir.path(),
             manifest,
@@ -6261,6 +6317,7 @@ mod tests {
             vec![HotPathArtifactFile {
                 path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
                 bytes: 77,
+                sha256: "0".repeat(64),
                 description: "command pack".to_owned(),
             }],
         )

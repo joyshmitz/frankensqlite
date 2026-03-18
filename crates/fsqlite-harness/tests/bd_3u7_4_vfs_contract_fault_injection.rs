@@ -1,21 +1,25 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fsqlite_error::FrankenError;
 use fsqlite_harness::fault_vfs::{
     FaultInjectingVfs, FaultMetricsSnapshot, FaultSpec, TEST_VFS_FAULT_COUNTER_NAME,
 };
-use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+use fsqlite_types::LockLevel;
+use fsqlite_vfs::traits::{Vfs, VfsFile};
 #[cfg(target_os = "linux")]
 use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
-use fsqlite_vfs::traits::{Vfs, VfsFile};
 use serde::Serialize;
 #[cfg(unix)]
 use tempfile::TempDir;
@@ -28,6 +32,18 @@ const BENCH_PAGE_SIZE: usize = 4096;
 const BENCH_PAGE_SIZE_U64: u64 = 4096;
 const BENCH_PAGE_COUNT: u64 = 128;
 const LATENCY_BASE_MS: u64 = 2;
+#[cfg(unix)]
+const UNIX_LOCK_CHILD_MODE_ENV: &str = "BD_3U7_4_CHILD_MODE";
+#[cfg(unix)]
+const UNIX_LOCK_CHILD_DB_PATH_ENV: &str = "BD_3U7_4_CHILD_DB_PATH";
+#[cfg(unix)]
+const UNIX_LOCK_CHILD_READY: &str = "BD_3U7_4_CHILD_READY";
+#[cfg(unix)]
+const UNIX_LOCK_CHILD_RELEASED: &str = "BD_3U7_4_CHILD_RELEASED";
+#[cfg(unix)]
+const UNIX_LOCK_CHILD_RELEASE_CMD: &str = "release";
+#[cfg(unix)]
+const THIS_TEST_NAME: &str = "test_e2e_bd_3u7_4_vfs_contract_fault_matrix";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct FaultContractRun {
@@ -383,7 +399,105 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
 }
 
 #[cfg(unix)]
-fn run_unix_lock_probe() -> Result<String, String> {
+fn wait_unix_lock_probe_child(
+    mut child: Child,
+    stdout_prefix: &str,
+    send_release: bool,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    let release_error = if send_release {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "unix_cross_child_missing_stdin".to_owned())?;
+        let release_line = format!("{UNIX_LOCK_CHILD_RELEASE_CMD}\n");
+        if let Err(error) = stdin.write_all(release_line.as_bytes()) {
+            Some(format!("write_failed error={error}"))
+        } else if let Err(error) = stdin.flush() {
+            Some(format!("flush_failed error={error}"))
+        } else {
+            None
+        }
+    } else {
+        let _ = child.stdin.take();
+        None
+    };
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("unix_cross_child_wait_failed error={error}"))?;
+    let mut stdout = stdout_prefix.to_owned();
+    stdout.push_str(&String::from_utf8_lossy(&output.stdout));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if let Some(release_error) = release_error {
+        return Err(format!(
+            "unix_cross_child_release_delivery_failed {release_error} status={} stdout={} stderr={}",
+            output.status, stdout, stderr
+        ));
+    }
+
+    Ok((output.status, stdout, stderr))
+}
+
+#[cfg(unix)]
+fn maybe_run_unix_lock_probe_child() -> bool {
+    if std::env::var(UNIX_LOCK_CHILD_MODE_ENV).ok().as_deref() != Some("unix_reserved_holder") {
+        return false;
+    }
+
+    run_unix_lock_probe_child().expect("bd-3u7.4 unix child lock-holder helper should succeed");
+    true
+}
+
+#[cfg(unix)]
+fn run_unix_lock_probe_child() -> Result<(), String> {
+    let cx = Cx::new();
+    let path = PathBuf::from(
+        std::env::var(UNIX_LOCK_CHILD_DB_PATH_ENV)
+            .map_err(|error| format!("unix_child_missing_db_path_env: {error}"))?,
+    );
+    let vfs = UnixVfs::new();
+    let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+
+    let (mut file, _) = vfs
+        .open(&cx, Some(&path), flags)
+        .map_err(|error| format!("unix_child_open_failed error={error}"))?;
+    file.lock(&cx, LockLevel::Shared)
+        .map_err(|error| format!("unix_child_lock_shared_failed error={error}"))?;
+    file.lock(&cx, LockLevel::Reserved)
+        .map_err(|error| format!("unix_child_lock_reserved_failed error={error}"))?;
+
+    println!("{UNIX_LOCK_CHILD_READY}");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("unix_child_ready_flush_failed error={error}"))?;
+
+    let mut release = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut release)
+        .map_err(|error| format!("unix_child_release_read_failed error={error}"))?;
+    if release.trim() != UNIX_LOCK_CHILD_RELEASE_CMD {
+        return Err(format!(
+            "unix_child_release_command_mismatch expected={UNIX_LOCK_CHILD_RELEASE_CMD} actual={}",
+            release.trim()
+        ));
+    }
+
+    file.unlock(&cx, LockLevel::None)
+        .map_err(|error| format!("unix_child_unlock_failed error={error}"))?;
+    file.close(&cx)
+        .map_err(|error| format!("unix_child_close_failed error={error}"))?;
+
+    println!("{UNIX_LOCK_CHILD_RELEASED}");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("unix_child_released_flush_failed error={error}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_unix_same_process_lock_probe() -> Result<String, String> {
     let cx = Cx::new();
     let tempdir = TempDir::new().map_err(|error| format!("unix_probe_tempdir_failed: {error}"))?;
     let path = tempdir.path().join("bd_3u7_4_unix_lock.db");
@@ -406,8 +520,9 @@ fn run_unix_lock_probe() -> Result<String, String> {
     let reserved_seen = file_b
         .check_reserved_lock(&cx)
         .map_err(|error| format!("unix_probe_reserved_probe_failed error={error}"))?;
-    // Unix advisory locks are process-scoped, not fd-scoped. In this same-process probe,
-    // check_reserved_lock should not report our own reservation as "held by others".
+    // check_reserved_lock reports whether another process holds RESERVED; our own reservation
+    // should stay invisible here even though the VFS still rejects a second same-process
+    // reserver through inode-level bookkeeping.
     if reserved_seen {
         return Err("unix_probe_unexpected_reserved_lock_visibility_same_process".to_owned());
     }
@@ -415,9 +530,14 @@ fn run_unix_lock_probe() -> Result<String, String> {
     file_b
         .lock(&cx, LockLevel::Shared)
         .map_err(|error| format!("unix_probe_lock_b_shared_failed error={error}"))?;
-    file_b
+    let reserved_err = file_b
         .lock(&cx, LockLevel::Reserved)
-        .map_err(|error| format!("unix_probe_lock_b_reserved_failed error={error}"))?;
+        .expect_err("same-process second reserved lock should fail");
+    if !matches!(reserved_err, FrankenError::Busy) {
+        return Err(format!(
+            "unix_probe_same_process_reserved_expected_busy actual={reserved_err:?}"
+        ));
+    }
 
     file_a
         .unlock(&cx, LockLevel::None)
@@ -440,7 +560,157 @@ fn run_unix_lock_probe() -> Result<String, String> {
         .close(&cx)
         .map_err(|error| format!("unix_probe_close_b_failed error={error}"))?;
 
-    Ok("unix_reserved_lock_exclusivity_pass".to_owned())
+    Ok("unix_same_process_reserved_lock_pass".to_owned())
+}
+
+#[cfg(unix)]
+fn run_unix_cross_process_lock_probe() -> Result<String, String> {
+    let cx = Cx::new();
+    let tempdir = TempDir::new().map_err(|error| format!("unix_cross_tempdir_failed: {error}"))?;
+    let path = tempdir.path().join("bd_3u7_4_unix_cross_process_lock.db");
+    let vfs = UnixVfs::new();
+    let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+
+    let (mut bootstrap, _) = vfs
+        .open(&cx, Some(&path), flags)
+        .map_err(|error| format!("unix_cross_open_bootstrap_failed error={error}"))?;
+    bootstrap
+        .write(&cx, b"seed", 0)
+        .map_err(|error| format!("unix_cross_bootstrap_write_failed error={error}"))?;
+    bootstrap
+        .close(&cx)
+        .map_err(|error| format!("unix_cross_bootstrap_close_failed error={error}"))?;
+
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("unix_cross_current_exe_failed: {error}"))?;
+    let mut child = Command::new(exe)
+        .arg("--exact")
+        .arg(THIS_TEST_NAME)
+        .arg("--nocapture")
+        .env(UNIX_LOCK_CHILD_MODE_ENV, "unix_reserved_holder")
+        .env(UNIX_LOCK_CHILD_DB_PATH_ENV, &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("unix_cross_spawn_child_failed error={error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "unix_cross_child_missing_stdout".to_owned())?;
+    let mut stdout = std::io::BufReader::new(stdout);
+    let mut stdout_log = String::new();
+    let mut line = String::new();
+    let ready_seen = loop {
+        line.clear();
+        let read = stdout
+            .read_line(&mut line)
+            .map_err(|error| format!("unix_cross_child_ready_read_failed error={error}"))?;
+        if read == 0 {
+            break false;
+        }
+        stdout_log.push_str(&line);
+        if line.contains(UNIX_LOCK_CHILD_READY) {
+            break true;
+        }
+    };
+    child.stdout = Some(stdout.into_inner());
+
+    if !ready_seen {
+        let (status, child_stdout, child_stderr) =
+            wait_unix_lock_probe_child(child, &stdout_log, false)?;
+        return Err(format!(
+            "unix_cross_child_never_signalled_ready status={} stdout={} stderr={}",
+            status, child_stdout, child_stderr
+        ));
+    }
+
+    let (mut parent, _) = match vfs.open(&cx, Some(&path), flags) {
+        Ok(parent) => parent,
+        Err(error) => {
+            let (status, child_stdout, child_stderr) =
+                wait_unix_lock_probe_child(child, &stdout_log, true)?;
+            return Err(format!(
+                "unix_cross_open_parent_failed error={error}; child_status={} stdout={} stderr={}",
+                status, child_stdout, child_stderr
+            ));
+        }
+    };
+
+    let pre_release_result = (|| -> Result<(), String> {
+        let reserved_seen = parent
+            .check_reserved_lock(&cx)
+            .map_err(|error| format!("unix_cross_reserved_probe_failed error={error}"))?;
+        if !reserved_seen {
+            return Err("unix_cross_reserved_lock_not_visible".to_owned());
+        }
+
+        parent
+            .lock(&cx, LockLevel::Shared)
+            .map_err(|error| format!("unix_cross_parent_shared_lock_failed error={error}"))?;
+        let reserved_err = parent
+            .lock(&cx, LockLevel::Reserved)
+            .expect_err("cross-process reserved lock should reject second reserver");
+        if !matches!(reserved_err, FrankenError::Busy) {
+            return Err(format!(
+                "unix_cross_reserved_lock_expected_busy actual={reserved_err:?}"
+            ));
+        }
+        parent
+            .unlock(&cx, LockLevel::None)
+            .map_err(|error| format!("unix_cross_parent_unlock_failed error={error}"))?;
+        Ok(())
+    })();
+
+    let (child_status, child_stdout, child_stderr) =
+        wait_unix_lock_probe_child(child, &stdout_log, true)?;
+    if let Err(error) = pre_release_result {
+        return Err(format!(
+            "{error}; child_status={} stdout={} stderr={}",
+            child_status, child_stdout, child_stderr
+        ));
+    }
+    if !child_status.success() {
+        return Err(format!(
+            "unix_cross_child_failed status={} stdout={} stderr={}",
+            child_status, child_stdout, child_stderr
+        ));
+    }
+    if !child_stdout.contains(UNIX_LOCK_CHILD_RELEASED) {
+        return Err(format!(
+            "unix_cross_child_missing_release_marker stdout={child_stdout}"
+        ));
+    }
+
+    let reserved_after = parent
+        .check_reserved_lock(&cx)
+        .map_err(|error| format!("unix_cross_reserved_after_release_failed error={error}"))?;
+    if reserved_after {
+        return Err("unix_cross_reserved_lock_stuck_after_release".to_owned());
+    }
+
+    parent
+        .lock(&cx, LockLevel::Shared)
+        .map_err(|error| format!("unix_cross_reacquire_shared_failed error={error}"))?;
+    parent
+        .lock(&cx, LockLevel::Reserved)
+        .map_err(|error| format!("unix_cross_reacquire_reserved_failed error={error}"))?;
+    parent
+        .unlock(&cx, LockLevel::None)
+        .map_err(|error| format!("unix_cross_reacquire_unlock_failed error={error}"))?;
+    parent
+        .close(&cx)
+        .map_err(|error| format!("unix_cross_parent_close_failed error={error}"))?;
+
+    Ok("unix_cross_process_reserved_lock_pass".to_owned())
+}
+
+#[cfg(unix)]
+fn run_unix_lock_probe() -> Result<String, String> {
+    let same_process = run_unix_same_process_lock_probe()?;
+    let cross_process = run_unix_cross_process_lock_probe()?;
+    Ok(format!("{same_process}|{cross_process}"))
 }
 
 #[cfg(not(unix))]
@@ -594,6 +864,11 @@ fn run_throughput(seed: u64, iterations: usize) -> Result<ThroughputRun, String>
 
 #[test]
 fn test_e2e_bd_3u7_4_vfs_contract_fault_matrix() {
+    #[cfg(unix)]
+    if maybe_run_unix_lock_probe_child() {
+        return;
+    }
+
     let seed = scenario_seed();
     let iterations = bench_iters();
     let started = Instant::now();
@@ -604,9 +879,21 @@ fn test_e2e_bd_3u7_4_vfs_contract_fault_matrix() {
         first, second,
         "bead_id={BEAD_ID} deterministic fault contract replay failed for seed={seed}"
     );
+    #[cfg(unix)]
     assert!(
-        first.unix_lock_probe.contains("pass") || first.unix_lock_probe.contains("skipped"),
-        "bead_id={BEAD_ID} unix lock probe result should be pass|skipped, got={}",
+        first
+            .unix_lock_probe
+            .contains("unix_same_process_reserved_lock_pass")
+            && first
+                .unix_lock_probe
+                .contains("unix_cross_process_reserved_lock_pass"),
+        "bead_id={BEAD_ID} unix lock probe must include same-process and cross-process pass markers, got={}",
+        first.unix_lock_probe
+    );
+    #[cfg(not(unix))]
+    assert!(
+        first.unix_lock_probe.contains("skipped"),
+        "bead_id={BEAD_ID} unix lock probe result should be skipped on non-unix, got={}",
         first.unix_lock_probe
     );
 
