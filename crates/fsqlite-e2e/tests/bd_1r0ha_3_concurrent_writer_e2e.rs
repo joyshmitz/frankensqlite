@@ -12,6 +12,7 @@ use fsqlite_e2e::oplog::{
     ConcurrencyModel, ExpectedResult, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
     preset_hot_page_contention,
 };
+use fsqlite_e2e::perf_runner::{FsqliteHotPathProfileConfig, profile_fsqlite_hot_path_oplog};
 use fsqlite_e2e::report::EngineRunReport;
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 use fsqlite_e2e::{E2eResult, HarnessSettings};
@@ -84,6 +85,27 @@ fn fsqlite_exec_config() -> FsqliteExecConfig {
         .pragmas
         .extend(fairness::additional_benchmark_pragmas());
     config
+}
+
+fn fsqlite_profile_config(
+    workload: &str,
+    seed: u64,
+    concurrency: u16,
+) -> FsqliteHotPathProfileConfig {
+    let mut exec_config = fsqlite_exec_config();
+    exec_config.collect_hot_path_profile = true;
+    FsqliteHotPathProfileConfig {
+        workload: workload.to_owned(),
+        seed,
+        scale: 1,
+        concurrency,
+        exec_config,
+        replay_command: REPLAY_COMMAND.to_owned(),
+        golden_dir: None,
+        working_base: None,
+        bead_id: Some(BEAD_ID.to_owned()),
+        scenario_prefix: Some(BEAD_ID.to_owned()),
+    }
 }
 
 fn benchmark_engine(engine: EngineKind, workload_name: &str, oplog: &OpLog) -> BenchmarkSummary {
@@ -463,6 +485,67 @@ fn emit_scenario_outcome(payload: serde_json::Value) {
     println!("SCENARIO_OUTCOME:{payload}");
 }
 
+fn emit_hot_path_profile(payload: serde_json::Value) {
+    println!("HOT_PATH_PROFILE:{payload}");
+}
+
+fn profile_fsqlite_scenario(
+    scenario_id: &str,
+    workload: &str,
+    seed: u64,
+    oplog: &OpLog,
+) -> serde_json::Value {
+    let temp = tempdir().expect("tempdir");
+    let db_path = temp.path().join(format!("{workload}.db"));
+    let report = profile_fsqlite_hot_path_oplog(
+        &db_path,
+        BEAD_ID,
+        oplog,
+        &fsqlite_profile_config(workload, seed, oplog.header.concurrency.worker_count),
+    )
+    .expect("profile fsqlite hot path scenario");
+    json!({
+        "scenario_id": scenario_id,
+        "workload": workload,
+        "seed": seed,
+        "concurrency": oplog.header.concurrency.worker_count,
+        "engine": {
+            "ops_per_sec": report.engine_report.ops_per_sec,
+            "retries": report.engine_report.retries,
+            "aborts": report.engine_report.aborts,
+            "runtime_phase_timing": report.engine_report.runtime_phase_timing,
+        },
+        "top_subsystems": report.subsystem_ranking.iter().take(8).collect::<Vec<_>>(),
+        "top_allocators": report
+            .allocator_pressure
+            .ranked_sources
+            .iter()
+            .take(6)
+            .collect::<Vec<_>>(),
+        "parser": report.parser,
+        "record_decode": {
+            "parse_record_calls": report.record_decode.parse_record_calls,
+            "parse_record_into_calls": report.record_decode.parse_record_into_calls,
+            "parse_record_column_calls": report.record_decode.parse_record_column_calls,
+            "decode_time_ns": report.record_decode.decode_time_ns,
+            "vdbe_record_decode_calls_total": report.record_decode.vdbe_record_decode_calls_total,
+            "decoded_values_total": report.record_decode.decoded_values.total_values,
+            "decoded_value_heap_bytes_total": report
+                .record_decode
+                .vdbe_decoded_value_heap_bytes_total,
+            "callsite_breakdown": report.record_decode.callsite_breakdown,
+        },
+        "row_materialization": {
+            "result_rows_total": report.row_materialization.result_rows_total,
+            "result_values_total": report.row_materialization.result_values_total,
+            "result_row_materialization_time_ns_total": report.row_materialization.result_row_materialization_time_ns_total,
+        },
+        "mvcc_write": report.mvcc_write,
+        "page_data_motion": report.page_data_motion,
+        "connection_ceremony": report.connection_ceremony,
+    })
+}
+
 #[test]
 fn unit_scenario_contract_constants_are_stable() {
     assert_eq!(BEAD_ID, "bd-1r0ha.3");
@@ -727,4 +810,36 @@ fn scenario_no_global_writer_serialization_probe() {
         },
         "replay_command": REPLAY_COMMAND,
     }));
+}
+
+#[test]
+#[ignore = "manual hot path probe for concurrent-writer scenarios"]
+fn manual_hot_path_profile_concurrent_writer_scenarios() {
+    let disjoint = build_reader_writer_disjoint_oplog(
+        SCENARIO_RW_DISJOINT,
+        SEED_RW_DISJOINT,
+        READERS,
+        WRITERS,
+        DISJOINT_ROUNDS,
+        HOT_ROWS,
+    );
+    let no_global = build_writer_fanout_oplog(
+        SCENARIO_NO_SERIALIZATION,
+        SEED_NO_SERIALIZATION,
+        TOTAL_WORKERS,
+        DISJOINT_ROUNDS,
+    );
+
+    emit_hot_path_profile(profile_fsqlite_scenario(
+        SCENARIO_RW_DISJOINT,
+        "rw10w10_disjoint",
+        SEED_RW_DISJOINT,
+        &disjoint,
+    ));
+    emit_hot_path_profile(profile_fsqlite_scenario(
+        SCENARIO_NO_SERIALIZATION,
+        "writer_fanout",
+        SEED_NO_SERIALIZATION,
+        &no_global,
+    ));
 }

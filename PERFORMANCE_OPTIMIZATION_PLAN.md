@@ -15,6 +15,42 @@ account for >95% of the gap:
 4. **Per-query allocations** (est. 10-15%): format!() SQL construction, Vec/String allocations on hot paths
 5. **VDBE interpreter overhead** (est. 5-10%): Large match dispatch, no threaded interpretation
 
+## Priority Reset: 2026-03-19
+
+The original plan is directionally useful, but it understated two bigger problems:
+
+1. **Benchmark truthfulness.** Several benches were unfairly comparing prepared rusqlite paths against ad hoc FrankenSQLite SQL strings, and the main concurrent-write bench was explicitly measuring a FrankenSQLite sequential control rather than the real persistent concurrent-writer path.
+2. **Architecture tax.** Outside the intentional MVCC/RaptorQ differences, the biggest accidental divergence from SQLite is the hybrid runtime and the amount of control-plane machinery dragged through ordinary statement execution.
+3. **MVCC representation cost.** The strongest likely explanation for weak concurrent-writer performance is not just “insufficient optimization,” but the cost model of full-page version chains, page reconstruction, GC pressure, and heavyweight SSI bookkeeping.
+
+The implication is that the gap will not be closed by micro-tweaks alone. The work has to happen on three tracks in parallel:
+
+- **Track A: Restore measurement truth.** Normalize benchmark API usage, make benchmark names honest, and require a canonical hot-path artifact for any serious perf discussion.
+- **Track B: Copy more of SQLite’s hot-path shape.** Narrow the prepare/compile/execute lifecycle, exploit direct seek and covering-index fast paths, and keep fallback logic off the common path.
+- **Track C: Rethink MVCC granularity.** Move common-case concurrent updates away from whole-page version-chain work toward logical row/slot visibility structures while preserving SQLite-compatible durable pages.
+
+## Immediate Execution Track
+
+### A. Truth-first benchmark cleanup
+
+- Convert FrankenSQLite benchmarks to prepared execution wherever the SQLite side already uses prepared statements.
+- Replace ad hoc `format!()` SQL in mixed-path benches with stable parameterized SQL so cache behavior is not artificially poisoned.
+- Keep the existing sequential FrankenSQLite control in the concurrent-write bench, but label it as a control until the persistent concurrent path is benchmarkable end to end.
+- Document the canonical `realdb-e2e hot-profile` workflow in the `fsqlite-e2e` crate docs so profiling is the default response to “why is this slow?”.
+
+### B. Hot-path simplification
+
+- Separate the no-fallback common path from compatibility/fallback routing in `fsqlite-core::Connection`.
+- Shrink `VdbeEngine`'s always-hot state footprint.
+- Audit rowid equality, direct seek, and covering-index codegen against SQLite behavior.
+- Make prepared steady-state execution the primary path for throughput-sensitive workloads.
+
+### C. Radical MVCC redesign
+
+- Prototype a logical visibility sidecar keyed by page/slot or page/rowid for common-row updates.
+- Keep page-level machinery for structural B-tree changes, but stop forcing ordinary logical writes through whole-page version publication and later chain traversal.
+- Replace cleanup/backpressure patterns that sleep in the hot path with opportunistic pruning and bounded metadata maintenance.
+
 ---
 
 ## Phase 0: Measurement Infrastructure (Week 1)

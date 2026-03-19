@@ -1255,7 +1255,7 @@ pub fn profile_fsqlite_hot_path(
     let _scope = HotPathProfileScope::enable()?;
     let engine_report = run_oplog_fsqlite(db_path, &oplog, &config.exec_config)?;
     let snapshot = hot_path_profile_snapshot();
-    Ok(build_hot_path_profile_report(
+    Ok(build_hot_path_profile_report_from_engine_run(
         fixture_id,
         config,
         run_id,
@@ -1263,6 +1263,64 @@ pub fn profile_fsqlite_hot_path(
         engine_report,
         snapshot,
     ))
+}
+
+pub fn profile_fsqlite_hot_path_oplog(
+    db_path: &Path,
+    fixture_id: &str,
+    oplog: &crate::oplog::OpLog,
+    config: &FsqliteHotPathProfileConfig,
+) -> crate::E2eResult<HotPathProfileReport> {
+    if config.concurrency == 0 {
+        return Err(crate::E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hot-path profile concurrency must be >= 1",
+        )));
+    }
+
+    let now_ms = unix_timestamp_millis();
+    let run_id = format!(
+        "{}-{}-{fixture_id}-c{}-s{}-{now_ms}",
+        config.bead_id(),
+        config.workload,
+        config.concurrency,
+        config.seed
+    );
+    let trace_id = format!(
+        "{}:{fixture_id}:c{}",
+        hot_path_profile_scenario_id(config.scenario_prefix(), &config.workload),
+        config.concurrency
+    );
+
+    let _scope = HotPathProfileScope::enable()?;
+    let engine_report = run_oplog_fsqlite(db_path, oplog, &config.exec_config)?;
+    let snapshot = hot_path_profile_snapshot();
+    Ok(build_hot_path_profile_report_from_engine_run(
+        fixture_id,
+        config,
+        run_id,
+        trace_id,
+        engine_report,
+        snapshot,
+    ))
+}
+
+fn build_hot_path_profile_report_from_engine_run(
+    fixture_id: &str,
+    config: &FsqliteHotPathProfileConfig,
+    run_id: String,
+    trace_id: String,
+    engine_report: EngineRunReport,
+    snapshot: HotPathProfileSnapshot,
+) -> HotPathProfileReport {
+    build_hot_path_profile_report(
+        fixture_id,
+        config,
+        run_id,
+        trace_id,
+        engine_report,
+        snapshot,
+    )
 }
 
 #[must_use]
@@ -3564,7 +3622,9 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
 mod tests {
     use super::*;
     use crate::report::StorageWiringReport;
-    use fsqlite_types::record::{RecordHotPathProfileSnapshot, ValueTypeProfileSnapshot};
+    use fsqlite_types::record::{
+        RecordHotPathProfileSnapshot, RecordProfileScopeBreakdownSnapshot, ValueTypeProfileSnapshot,
+    };
     use fsqlite_vdbe::engine::{
         MvccWritePathMetricsSnapshot, OpcodeExecutionCount, PageDataMotionMetricsSnapshot,
         ValueTypeMetricsSnapshot, VdbeMetricsSnapshot,
@@ -3699,6 +3759,7 @@ mod tests {
                     text_bytes: 64,
                     blob_bytes: 32,
                 },
+                callsite_breakdown: RecordProfileScopeBreakdownSnapshot::default(),
             },
             vdbe: VdbeMetricsSnapshot {
                 opcodes_executed_total: 120,
