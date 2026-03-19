@@ -19300,7 +19300,8 @@ fn test_conformance_sqlite_master_after_drop_s73f() {
     assert!(m1.is_empty(), "pre-drop: {m1:?}");
 
     // DROP INDEX
-    for s in &["DROP INDEX idx_t1b"] {
+    {
+        let s = &"DROP INDEX idx_t1b";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19312,7 +19313,8 @@ fn test_conformance_sqlite_master_after_drop_s73f() {
     assert!(m2.is_empty(), "after drop index: {m2:?}");
 
     // DROP VIEW
-    for s in &["DROP VIEW v1"] {
+    {
+        let s = &"DROP VIEW v1";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19324,7 +19326,8 @@ fn test_conformance_sqlite_master_after_drop_s73f() {
     assert!(m3.is_empty(), "after drop view: {m3:?}");
 
     // DROP TABLE t1
-    for s in &["DROP TABLE t1"] {
+    {
+        let s = &"DROP TABLE t1";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19336,7 +19339,8 @@ fn test_conformance_sqlite_master_after_drop_s73f() {
     assert!(m4.is_empty(), "after drop table t1: {m4:?}");
 
     // DROP TABLE t2 (and its index)
-    for s in &["DROP TABLE t2"] {
+    {
+        let s = &"DROP TABLE t2";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19427,7 +19431,8 @@ fn test_conformance_insert_or_replace_multi_constraint_s73i() {
         rconn.execute_batch(s).unwrap();
     }
     // REPLACE on PK conflict
-    for s in &["INSERT OR REPLACE INTO kv VALUES('b',20,'bravo')"] {
+    {
+        let s = &"INSERT OR REPLACE INTO kv VALUES('b',20,'bravo')";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19436,7 +19441,8 @@ fn test_conformance_insert_or_replace_multi_constraint_s73i() {
     assert!(m1.is_empty(), "replace-on-pk: {m1:?}");
 
     // REPLACE on UNIQUE conflict
-    for s in &["INSERT OR REPLACE INTO kv VALUES('d',4,'gamma')"] {
+    {
+        let s = &"INSERT OR REPLACE INTO kv VALUES('d',4,'gamma')";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19494,9 +19500,8 @@ fn test_conformance_update_subquery_set_where_s73k() {
         rconn.execute_batch(s).unwrap();
     }
     // Update with correlated subquery in SET
-    for s in &[
-        "UPDATE products SET price = price * (1 - COALESCE((SELECT pct FROM discounts WHERE discounts.category = products.category), 0))",
-    ] {
+    {
+        let s = &"UPDATE products SET price = price * (1 - COALESCE((SELECT pct FROM discounts WHERE discounts.category = products.category), 0))";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19529,9 +19534,8 @@ fn test_conformance_delete_with_exists_s73l() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "DELETE FROM orders WHERE EXISTS (SELECT 1 FROM cancelled WHERE cancelled.order_id = orders.id)",
-    ] {
+    {
+        let s = &"DELETE FROM orders WHERE EXISTS (SELECT 1 FROM cancelled WHERE cancelled.order_id = orders.id)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19653,7 +19657,8 @@ fn test_conformance_sqlite_master_ddl_lifecycle_s74a() {
 fn test_conformance_implicit_agg_empty_table_s74b() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE empty_t(id INTEGER PRIMARY KEY, val REAL, name TEXT)"] {
+    {
+        let s = &"CREATE TABLE empty_t(id INTEGER PRIMARY KEY, val REAL, name TEXT)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -20752,7 +20757,8 @@ fn test_conformance_distinct_order_null_s74t() {
 fn test_conformance_implicit_agg_expr_empty_s74u() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE s74u(id INTEGER PRIMARY KEY, val INTEGER)"] {
+    {
+        let s = &"CREATE TABLE s74u(id INTEGER PRIMARY KEY, val INTEGER)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -20855,7 +20861,8 @@ fn test_conformance_subquery_in_select_list_s73m() {
 fn test_conformance_insert_returning_s73n() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE s73n(id INTEGER PRIMARY KEY, val TEXT)"] {
+    {
+        let s = &"CREATE TABLE s73n(id INTEGER PRIMARY KEY, val TEXT)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }

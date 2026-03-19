@@ -5122,8 +5122,9 @@ mod tests {
         HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
         HotPathArtifactManifest, HotPathMvccWriteProfile, HotPathOpcodeProfileEntry,
         HotPathPageDataMotionProfile, HotPathParserProfile, HotPathProfileReport,
-        HotPathRankingEntry, HotPathRecordDecodeProfile, HotPathRowMaterializationProfile,
-        HotPathTypeProfile, HotPathValueTypeProfile,
+        HotPathRankingEntry, HotPathRecordDecodeCallsiteBreakdown,
+        HotPathRecordDecodeCallsiteCounters, HotPathRecordDecodeProfile,
+        HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
     };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
     use jsonschema::{Draft, options};
@@ -5275,6 +5276,23 @@ mod tests {
                 vdbe_record_decode_calls_total: 1,
                 vdbe_column_reads_total: 1,
                 vdbe_decoded_value_heap_bytes_total: 16,
+                decode_cache_hits_total: 0,
+                decode_cache_misses_total: 1,
+                decode_cache_invalidations_position_total: 0,
+                decode_cache_invalidations_write_total: 0,
+                decode_cache_invalidations_pseudo_total: 0,
+                callsite_breakdown: HotPathRecordDecodeCallsiteBreakdown {
+                    unattributed: HotPathRecordDecodeCallsiteCounters::default(),
+                    core_connection: HotPathRecordDecodeCallsiteCounters::default(),
+                    core_compat_persist: HotPathRecordDecodeCallsiteCounters::default(),
+                    vdbe_engine: HotPathRecordDecodeCallsiteCounters {
+                        parse_record_calls: 1,
+                        parse_record_into_calls: 0,
+                        parse_record_column_calls: 1,
+                    },
+                    vdbe_vectorized_scan: HotPathRecordDecodeCallsiteCounters::default(),
+                    btree_cursor: HotPathRecordDecodeCallsiteCounters::default(),
+                },
             },
             row_materialization: HotPathRowMaterializationProfile {
                 result_rows_total: 1,

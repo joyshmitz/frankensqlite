@@ -252,6 +252,24 @@ pub struct HotPathRecordDecodeProfile {
     pub decode_cache_invalidations_position_total: u64,
     pub decode_cache_invalidations_write_total: u64,
     pub decode_cache_invalidations_pseudo_total: u64,
+    pub callsite_breakdown: HotPathRecordDecodeCallsiteBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HotPathRecordDecodeCallsiteCounters {
+    pub parse_record_calls: u64,
+    pub parse_record_into_calls: u64,
+    pub parse_record_column_calls: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HotPathRecordDecodeCallsiteBreakdown {
+    pub unattributed: HotPathRecordDecodeCallsiteCounters,
+    pub core_connection: HotPathRecordDecodeCallsiteCounters,
+    pub core_compat_persist: HotPathRecordDecodeCallsiteCounters,
+    pub vdbe_engine: HotPathRecordDecodeCallsiteCounters,
+    pub vdbe_vectorized_scan: HotPathRecordDecodeCallsiteCounters,
+    pub btree_cursor: HotPathRecordDecodeCallsiteCounters,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -719,6 +737,45 @@ fn parser_profile(snapshot: ParserHotPathProfileSnapshot) -> HotPathParserProfil
 }
 
 #[must_use]
+fn record_decode_callsite_counters(
+    parse_record_calls: u64,
+    parse_record_into_calls: u64,
+    parse_record_column_calls: u64,
+) -> HotPathRecordDecodeCallsiteCounters {
+    HotPathRecordDecodeCallsiteCounters {
+        parse_record_calls,
+        parse_record_into_calls,
+        parse_record_column_calls,
+    }
+}
+
+#[must_use]
+fn hottest_full_record_decode_callsite(
+    breakdown: &HotPathRecordDecodeCallsiteBreakdown,
+) -> Option<(&'static str, u64)> {
+    [
+        ("btree_cursor", breakdown.btree_cursor.parse_record_calls),
+        ("vdbe_engine", breakdown.vdbe_engine.parse_record_calls),
+        (
+            "core_connection",
+            breakdown.core_connection.parse_record_calls,
+        ),
+        (
+            "core_compat_persist",
+            breakdown.core_compat_persist.parse_record_calls,
+        ),
+        (
+            "vdbe_vectorized_scan",
+            breakdown.vdbe_vectorized_scan.parse_record_calls,
+        ),
+        ("unattributed", breakdown.unattributed.parse_record_calls),
+    ]
+    .into_iter()
+    .max_by(|lhs, rhs| lhs.1.cmp(&rhs.1).then_with(|| lhs.0.cmp(rhs.0)))
+    .filter(|(_, total)| *total > 0)
+}
+
+#[must_use]
 fn build_hot_path_profile_report(
     fixture_id: &str,
     config: &FsqliteHotPathProfileConfig,
@@ -782,6 +839,110 @@ fn build_hot_path_profile_report(
         decode_cache_invalidations_pseudo_total: snapshot
             .vdbe
             .decode_cache_invalidations_pseudo_total,
+        callsite_breakdown: HotPathRecordDecodeCallsiteBreakdown {
+            unattributed: record_decode_callsite_counters(
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .unattributed
+                    .parse_record_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .unattributed
+                    .parse_record_into_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .unattributed
+                    .parse_record_column_calls,
+            ),
+            core_connection: record_decode_callsite_counters(
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .core_connection
+                    .parse_record_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .core_connection
+                    .parse_record_into_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .core_connection
+                    .parse_record_column_calls,
+            ),
+            core_compat_persist: record_decode_callsite_counters(
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .core_compat_persist
+                    .parse_record_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .core_compat_persist
+                    .parse_record_into_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .core_compat_persist
+                    .parse_record_column_calls,
+            ),
+            vdbe_engine: record_decode_callsite_counters(
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .vdbe_engine
+                    .parse_record_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .vdbe_engine
+                    .parse_record_into_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .vdbe_engine
+                    .parse_record_column_calls,
+            ),
+            vdbe_vectorized_scan: record_decode_callsite_counters(
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .vdbe_vectorized_scan
+                    .parse_record_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .vdbe_vectorized_scan
+                    .parse_record_into_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .vdbe_vectorized_scan
+                    .parse_record_column_calls,
+            ),
+            btree_cursor: record_decode_callsite_counters(
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .btree_cursor
+                    .parse_record_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .btree_cursor
+                    .parse_record_into_calls,
+                snapshot
+                    .record_decode
+                    .callsite_breakdown
+                    .btree_cursor
+                    .parse_record_column_calls,
+            ),
+        },
     };
     let row_materialization = HotPathRowMaterializationProfile {
         result_rows_total: snapshot.vdbe.result_rows_total,
@@ -2142,6 +2303,22 @@ fn build_hot_path_baseline_reuse_ledger(
         .record_decode
         .parse_record_into_calls
         .saturating_add(report.record_decode.parse_record_column_calls);
+    let dominant_full_decode_callsite = hottest_full_record_decode_callsite(
+        &report.record_decode.callsite_breakdown,
+    )
+    .map(|(callsite, total)| {
+        format!(" dominant full-record decode callsite: {callsite} ({total} parse_record calls).")
+    })
+    .unwrap_or_default();
+    let zero_hit_without_revisit = report.record_decode.decode_cache_hits_total == 0
+        && report
+            .record_decode
+            .decode_cache_invalidations_position_total
+            == 0
+        && report.record_decode.decode_cache_invalidations_write_total == 0
+        && report.record_decode.decode_cache_invalidations_pseudo_total == 0
+        && report.record_decode.vdbe_column_reads_total
+            == report.record_decode.decode_cache_misses_total;
     let mut entries = vec![
         HotPathBaselineReuseLedgerEntry {
             rank: 0,
@@ -2215,12 +2392,18 @@ fn build_hot_path_baseline_reuse_ledger(
                     .saturating_add(report.record_decode.decode_cache_misses_total),
             )),
             rationale: format!(
-                "record decode cache hits/misses are measured directly in the VDBE ({hits} hits, {misses} misses; invalidations: position={position}, write={write}, pseudo={pseudo}) across {decode_calls} decode entrypoints",
+                "record decode cache hits/misses are measured directly in the VDBE ({hits} hits, {misses} misses; invalidations: position={position}, write={write}, pseudo={pseudo}) across {decode_calls} decode entrypoints.{dominant}{no_revisit}",
                 hits = report.record_decode.decode_cache_hits_total,
                 misses = report.record_decode.decode_cache_misses_total,
                 position = report.record_decode.decode_cache_invalidations_position_total,
                 write = report.record_decode.decode_cache_invalidations_write_total,
                 pseudo = report.record_decode.decode_cache_invalidations_pseudo_total,
+                dominant = dominant_full_decode_callsite,
+                no_revisit = if zero_hit_without_revisit {
+                    " The representative path did not revisit any cached row image, so zero hits do not imply a broken cache."
+                } else {
+                    ""
+                },
             ),
             implication: String::new(),
             mapped_beads: Vec::new(),

@@ -415,6 +415,8 @@ fn ssi_evidence_metrics_for_abort_tracking() {
     let snap = EvidenceRecordMetricsSnapshot {
         fsqlite_evidence_records_total_commit: 100,
         fsqlite_evidence_records_total_abort: 5,
+        fsqlite_evidence_pending_records: 0,
+        fsqlite_evidence_records_total_budget_compact: 0,
     };
     assert_eq!(snap.fsqlite_evidence_records_total(), 105);
     assert_eq!(snap.fsqlite_evidence_records_total_commit, 100);

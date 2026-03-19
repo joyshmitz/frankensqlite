@@ -665,7 +665,7 @@ pub fn run_oplog_fsqlite(
         )));
     }
 
-    let (setup_len, per_worker) = partition_records(oplog, worker_count)?;
+    let (setup_records, per_worker) = partition_records(oplog, worker_count)?;
     let mut storage_wiring = None;
     let conflict_diagnostics;
     let wall;
@@ -674,8 +674,7 @@ pub fn run_oplog_fsqlite(
     let stats = if run_parallel_workers {
         let (stats, conflict_stats_note, run_wall) = replay_parallel(
             db_path,
-            oplog,
-            setup_len,
+            &setup_records,
             &per_worker,
             config,
             &mut metrics_capture,
@@ -687,7 +686,7 @@ pub fn run_oplog_fsqlite(
     } else {
         let conn = open_connection(db_path)?;
         storage_wiring = Some(configure_connection(&conn, db_path, config)?);
-        execute_setup(&conn, &oplog.records[..setup_len])?;
+        execute_setup(&conn, &setup_records)?;
         reset_conflict_stats(&conn)?;
         metrics_capture.reset();
         let started = Instant::now();
@@ -917,15 +916,19 @@ fn configure_connection(
 }
 
 /// Partition OpLog records into setup SQL + per-worker slices.
-fn partition_records(oplog: &OpLog, worker_count: u16) -> E2eResult<(usize, Vec<Vec<&OpRecord>>)> {
-    let setup_len = oplog
-        .records
-        .iter()
-        .take_while(|r| matches!(&r.kind, OpKind::Sql { .. }))
-        .count();
-
+///
+/// Setup records are the SQL prefix for each worker before that worker emits
+/// its first non-setup operation. This lets workloads duplicate idempotent
+/// setup per worker without accidentally benchmarking concurrent DDL.
+fn partition_records(
+    oplog: &OpLog,
+    worker_count: u16,
+) -> E2eResult<(Vec<&OpRecord>, Vec<Vec<&OpRecord>>)> {
     let mut per_worker: Vec<Vec<&OpRecord>> = vec![Vec::new(); usize::from(worker_count)];
-    for rec in oplog.records.iter().skip(setup_len) {
+    let mut setup_records = Vec::new();
+    let mut worker_started = vec![false; usize::from(worker_count)];
+
+    for rec in &oplog.records {
         let idx = usize::from(rec.worker);
         if idx >= per_worker.len() {
             return Err(E2eError::Io(std::io::Error::new(
@@ -936,16 +939,22 @@ fn partition_records(oplog: &OpLog, worker_count: u16) -> E2eResult<(usize, Vec<
                 ),
             )));
         }
+
+        if !worker_started[idx] && matches!(&rec.kind, OpKind::Sql { .. }) {
+            setup_records.push(rec);
+            continue;
+        }
+
+        worker_started[idx] = true;
         per_worker[idx].push(rec);
     }
 
-    Ok((setup_len, per_worker))
+    Ok((setup_records, per_worker))
 }
 
 fn replay_parallel(
     db_path: &Path,
-    oplog: &OpLog,
-    setup_len: usize,
+    setup_records: &[&OpRecord],
     per_worker: &[Vec<&OpRecord>],
     config: &FsqliteExecConfig,
     metrics_capture: &mut HotPathMetricsCapture,
@@ -964,7 +973,7 @@ fn replay_parallel(
     // Setup SQL must run once before worker replay so schema/seed data exists.
     let setup_conn = open_connection(db_path)?;
     *storage_wiring = Some(configure_connection(&setup_conn, db_path, config)?);
-    execute_setup(&setup_conn, &oplog.records[..setup_len])?;
+    execute_setup(&setup_conn, setup_records)?;
     reset_conflict_stats(&setup_conn)?;
 
     let per_worker_owned: Vec<Vec<OpRecord>> = per_worker
@@ -1017,7 +1026,7 @@ fn replay_parallel(
     Ok((total, conflict_diagnostics, wall))
 }
 
-fn execute_setup(conn: &Connection, setup_records: &[OpRecord]) -> E2eResult<()> {
+fn execute_setup(conn: &Connection, setup_records: &[&OpRecord]) -> E2eResult<()> {
     for rec in setup_records {
         if let Err(err) = execute_op(conn, rec) {
             return Err(E2eError::Fsqlite(format!(
@@ -2631,6 +2640,104 @@ mod tests {
         assert!(batches[0].ops(&records).is_empty());
         assert!(batches[1].commit);
         assert_eq!(batches[1].ops(&records).len(), 1);
+    }
+
+    #[test]
+    fn partition_records_hoists_each_workers_pre_transaction_sql_prefix() {
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "partition-setup".to_owned(),
+                seed: 1,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 2,
+                    transaction_size: 1,
+                    commit_order_policy: "barrier".to_owned(),
+                },
+                preset: None,
+            },
+            records: vec![
+                OpRecord {
+                    op_id: 0,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: "CREATE TABLE t0(id INTEGER PRIMARY KEY);".to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 1,
+                    worker: 0,
+                    kind: OpKind::Begin,
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 2,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: "INSERT INTO t0(id) VALUES (1);".to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 3,
+                    worker: 0,
+                    kind: OpKind::Commit,
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 4,
+                    worker: 1,
+                    kind: OpKind::Sql {
+                        statement: "CREATE TABLE t1(id INTEGER PRIMARY KEY);".to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 5,
+                    worker: 1,
+                    kind: OpKind::Sql {
+                        statement: "INSERT OR IGNORE INTO t1(id) VALUES (0);".to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 6,
+                    worker: 1,
+                    kind: OpKind::Begin,
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 7,
+                    worker: 1,
+                    kind: OpKind::Sql {
+                        statement: "INSERT INTO t1(id) VALUES (1);".to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 8,
+                    worker: 1,
+                    kind: OpKind::Commit,
+                    expected: None,
+                },
+            ],
+        };
+
+        let (setup_records, per_worker) = partition_records(&oplog, 2).unwrap();
+
+        assert_eq!(
+            setup_records.iter().map(|rec| rec.op_id).collect::<Vec<_>>(),
+            vec![0, 4, 5]
+        );
+        assert_eq!(
+            per_worker[0].iter().map(|rec| rec.op_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            per_worker[1].iter().map(|rec| rec.op_id).collect::<Vec<_>>(),
+            vec![6, 7, 8]
+        );
     }
 
     #[test]

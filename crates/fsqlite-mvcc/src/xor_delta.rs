@@ -495,6 +495,7 @@ pub fn decode_sparse_xor_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, Del
 /// # Errors
 ///
 /// Returns a [`DeltaError`] when any delta is malformed or incompatible.
+#[inline(never)]
 pub fn reconstruct_chain_from_newest<T: AsRef<[u8]>>(
     newest_full: &[u8],
     deltas_newest_to_oldest: &[T],

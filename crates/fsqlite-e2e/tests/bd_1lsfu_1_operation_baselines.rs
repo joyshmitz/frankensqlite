@@ -572,6 +572,7 @@ where
     apply_pragmas_fsqlite(&conn);
     conn.execute(CREATE_TABLE).unwrap();
 
+    reset_hot_path_profile();
     let start = std::time::Instant::now();
     for (idx, sql) in sqls.into_iter().enumerate() {
         let stmt = conn.prepare(sql).unwrap();
@@ -579,11 +580,11 @@ where
             .unwrap();
     }
     let elapsed = start.elapsed();
+    let profile = hot_path_profile_snapshot();
 
     let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
     assert_eq!(rows[0].values()[0], SqliteValue::Integer(row_count));
 
-    let profile = hot_path_profile_snapshot();
     PrepareCacheProbeRun {
         rows_per_sec: row_count as f64 / elapsed.as_secs_f64(),
         parse_cache_hits: profile.parser.parse_cache_hits,
@@ -618,11 +619,12 @@ fn run_fsqlite_decode_cache_probe(sql: &str, iterations: usize) -> DecodeCachePr
         INSERT_SQL,
         &[
             SqliteValue::Integer(1),
-            SqliteValue::Text("decode-cache-hot-row".to_owned()),
+            SqliteValue::Text("decode-cache-hot-row".into()),
         ],
     )
     .unwrap();
 
+    reset_hot_path_profile();
     let start = std::time::Instant::now();
     for _ in 0..iterations {
         let rows = conn.query(sql).unwrap();

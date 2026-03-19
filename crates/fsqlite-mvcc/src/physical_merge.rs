@@ -206,18 +206,18 @@ impl StructuredPagePatch {
 
 /// A cell extracted from a B-tree page, with its semantic key digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedCell {
+pub struct ParsedCell<'a> {
     /// The semantic key digest (same domain as `SemanticKeyRef.key_digest`).
     pub cell_key_digest: [u8; 16],
     /// The raw cell bytes (on-page representation, excluding cell pointer).
-    pub cell_bytes: Vec<u8>,
+    pub cell_bytes: &'a [u8],
     /// For table B-trees: the rowid.  For index B-trees: `None`.
     pub rowid: Option<i64>,
 }
 
 /// A B-tree page parsed into its semantic components.
 #[derive(Debug, Clone)]
-pub struct ParsedPage {
+pub struct ParsedPage<'a> {
     /// The page type.
     pub page_type: BTreePageType,
     /// Header offset (0 normally, 100 for page 1).
@@ -225,7 +225,7 @@ pub struct ParsedPage {
     /// The parsed header.
     pub header: BTreePageHeader,
     /// Cells in cell-pointer order, keyed by digest.
-    pub cells: Vec<ParsedCell>,
+    pub cells: Vec<ParsedCell<'a>>,
     /// Page size.
     pub page_size: PageSize,
     /// Reserved bytes per page.
@@ -235,7 +235,7 @@ pub struct ParsedPage {
 }
 
 /// Extracted cell data: (`raw_bytes`, `optional_rowid`, `key_digest`).
-type CellExtract = (Vec<u8>, Option<i64>, [u8; 16]);
+type CellExtract<'a> = (&'a [u8], Option<i64>, [u8; 16]);
 
 // ---------------------------------------------------------------------------
 // Parse phase
@@ -251,13 +251,13 @@ type CellExtract = (Vec<u8>, Option<i64>, [u8; 16]);
 ///
 /// Returns [`MergeError::PageParseError`] or [`MergeError::InvalidPageBuffer`]
 /// if the page buffer is invalid or truncated.
-pub fn parse_btree_page(
-    page: &[u8],
+pub fn parse_btree_page<'a>(
+    page: &'a [u8],
     page_size: PageSize,
     reserved_per_page: u8,
     is_page1: bool,
     btree_ref: BtreeRef,
-) -> Result<ParsedPage, MergeError> {
+) -> Result<ParsedPage<'a>, MergeError> {
     let header = BTreePageHeader::parse(page, page_size, reserved_per_page, is_page1)
         .map_err(|e| MergeError::PageParseError(format!("{e}")))?;
 
@@ -305,13 +305,13 @@ pub fn parse_btree_page(
 
 /// Extract a single cell's raw bytes, rowid (if table B-tree), and key digest.
 #[allow(clippy::cast_possible_truncation)]
-fn extract_cell_with_digest(
-    page: &[u8],
+fn extract_cell_with_digest<'a>(
+    page: &'a [u8],
     cell_offset: usize,
     usable: usize,
     page_type: BTreePageType,
     btree_ref: BtreeRef,
-) -> Result<CellExtract, MergeError> {
+) -> Result<CellExtract<'a>, MergeError> {
     let remaining = &page[cell_offset..usable.min(page.len())];
 
     match page_type {
@@ -325,11 +325,11 @@ fn extract_cell_with_digest(
 }
 
 /// Parse a leaf table cell: `[varint payload_size][varint rowid][payload...][overflow?]`
-fn parse_leaf_table_cell(
-    data: &[u8],
+fn parse_leaf_table_cell<'a>(
+    data: &'a [u8],
     btree_ref: BtreeRef,
     usable: u32,
-) -> Result<CellExtract, MergeError> {
+) -> Result<CellExtract<'a>, MergeError> {
     let (payload_size, n1) =
         fsqlite_types::serial_type::read_varint(data).ok_or(MergeError::InvalidPageBuffer)?;
     let (rowid_u64, n2) = fsqlite_types::serial_type::read_varint(&data[n1..])
@@ -345,7 +345,7 @@ fn parse_leaf_table_cell(
     let total_cell_size = header_len + local_payload as usize + if has_overflow { 4 } else { 0 };
     let cell_end = total_cell_size.min(data.len());
 
-    let cell_bytes = data[..cell_end].to_vec();
+    let cell_bytes = &data[..cell_end];
 
     // Compute digest using rowid as canonical key bytes (LE i64)
     let digest =
@@ -355,11 +355,11 @@ fn parse_leaf_table_cell(
 }
 
 /// Parse a leaf index cell: `[varint payload_size][payload...][overflow?]`
-fn parse_leaf_index_cell(
-    data: &[u8],
+fn parse_leaf_index_cell<'a>(
+    data: &'a [u8],
     btree_ref: BtreeRef,
     usable: u32,
-) -> Result<CellExtract, MergeError> {
+) -> Result<CellExtract<'a>, MergeError> {
     let (payload_size, n1) =
         fsqlite_types::serial_type::read_varint(data).ok_or(MergeError::InvalidPageBuffer)?;
 
@@ -368,7 +368,7 @@ fn parse_leaf_index_cell(
     let total_cell_size = n1 + local_payload as usize + if has_overflow { 4 } else { 0 };
     let cell_end = total_cell_size.min(data.len());
 
-    let cell_bytes = data[..cell_end].to_vec();
+    let cell_bytes = &data[..cell_end];
 
     // For index pages, use the payload + overflow pointer as canonical key bytes
     // to ensure uniqueness even when common prefixes overflow (§5.10.3).
@@ -383,7 +383,10 @@ fn parse_leaf_index_cell(
 }
 
 /// Parse an interior table cell: `[4-byte left_child][varint rowid]`
-fn parse_interior_table_cell(data: &[u8], btree_ref: BtreeRef) -> Result<CellExtract, MergeError> {
+fn parse_interior_table_cell<'a>(
+    data: &'a [u8],
+    btree_ref: BtreeRef,
+) -> Result<CellExtract<'a>, MergeError> {
     if data.len() < 4 {
         return Err(MergeError::InvalidPageBuffer);
     }
@@ -394,7 +397,7 @@ fn parse_interior_table_cell(data: &[u8], btree_ref: BtreeRef) -> Result<CellExt
     let rowid = rowid_u64 as i64;
 
     let cell_end = (4 + n).min(data.len());
-    let cell_bytes = data[..cell_end].to_vec();
+    let cell_bytes = &data[..cell_end];
 
     let digest =
         SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, btree_ref, &rowid.to_le_bytes());
@@ -403,11 +406,11 @@ fn parse_interior_table_cell(data: &[u8], btree_ref: BtreeRef) -> Result<CellExt
 }
 
 /// Parse an interior index cell: `[4-byte left_child][varint payload_size][payload...][overflow?]`
-fn parse_interior_index_cell(
-    data: &[u8],
+fn parse_interior_index_cell<'a>(
+    data: &'a [u8],
     btree_ref: BtreeRef,
     usable: u32,
-) -> Result<CellExtract, MergeError> {
+) -> Result<CellExtract<'a>, MergeError> {
     if data.len() < 4 {
         return Err(MergeError::InvalidPageBuffer);
     }
@@ -419,7 +422,7 @@ fn parse_interior_index_cell(
     let total = 4 + n1 + local_payload as usize + if has_overflow { 4 } else { 0 };
     let cell_end = total.min(data.len());
 
-    let cell_bytes = data[..cell_end].to_vec();
+    let cell_bytes = &data[..cell_end];
 
     // Use [left_child][payload][overflow] as canonical key bytes for interior index pages.
     let key_bytes = &data[..cell_end];
@@ -469,8 +472,8 @@ fn compute_local_payload_size(payload_size: u64, usable: u32, is_table_leaf: boo
 ///
 /// Returns [`MergeError::PageParseError`] if the page types don't match.
 pub fn diff_parsed_pages(
-    base: &ParsedPage,
-    modified: &ParsedPage,
+    base: &ParsedPage<'_>,
+    modified: &ParsedPage<'_>,
 ) -> Result<StructuredPagePatch, MergeError> {
     if base.page_type != modified.page_type {
         return Err(MergeError::PageParseError(
@@ -481,7 +484,8 @@ pub fn diff_parsed_pages(
     let mut cell_ops = Vec::new();
 
     // Build index of base cells by digest
-    let mut base_cells: HashMap<[u8; 16], &ParsedCell> = HashMap::with_capacity(base.cells.len());
+    let mut base_cells: HashMap<[u8; 16], &ParsedCell<'_>> =
+        HashMap::with_capacity(base.cells.len());
     for c in &base.cells {
         if base_cells.insert(c.cell_key_digest, c).is_some() {
             return Err(MergeError::PageParseError(
@@ -490,7 +494,7 @@ pub fn diff_parsed_pages(
         }
     }
 
-    let mut modified_cells: HashMap<[u8; 16], &ParsedCell> =
+    let mut modified_cells: HashMap<[u8; 16], &ParsedCell<'_>> =
         HashMap::with_capacity(modified.cells.len());
     for c in &modified.cells {
         if modified_cells.insert(c.cell_key_digest, c).is_some() {
@@ -507,7 +511,7 @@ pub fn diff_parsed_pages(
                 cell_ops.push(CellOp {
                     cell_key_digest: mc.cell_key_digest,
                     kind: CellOpKind::Replace {
-                        new_cell_bytes: mc.cell_bytes.clone(),
+                        new_cell_bytes: mc.cell_bytes.to_vec(),
                     },
                 });
             }
@@ -515,7 +519,7 @@ pub fn diff_parsed_pages(
             cell_ops.push(CellOp {
                 cell_key_digest: mc.cell_key_digest,
                 kind: CellOpKind::Insert {
-                    cell_bytes: mc.cell_bytes.clone(),
+                    cell_bytes: mc.cell_bytes.to_vec(),
                 },
             });
         }
@@ -624,12 +628,12 @@ pub fn merge_structured_patches(
 /// # Errors
 ///
 /// Currently infallible but returns `Result` for future extensibility.
-pub fn apply_patch(
-    base: &ParsedPage,
-    patch: &StructuredPagePatch,
-) -> Result<Vec<ParsedCell>, MergeError> {
+pub fn apply_patch<'a>(
+    base: &ParsedPage<'a>,
+    patch: &'a StructuredPagePatch,
+) -> Result<Vec<ParsedCell<'a>>, MergeError> {
     // Build mutable cell map keyed by digest
-    let mut cell_map: BTreeMap<[u8; 16], ParsedCell> = base
+    let mut cell_map: BTreeMap<[u8; 16], ParsedCell<'a>> = base
         .cells
         .iter()
         .map(|c| (c.cell_key_digest, c.clone()))
@@ -648,7 +652,7 @@ pub fn apply_patch(
                     op.cell_key_digest,
                     ParsedCell {
                         cell_key_digest: op.cell_key_digest,
-                        cell_bytes: cell_bytes.clone(),
+                        cell_bytes: cell_bytes,
                         rowid,
                     },
                 );
@@ -658,7 +662,7 @@ pub fn apply_patch(
             }
             CellOpKind::Replace { new_cell_bytes } => {
                 if let Some(cell) = cell_map.get_mut(&op.cell_key_digest) {
-                    cell.cell_bytes.clone_from(new_cell_bytes);
+                    cell.cell_bytes = new_cell_bytes.as_slice();
                     if base.page_type.is_table() {
                         cell.rowid = extract_rowid_from_cell(new_cell_bytes, base.page_type);
                     }
@@ -670,7 +674,7 @@ pub fn apply_patch(
 
     // Return cells sorted by rowid (table) or key bytes (index) for canonical order
     let usable = base.page_size.usable(base.reserved_per_page);
-    let mut cells: Vec<ParsedCell> = cell_map.into_values().collect();
+    let mut cells: Vec<ParsedCell<'a>> = cell_map.into_values().collect();
     cells.sort_by(|a, b| match (a.rowid, b.rowid) {
         (Some(ra), Some(rb)) => ra.cmp(&rb),
         (None, None) => {
@@ -751,7 +755,7 @@ fn extract_rowid_from_cell(cell_bytes: &[u8], page_type: BTreePageType) -> Optio
 ///
 /// Returns [`MergeError::PageOverflow`] if cells don't fit in the page.
 pub fn repack_btree_page(
-    cells: &[ParsedCell],
+    cells: &[ParsedCell<'_>],
     page_type: BTreePageType,
     page_size: PageSize,
     reserved_per_page: u8,

@@ -3217,8 +3217,7 @@ mod tests {
                 assert_eq!(last.read_set_summary.page_count, 0);
                 let after = ssi_evidence_metrics_snapshot();
                 assert!(
-                    after.fsqlite_evidence_records_total_budget_compact
-                        >= before.fsqlite_evidence_records_total_budget_compact + 1
+                    after.fsqlite_evidence_records_total_budget_compact > before.fsqlite_evidence_records_total_budget_compact
                 );
             },
         );

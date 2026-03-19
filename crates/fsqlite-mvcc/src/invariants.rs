@@ -650,6 +650,7 @@ impl VersionStore {
     /// that ranges provide for very deep chains (10+).
     #[must_use]
     #[allow(clippy::significant_drop_tightening)]
+    #[inline(never)]
     pub fn resolve_with_trace(
         &self,
         page: PageNumber,

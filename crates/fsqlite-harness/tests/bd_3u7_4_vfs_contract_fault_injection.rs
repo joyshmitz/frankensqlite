@@ -782,7 +782,7 @@ fn run_uring_comparison(seed: u64, iterations: usize) -> Result<(f64, f64, bool,
 
     let io_uring_vfs = IoUringVfs::new();
     let io_uring_available = io_uring_vfs.is_available();
-    let io_uring_status = io_uring_vfs.status().to_owned();
+    let io_uring_status = io_uring_vfs.status();
     if !io_uring_available {
         return Ok((unix_ops_per_sec, 0.0, false, io_uring_status));
     }
