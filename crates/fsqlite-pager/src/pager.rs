@@ -1041,11 +1041,13 @@ where
         if self.vfs.is_memory() {
             let commit_seq_before_refresh = inner.commit_seq;
             if active_transactions_before_begin == 0 {
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .map_err(|_| FrankenError::internal("SimplePager cache lock poisoned"))?;
-                inner.refresh_committed_state(cx, &mut cache)?;
+                {
+                    let mut cache = self
+                        .cache
+                        .lock()
+                        .map_err(|_| FrankenError::internal("SimplePager cache lock poisoned"))?;
+                    inner.refresh_committed_state(cx, &mut cache)?;
+                }
                 let clear_published_pages = inner.commit_seq != commit_seq_before_refresh;
                 self.published.publish(
                     cx,

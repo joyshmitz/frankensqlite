@@ -20,6 +20,7 @@ use fsqlite::{Connection, FrankenError};
 use fsqlite_btree::instrumentation::{
     BtreeMetricsSnapshot, btree_metrics_snapshot, reset_btree_metrics,
 };
+use fsqlite_core::connection::{hot_path_profile_enabled, reset_hot_path_profile};
 use fsqlite_parser::parser::{parse_metrics_enabled, set_parse_metrics_enabled};
 use fsqlite_parser::{
     ParseMetricsSnapshot, SemanticMetricsSnapshot, TokenizeMetricsSnapshot, parse_metrics_snapshot,
@@ -270,6 +271,11 @@ impl HotPathMetricsCapture {
             reset_semantic_metrics();
             reset_vdbe_metrics();
             reset_btree_metrics();
+            // Keep connection-level counters aligned with parser/VDBE/B-tree
+            // counters so setup SQL does not leak into the measured hot path.
+            if hot_path_profile_enabled() {
+                reset_hot_path_profile();
+            }
             self.vfs_before = GLOBAL_VFS_METRICS.snapshot();
             self.wal_before = wal_telemetry_snapshot();
         }
@@ -2554,11 +2560,35 @@ mod tests {
         ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
         preset_commutative_inserts_disjoint_keys,
     };
+    use fsqlite_core::connection::{
+        hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+        set_hot_path_profile_enabled,
+    };
 
     fn hot_path_test_guard() -> std::sync::MutexGuard<'static, ()> {
         crate::perf_runner::HOT_PATH_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    struct ConnectionHotPathProfileGuard {
+        was_enabled: bool,
+    }
+
+    impl ConnectionHotPathProfileGuard {
+        fn new() -> Self {
+            let was_enabled = hot_path_profile_enabled();
+            reset_hot_path_profile();
+            set_hot_path_profile_enabled(true);
+            Self { was_enabled }
+        }
+    }
+
+    impl Drop for ConnectionHotPathProfileGuard {
+        fn drop(&mut self) {
+            reset_hot_path_profile();
+            set_hot_path_profile_enabled(self.was_enabled);
+        }
     }
 
     #[test]
@@ -2606,6 +2636,75 @@ mod tests {
         assert_eq!(profile.runtime_retry.total_retries, 0);
         assert_eq!(profile.runtime_retry.max_batch_attempts, 0);
         assert!(profile.runtime_retry.top_snapshot_conflict_pages.is_empty());
+    }
+
+    #[test]
+    fn run_oplog_fsqlite_excludes_setup_from_connection_hot_path_counters() {
+        let _guard = hot_path_test_guard();
+        let _profile_guard = ConnectionHotPathProfileGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("setup-profile.db");
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "setup-profile".to_owned(),
+                seed: 7,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "barrier".to_owned(),
+                },
+                preset: None,
+            },
+            records: vec![
+                OpRecord {
+                    op_id: 0,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);"
+                            .to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 1,
+                    worker: 0,
+                    kind: OpKind::Begin,
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 2,
+                    worker: 0,
+                    kind: OpKind::Insert {
+                        table: "t".to_owned(),
+                        key: 1,
+                        values: vec![("v".to_owned(), "1".to_owned())],
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                },
+                OpRecord {
+                    op_id: 3,
+                    worker: 0,
+                    kind: OpKind::Commit,
+                    expected: None,
+                },
+            ],
+        };
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(&db_path, &oplog, &config).unwrap();
+        let snapshot = hot_path_profile_snapshot();
+
+        assert!(report.error.is_none(), "error={:?}", report.error);
+        assert_eq!(report.ops_total, 1, "{report:?}");
+        assert_eq!(snapshot.prepared_schema_refreshes, 0, "{snapshot:?}");
+        assert_eq!(
+            snapshot.pager_publication_refreshes, 1,
+            "setup SQL should not leak into measured connection counters: {snapshot:?}"
+        );
     }
 
     #[test]

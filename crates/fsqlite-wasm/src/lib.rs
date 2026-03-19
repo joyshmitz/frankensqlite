@@ -770,10 +770,48 @@ mod tests {
     }
 
     #[test]
-    fn fractional_number_outside_safe_integer_range_remains_real() {
-        let value = parse_js_number_value((MAX_SAFE_INTEGER as f64) + 0.5, false)
-            .expect("fractional numbers should remain REAL");
-        assert_eq!(value, SqliteValue::Float((MAX_SAFE_INTEGER as f64) + 0.5));
+    fn fractional_number_with_representable_precision_remains_real() {
+        let number = ((1_i64 << 51) as f64) + 0.5;
+        assert_eq!(number.fract(), 0.5);
+
+        let value =
+            parse_js_number_value(number, false).expect("fractional numbers should remain REAL");
+        assert_eq!(value, SqliteValue::Float(number));
+    }
+
+    #[test]
+    fn js_value_conversion_preserves_fractional_precision_when_js_can_represent_it() {
+        let number = ((1_i64 << 51) as f64) + 0.5;
+        let value = js_value_to_sqlite_value(&JsValue::from_f64(number))
+            .expect("representable fractional JS numbers should remain REAL");
+        assert_eq!(value, SqliteValue::Float(number));
+    }
+
+    #[test]
+    fn rounded_large_number_requires_bigint_after_js_precision_loss() {
+        // JavaScript numbers above 2^53 lose sub-integer precision before the
+        // binding sees them, so a source value like `MAX_SAFE_INTEGER + 0.5`
+        // arrives as an integral f64 and must follow the BigInt path.
+        let rounded = (MAX_SAFE_INTEGER as f64) + 0.5;
+        assert_eq!(rounded, (MAX_SAFE_INTEGER + 1) as f64);
+        assert_eq!(rounded.fract(), 0.0);
+
+        let error = parse_js_number_value(rounded, false)
+            .expect_err("precision-lost large numbers should require BigInt");
+        assert!(matches!(error, FrankenError::TypeMismatch { .. }));
+        assert!(error.to_string().contains("BigInt"));
+    }
+
+    #[test]
+    fn js_value_conversion_rejects_large_fraction_after_js_rounding() {
+        let rounded = (MAX_SAFE_INTEGER as f64) + 0.5;
+        let error = js_value_to_sqlite_value(&JsValue::from_f64(rounded))
+            .expect_err("rounded large JS numbers should require BigInt");
+        let message = Reflect::get(&error, &JsValue::from_str("message"))
+            .expect("message field should exist")
+            .as_string()
+            .expect("message should be a string");
+        assert!(message.contains("BigInt"));
     }
 
     #[test]

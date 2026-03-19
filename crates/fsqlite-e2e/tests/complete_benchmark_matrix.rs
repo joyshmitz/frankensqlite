@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -240,10 +241,10 @@ fn resolve_canonical_cell(
     summary: &BenchmarkSummary,
     mode: BenchmarkMode,
 ) -> Result<ExpandedBenchmarkCell, Box<dyn Error>> {
-    let row = campaign
+    let matching_rows = campaign
         .matrix_rows
         .iter()
-        .find(|row| {
+        .filter(|row| {
             row.workload == summary.workload
                 && row.concurrency == summary.concurrency
                 && row
@@ -252,15 +253,35 @@ fn resolve_canonical_cell(
                     .any(|fixture| fixture == &summary.fixture_id)
                 && row.modes.contains(&mode)
         })
-        .ok_or_else(|| {
-            format!(
+        .collect::<Vec<_>>();
+    let row = match matching_rows.as_slice() {
+        [] => {
+            return Err(format!(
                 "no canonical matrix row for fixture={} workload={} concurrency={} mode={}",
                 summary.fixture_id,
                 summary.workload,
                 summary.concurrency,
                 benchmark_mode_id(mode)
             )
-        })?;
+            .into())
+        }
+        [row] => *row,
+        rows => {
+            let row_ids = rows
+                .iter()
+                .map(|row| row.row_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "ambiguous canonical matrix rows for fixture={} workload={} concurrency={} mode={}: {row_ids}",
+                summary.fixture_id,
+                summary.workload,
+                summary.concurrency,
+                benchmark_mode_id(mode)
+            )
+            .into());
+        }
+    };
     let placement = row
         .placement_variants
         .iter()
@@ -284,6 +305,68 @@ fn resolve_canonical_cell(
         build_profile_id: row.build_profile_id.clone(),
         seed_policy_id: row.seed_policy_id.clone(),
     })
+}
+
+fn validate_matrix_mode(mode: &str) -> Result<(), Box<dyn Error>> {
+    const SUPPORTED_MODES: [&str; 5] = ["full", "both", "sqlite3", "mvcc", "single_writer"];
+    if SUPPORTED_MODES.contains(&mode) {
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported FSQLITE_MATRIX_MODE `{mode}`; expected one of: {}",
+        SUPPORTED_MODES.join(", ")
+    )
+    .into())
+}
+
+#[test]
+fn matrix_mode_validation_rejects_unknown_values() {
+    for mode in ["full", "both", "sqlite3", "mvcc", "single_writer"] {
+        validate_matrix_mode(mode).expect("supported matrix mode should validate");
+    }
+    assert!(
+        validate_matrix_mode("bogus").is_err(),
+        "unknown matrix modes must fail fast instead of silently doing nothing"
+    );
+}
+
+#[test]
+fn beads_campaign_row_keys_are_unambiguous() -> Result<(), Box<dyn Error>> {
+    let campaign = load_beads_benchmark_campaign(&repo_root())
+        .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
+    let mut keys: BTreeMap<(String, String, u16, String), Vec<String>> = BTreeMap::new();
+
+    for row in &campaign.matrix_rows {
+        for fixture_id in &row.fixtures {
+            for mode in &row.modes {
+                keys.entry((
+                    fixture_id.clone(),
+                    row.workload.clone(),
+                    row.concurrency,
+                    benchmark_mode_id(*mode).to_owned(),
+                ))
+                .or_default()
+                .push(row.row_id.clone());
+            }
+        }
+    }
+
+    let ambiguous = keys
+        .into_iter()
+        .filter(|(_, row_ids)| row_ids.len() > 1)
+        .map(|((fixture_id, workload, concurrency, mode_id), row_ids)| {
+            format!(
+                "fixture={fixture_id} workload={workload} concurrency={concurrency} mode={mode_id} rows={}",
+                row_ids.join(", ")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        ambiguous.is_empty(),
+        "campaign row keys must stay unique for canonical resolution:\n{}",
+        ambiguous.join("\n")
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -521,6 +604,7 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     let workload_filter = std::env::var("FSQLITE_MATRIX_WORKLOAD").ok();
     let concurrency_filter = std::env::var("FSQLITE_MATRIX_CONCURRENCY").ok();
     let mode = std::env::var("FSQLITE_MATRIX_MODE").unwrap_or_else(|_| "full".to_owned());
+    validate_matrix_mode(&mode)?;
     let stem = std::env::var("FSQLITE_MATRIX_OUTPUT_STEM").unwrap_or_else(|_| {
         fixture_filter
             .clone()
@@ -614,7 +698,7 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
     let run_id = matrix_run_id();
     let source_revision = git_head_revision(&repo_root)?;
-    let beads_data_hash = sha256_file(&repo_root.join(".beads/issues.jsonl"))?;
+    let beads_data_hash = sha256_file(&repo_root.join(&campaign.beads_data_relpath))?;
     let mut generated_bundles = Vec::new();
 
     let mut combined = String::new();
