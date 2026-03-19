@@ -5762,7 +5762,7 @@ impl Connection {
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert", || {
+            self.with_internal_statement_savepoint_and_cx(execution_cx, "insert", || {
                 self.execute_precompiled_prepared_insert_dispatch(
                     execution_cx,
                     stmt,
@@ -5867,7 +5867,7 @@ impl Connection {
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert", || {
+            self.with_internal_statement_savepoint_and_cx(execution_cx, "insert", || {
                 self.execute_precompiled_prepared_insert_dispatch(
                     execution_cx,
                     stmt,
@@ -6037,13 +6037,17 @@ impl Connection {
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint(kind.statement_kind(), || {
-                self.execute_precompiled_prepared_update_or_delete_dispatch(
-                    execution_cx,
-                    stmt,
-                    params,
-                )
-            })
+            self.with_internal_statement_savepoint_and_cx(
+                execution_cx,
+                kind.statement_kind(),
+                || {
+                    self.execute_precompiled_prepared_update_or_delete_dispatch(
+                        execution_cx,
+                        stmt,
+                        params,
+                    )
+                },
+            )
         } else {
             self.execute_precompiled_prepared_update_or_delete_dispatch(execution_cx, stmt, params)
         };
@@ -6125,13 +6129,17 @@ impl Connection {
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint(kind.statement_kind(), || {
-                self.execute_precompiled_prepared_update_or_delete_dispatch(
-                    execution_cx,
-                    stmt,
-                    params,
-                )
-            })
+            self.with_internal_statement_savepoint_and_cx(
+                execution_cx,
+                kind.statement_kind(),
+                || {
+                    self.execute_precompiled_prepared_update_or_delete_dispatch(
+                        execution_cx,
+                        stmt,
+                        params,
+                    )
+                },
+            )
         } else {
             self.execute_precompiled_prepared_update_or_delete_dispatch(execution_cx, stmt, params)
         };
@@ -6514,6 +6522,15 @@ impl Connection {
         body: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let cx = self.op_cx()?;
+        self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
+    }
+
+    fn with_internal_statement_savepoint_and_cx<T>(
+        &self,
+        cx: &Cx,
+        purpose: &str,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let savepoint_name = self.next_internal_savepoint_name(purpose);
         let snapshot = self.snapshot();
         self.internal_statement_savepoint_depth.set(
@@ -6526,7 +6543,7 @@ impl Connection {
         };
 
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.savepoint(&cx, &savepoint_name)?;
+            txn.savepoint(cx, &savepoint_name)?;
         }
 
         let concurrent_snapshot = if *self.concurrent_txn.borrow() {
@@ -6549,7 +6566,7 @@ impl Connection {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     let cleanup_errors =
-                        self.cleanup_failed_savepoint_setup(&cx, &savepoint_name, None);
+                        self.cleanup_failed_savepoint_setup(cx, &savepoint_name, None);
                     if !cleanup_errors.is_empty() {
                         return Err(FrankenError::Internal(format!(
                             "statement savepoint setup failed after {purpose}: {error}; cleanup failed: {}",
@@ -6563,9 +6580,9 @@ impl Connection {
             None
         };
         let live_vtab_level = self.current_live_vtab_savepoint_level()?;
-        if let Err(error) = self.live_vtab_savepoint_all(&cx, live_vtab_level) {
+        if let Err(error) = self.live_vtab_savepoint_all(cx, live_vtab_level) {
             let cleanup_errors = self.cleanup_failed_savepoint_setup(
-                &cx,
+                cx,
                 &savepoint_name,
                 concurrent_snapshot.as_ref(),
             );
@@ -6581,9 +6598,9 @@ impl Connection {
         match body() {
             Ok(value) => {
                 if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                    txn.release_savepoint(&cx, &savepoint_name)?;
+                    txn.release_savepoint(cx, &savepoint_name)?;
                 }
-                self.live_vtab_release_all(&cx, live_vtab_level)?;
+                self.live_vtab_release_all(cx, live_vtab_level)?;
                 Ok(value)
             }
             Err(statement_error) => {
@@ -6630,10 +6647,10 @@ impl Connection {
                 if concurrent_rollback_succeeded
                     && let Some(txn) = self.active_txn.borrow_mut().as_mut()
                 {
-                    match txn.rollback_to_savepoint(&cx, &savepoint_name) {
+                    match txn.rollback_to_savepoint(cx, &savepoint_name) {
                         Ok(()) => {
                             pager_rollback_succeeded = true;
-                            if let Err(err) = txn.release_savepoint(&cx, &savepoint_name) {
+                            if let Err(err) = txn.release_savepoint(cx, &savepoint_name) {
                                 cleanup_errors.push(format!(
                                     "pager release_savepoint('{savepoint_name}') failed: {err}"
                                 ));
@@ -6646,9 +6663,9 @@ impl Connection {
                 }
 
                 if concurrent_rollback_succeeded && pager_rollback_succeeded {
-                    match self.live_vtab_rollback_to_all(&cx, live_vtab_level) {
+                    match self.live_vtab_rollback_to_all(cx, live_vtab_level) {
                         Ok(()) => {
-                            if let Err(err) = self.live_vtab_release_all(&cx, live_vtab_level) {
+                            if let Err(err) = self.live_vtab_release_all(cx, live_vtab_level) {
                                 cleanup_errors.push(format!(
                                     "virtual-table release({live_vtab_level}) failed: {err}"
                                 ));
@@ -6664,7 +6681,7 @@ impl Connection {
 
                 if pager_rollback_succeeded {
                     self.txn_metrics_note_rollback();
-                    self.restore_snapshot(&cx, &snapshot)?;
+                    self.restore_snapshot(cx, &snapshot)?;
                 }
 
                 if !cleanup_errors.is_empty() {
@@ -6868,7 +6885,7 @@ impl Connection {
         let rollback_on_constraint_violation =
             statement_rolls_back_transaction_on_constraint(statement.as_ref());
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint(statement_kind, || {
+            self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, || {
                 self.execute_statement_dispatch_impl(
                     &op_cx,
                     statement.as_ref(),
@@ -7802,20 +7819,20 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Commit => {
-                self.execute_commit()?;
+                self.execute_commit_with_cx(cx)?;
                 Ok(Vec::new())
             }
             Statement::Rollback(rb) => {
-                self.execute_rollback(rb)?;
+                self.execute_rollback_with_cx(cx, rb)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::Savepoint(name) => {
-                self.execute_savepoint(name)?;
+                self.execute_savepoint_with_cx(cx, name)?;
                 Ok(Vec::new())
             }
             Statement::Release(name) => {
-                self.execute_release(name)?;
+                self.execute_release_with_cx(cx, name)?;
                 Ok(Vec::new())
             }
             Statement::Pragma(pragma) => self.execute_pragma(pragma),
@@ -16176,17 +16193,14 @@ impl Connection {
         }
     }
 
-    /// Handle COMMIT.
-    fn execute_commit(&self) -> Result<()> {
+    fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
         if !*self.in_transaction.borrow() {
             return Err(FrankenError::Internal(
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
-
-        let cx = self.op_cx()?;
         if !self.live_vtab_transactions.borrow().is_empty() {
-            if let Err(sync_error) = self.live_vtab_sync_all(&cx) {
+            if let Err(sync_error) = self.live_vtab_sync_all(cx) {
                 let txn_has_pending_writes = self
                     .active_txn
                     .borrow()
@@ -16199,15 +16213,15 @@ impl Connection {
 
                 self.txn_metrics_note_rollback();
                 let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                    txn.rollback(&cx)
+                    txn.rollback(cx)
                 } else {
                     Ok(())
                 };
                 let rollback_succeeded = rollback_result.is_ok();
-                let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+                let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                 let reload_result = if txn_has_pending_writes && rollback_succeeded {
-                    self.reload_memdb_from_pager(&cx)
+                    self.reload_memdb_from_pager(cx)
                 } else {
                     Ok(())
                 };
@@ -16259,7 +16273,7 @@ impl Connection {
             let commit_res = {
                 let mut txn_guard = self.active_txn.borrow_mut();
                 if let Some(txn) = txn_guard.as_mut() {
-                    txn.commit(&cx)
+                    txn.commit(cx)
                 } else {
                     Ok(())
                 }
@@ -16281,8 +16295,8 @@ impl Connection {
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
-        self.live_vtab_commit_all_best_effort(&cx);
-        self.finalize_live_vtab_registry_commit(&cx);
+        self.live_vtab_commit_all_best_effort(cx);
+        self.finalize_live_vtab_registry_commit(cx);
         self.txn_metrics_mark_finished();
 
         // Discard rollback snapshot and savepoints — changes are committed.
@@ -16372,6 +16386,10 @@ impl Connection {
     /// Handle ROLLBACK [TO SAVEPOINT name].
     fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
         let cx = self.op_cx()?;
+        self.execute_rollback_with_cx(&cx, rb)
+    }
+
+    fn execute_rollback_with_cx(&self, cx: &Cx, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
         if let Some(ref sp_name) = rb.to_savepoint {
             let (idx, snap, canonical_name, concurrent_snap) = {
                 let savepoints = self.savepoints.borrow();
@@ -16412,7 +16430,7 @@ impl Connection {
             // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
             // but keep the savepoint (don't pop it).
             if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                txn.rollback_to_savepoint(&cx, &canonical_name)?;
+                txn.rollback_to_savepoint(cx, &canonical_name)?;
             }
 
             // MVCC concurrent-writer rollback (bd-14zc / 5E.1):
@@ -16436,7 +16454,7 @@ impl Connection {
                 }
             }
             let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
-            let live_vtab_result = self.live_vtab_rollback_to_all(&cx, live_vtab_level);
+            let live_vtab_result = self.live_vtab_rollback_to_all(cx, live_vtab_level);
 
             {
                 let mut savepoints = self.savepoints.borrow_mut();
@@ -16445,7 +16463,7 @@ impl Connection {
                 self.txn_metrics_set_savepoint_depth(savepoints.len());
             }
             self.txn_metrics_note_rollback();
-            self.restore_snapshot(&cx, &snap)?;
+            self.restore_snapshot(cx, &snap)?;
 
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
@@ -16477,17 +16495,17 @@ impl Connection {
             // release writer locks. After this, the pager reflects the
             // pre-transaction committed state.
             let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                txn.rollback(&cx)
+                txn.rollback(cx)
             } else {
                 Ok(())
             };
-            let live_vtab_result = self.live_vtab_rollback_all(&cx);
-            let live_vtab_registry_result = self.restore_live_vtab_registry_to(&cx, 0);
+            let live_vtab_result = self.live_vtab_rollback_all(cx);
+            let live_vtab_registry_result = self.restore_live_vtab_registry_to(cx, 0);
 
             // Reload MemDatabase from pager's committed state.
             // This replaces the snapshot-restore approach with reading the
             // authoritative state from the pager.
-            let reload_result = self.reload_memdb_from_pager(&cx);
+            let reload_result = self.reload_memdb_from_pager(cx);
 
             // Clear transaction state.
             *self.txn_snapshot.borrow_mut() = None;
@@ -16617,16 +16635,14 @@ impl Connection {
         self.gc_todo.borrow_mut().enqueue(pgno);
     }
 
-    /// Handle SAVEPOINT name.
     #[allow(clippy::unnecessary_wraps)] // will return errors once pager is wired
-    fn execute_savepoint(&self, name: &str) -> Result<()> {
-        let cx = self.op_cx()?;
+    fn execute_savepoint_with_cx(&self, cx: &Cx, name: &str) -> Result<()> {
         // If no explicit transaction, implicitly begin one.
         let started_implicit_txn = !*self.in_transaction.borrow();
         if started_implicit_txn {
             // Discard cached snapshots — implicit transaction starts fresh.
-            self.invalidate_cached_read_snapshot(&cx);
-            self.invalidate_cached_write_txn(&cx);
+            self.invalidate_cached_read_snapshot(cx);
+            self.invalidate_cached_write_txn(cx);
             let is_concurrent = *self.concurrent_mode_default.borrow();
             let pager_mode = if is_concurrent {
                 TransactionMode::Concurrent
@@ -16636,12 +16652,12 @@ impl Connection {
             // Bind the implicit transaction snapshot to the pager's published
             // visibility plane before opening the pager txn.
             let concurrent_snapshot = if is_concurrent {
-                let publication = self.bind_pager_publication(&cx, "savepoint_implicit_begin")?;
+                let publication = self.bind_pager_publication(cx, "savepoint_implicit_begin")?;
                 Some(self.concurrent_snapshot_from_publication(publication))
             } else {
                 None
             };
-            let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode)?;
+            let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, cx, pager_mode)?;
             let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
                 let session_id = lock_unpoisoned(&self.concurrent_registry)
                     .begin_concurrent(snapshot)
@@ -16652,7 +16668,7 @@ impl Connection {
                 let session_id = match session_id {
                     Ok(id) => id,
                     Err(err) => {
-                        let _ = txn.rollback(&cx);
+                        let _ = txn.rollback(cx);
                         return Err(err);
                     }
                 };
@@ -16674,7 +16690,7 @@ impl Connection {
         let pager_savepoint_result = {
             let mut active_txn = self.active_txn.borrow_mut();
             if let Some(txn) = active_txn.as_mut() {
-                txn.savepoint(&cx, name)
+                txn.savepoint(cx, name)
             } else {
                 Ok(())
             }
@@ -16721,7 +16737,7 @@ impl Connection {
                     let mut cleanup_errors = if started_implicit_txn {
                         Vec::new()
                     } else {
-                        self.cleanup_failed_savepoint_setup(&cx, name, None)
+                        self.cleanup_failed_savepoint_setup(cx, name, None)
                     };
                     if started_implicit_txn
                         && let Some(cleanup_error) =
@@ -16742,11 +16758,11 @@ impl Connection {
             None
         };
         let live_vtab_level = self.next_live_vtab_savepoint_level()?;
-        if let Err(error) = self.live_vtab_savepoint_all(&cx, live_vtab_level) {
+        if let Err(error) = self.live_vtab_savepoint_all(cx, live_vtab_level) {
             let mut cleanup_errors = if started_implicit_txn {
                 Vec::new()
             } else {
-                self.cleanup_failed_savepoint_setup(&cx, name, concurrent_snapshot.as_ref())
+                self.cleanup_failed_savepoint_setup(cx, name, concurrent_snapshot.as_ref())
             };
             if started_implicit_txn
                 && let Some(cleanup_error) = self.rollback_failed_implicit_savepoint_transaction()
@@ -16771,9 +16787,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Handle RELEASE \[SAVEPOINT\] name.
-    fn execute_release(&self, name: &str) -> Result<()> {
-        let cx = self.op_cx()?;
+    fn execute_release_with_cx(&self, cx: &Cx, name: &str) -> Result<()> {
         let (idx, canonical_name) = {
             let savepoints = self.savepoints.borrow();
             let idx = savepoints
@@ -16788,14 +16802,14 @@ impl Connection {
         // without calling pager release_savepoint first — this avoids leaving
         // the pager savepoint stack out of sync if the commit fails.
         if idx == 0 && *self.implicit_txn.borrow() {
-            return self.execute_commit();
+            return self.execute_commit_with_cx(cx);
         }
 
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.release_savepoint(&cx, &canonical_name)?;
+            txn.release_savepoint(cx, &canonical_name)?;
         }
         let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
-        self.live_vtab_release_all(&cx, live_vtab_level)?;
+        self.live_vtab_release_all(cx, live_vtab_level)?;
 
         let mut savepoints = self.savepoints.borrow_mut();
         // RELEASE removes the named savepoint and all savepoints created after it.
@@ -69165,6 +69179,10 @@ mod pager_routing_tests {
         assert_eq!(affected, 1);
         let profile = hot_path_profile_snapshot();
         assert_eq!(
+            profile.op_cx_background_gates, 0,
+            "prepared DML inside an explicit transaction should reuse the existing dispatcher operation context for statement savepoints: {profile:?}"
+        );
+        assert_eq!(
             profile.prepared_schema_refreshes, 0,
             "prepared DML inside an explicit transaction should skip external schema refresh ceremony: {profile:?}"
         );
@@ -69180,6 +69198,100 @@ mod pager_routing_tests {
             profile.pager_publication_refreshes, 0,
             "prepared DML inside an explicit transaction should not bind a fresh pager publication mid-transaction: {profile:?}"
         );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_explicit_commit_reuses_dispatch_background_gate() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("explicit_commit_background_gate_reuse.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE commit_gate_fast (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO commit_gate_fast (id, val) VALUES (1, 'alpha');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        conn.execute("COMMIT;").unwrap();
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.op_cx_background_gates, 0,
+            "explicit COMMIT should reuse the dispatcher background gate instead of minting an extra op_cx: {profile:?}"
+        );
+        assert_eq!(
+            profile.pager_publication_refreshes, 0,
+            "explicit COMMIT should not need a fresh pager publication refresh: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_backed_explicit_rollback_reuses_dispatch_background_gate() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("explicit_rollback_background_gate_reuse.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE rollback_gate_fast (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO rollback_gate_fast (id, val) VALUES (1, 'alpha');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        conn.execute("ROLLBACK;").unwrap();
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.op_cx_background_gates, 0,
+            "explicit ROLLBACK should reuse the dispatcher background gate instead of minting an extra op_cx: {profile:?}"
+        );
+        assert_eq!(
+            profile.pager_publication_refreshes, 1,
+            "explicit ROLLBACK still reloads committed pager state once after dropping the transaction: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_backed_savepoint_and_release_reuse_dispatch_background_gate() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("savepoint_release_background_gate_reuse.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE savepoint_gate_fast (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+
+        reset_hot_path_profile();
+        conn.execute("SAVEPOINT fast_gate;").unwrap();
+        let savepoint_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            savepoint_profile.op_cx_background_gates, 0,
+            "explicit SAVEPOINT should reuse the dispatcher background gate instead of minting an extra op_cx: {savepoint_profile:?}"
+        );
+        assert_eq!(
+            savepoint_profile.pager_publication_refreshes, 0,
+            "explicit SAVEPOINT inside an active transaction should not bind a fresh pager publication: {savepoint_profile:?}"
+        );
+
+        reset_hot_path_profile();
+        conn.execute("RELEASE fast_gate;").unwrap();
+        let release_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            release_profile.op_cx_background_gates, 0,
+            "explicit RELEASE should reuse the dispatcher background gate instead of minting an extra op_cx: {release_profile:?}"
+        );
+        assert_eq!(
+            release_profile.pager_publication_refreshes, 0,
+            "explicit RELEASE inside an active transaction should not bind a fresh pager publication: {release_profile:?}"
+        );
+
         conn.execute("ROLLBACK;").unwrap();
     }
 

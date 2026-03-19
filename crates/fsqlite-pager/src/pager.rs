@@ -9027,7 +9027,7 @@ mod tests {
 
     #[test]
     fn test_wal_external_refresh_tracks_headerless_interior_commit() {
-        let (pager1, pager2, _frames) = wal_pager_pair_with_shared_backend();
+        let (pager1, pager2, frames) = wal_pager_pair_with_shared_backend();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
 
@@ -9050,8 +9050,43 @@ mod tests {
             latest_seq > seq_before,
             "bead_id={BEAD_ID} case=wal_headerless_interior_commit_advances_local_seq"
         );
+        assert_eq!(
+            frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                .count(),
+            2,
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_emits_commit_markers"
+        );
+        {
+            let mut inner = pager2.inner.lock().unwrap();
+            assert_eq!(
+                inner.journal_mode,
+                JournalMode::Wal,
+                "bead_id={BEAD_ID} case=wal_headerless_interior_commit_follower_in_wal_mode"
+            );
+            let wal = inner
+                .wal_backend
+                .as_mut()
+                .expect("WAL backend should stay installed");
+            assert_eq!(
+                wal.committed_txn_count(&cx).unwrap(),
+                2,
+                "bead_id={BEAD_ID} case=wal_headerless_interior_commit_backend_reports_commit_count"
+            );
+        }
 
         let reader = pager2.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        {
+            let inner = pager2.inner.lock().unwrap();
+            assert_eq!(
+                inner.commit_seq,
+                latest_seq,
+                "bead_id={BEAD_ID} case=wal_headerless_interior_commit_refreshes_inner_commit_seq"
+            );
+        }
         let refreshed = pager2.published_snapshot();
         assert_eq!(
             refreshed.visible_commit_seq, latest_seq,
@@ -11272,7 +11307,6 @@ mod tests {
                 journal_mode: JournalMode::Wal,
                 freelist_count: 0,
                 checkpoint_active: false,
-                readonly: false,
             },
             page_no,
             page.clone(),
@@ -11309,7 +11343,6 @@ mod tests {
                 db_size: 4,
                 journal_mode: JournalMode::Wal,
                 freelist_count: 0,
-                readonly: false,
                 checkpoint_active: false,
             },
             |pages| {
@@ -11323,7 +11356,6 @@ mod tests {
                 visible_commit_seq: CommitSeq::new(7),
                 db_size: 4,
                 journal_mode: JournalMode::Wal,
-                readonly: false,
                 freelist_count: 0,
                 checkpoint_active: false,
             },
