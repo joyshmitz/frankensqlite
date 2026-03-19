@@ -221,6 +221,8 @@ tmp_rch_probe/
 # Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
 .beads/.br_recovery/
 .beads_recovery_*/
+.beads_snapshot_*/
+.beads/*.pre_*
 .beads/*.backup.*
 .beads/*.bad_*
 .beads/*.backup_*

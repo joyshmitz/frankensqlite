@@ -371,7 +371,6 @@ impl ConcurrentHandle {
     /// Record a granular write witness for fine-grained SSI.
     pub fn record_write_witness(&mut self, key: WitnessKey) {
         if let Some(p) = witness_key_page(&key) {
-            self.ensure_page_state(p).held_lock = true;
             let witnesses = self.write_index.entry(p).or_default();
             if !witnesses.iter().any(|existing| existing == &key) {
                 witnesses.push(key);
@@ -526,17 +525,14 @@ impl ActiveTxnView for ConcurrentHandle {
         let page = match witness_key_page(key) {
             Some(p) => p,
             None => {
-                return self
-                    .page_states
-                    .values()
-                    .any(PageTxnState::tracks_write_conflict)
+                return !self.write_index.is_empty()
+                    || self
+                        .page_states
+                        .values()
+                        .any(PageTxnState::tracks_write_conflict)
                     || !self.global_write_witnesses.is_empty();
             }
         };
-
-        if !self.tracks_write_conflict_page(page) {
-            return false;
-        }
 
         if let Some(witnesses) = self.write_index.get(&page) {
             return witnesses
@@ -544,7 +540,7 @@ impl ActiveTxnView for ConcurrentHandle {
                 .any(|w| crate::witness_plane::witness_keys_overlap(w, key));
         }
 
-        true
+        self.tracks_write_conflict_page(page)
     }
 
     fn has_in_rw(&self) -> bool {
@@ -1542,7 +1538,7 @@ struct HandleView {
     begin_seq: CommitSeq,
     is_active: bool,
     read_pages: HashSet<PageNumber>,
-    tracked_write_pages: HashSet<PageNumber>,
+    write_pages: HashSet<PageNumber>,
     has_read_witnesses: bool,
     has_write_witnesses: bool,
     has_global_read_witnesses: bool,
@@ -1553,12 +1549,15 @@ struct HandleView {
 
 impl HandleView {
     fn new(handle: &ConcurrentHandle) -> Self {
+        let mut write_pages: HashSet<PageNumber> =
+            handle.tracked_write_conflict_pages_iter().collect();
+        write_pages.extend(handle.write_index.keys().copied());
         Self {
             token: handle.token(),
             begin_seq: handle.begin_seq(),
             is_active: handle.is_active(),
             read_pages: handle.read_set().clone(),
-            tracked_write_pages: handle.tracked_write_conflict_pages_iter().collect(),
+            write_pages,
             has_read_witnesses: !handle.read_set().is_empty() || handle.has_global_read_witnesses(),
             has_write_witnesses: !handle.write_index.is_empty()
                 || handle.has_global_write_witnesses(),
@@ -1663,7 +1662,7 @@ impl ActiveEdgeDiscoveryIndex {
                 if view.has_global_write_witnesses {
                     index.writers_with_global_keys.push(idx);
                 }
-                for &page in &view.tracked_write_pages {
+                for &page in &view.write_pages {
                     index.writers_by_page.entry(page).or_default().push(idx);
                 }
             }
@@ -1770,9 +1769,9 @@ impl ActiveTxnView for HandleView {
             WitnessKey::Page(p)
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.tracked_write_pages.contains(p),
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.write_pages.contains(p),
             WitnessKey::Custom { .. } => {
-                !self.tracked_write_pages.is_empty() || self.has_global_write_witnesses
+                !self.write_pages.is_empty() || self.has_global_write_witnesses
             }
         }
     }
@@ -4012,6 +4011,62 @@ mod tests {
             namespace: 6,
             bytes: b"candidate".to_vec(),
         }));
+    }
+
+    #[test]
+    fn test_page_write_witness_preserves_overlap_without_claiming_lock() {
+        let page = test_page(17);
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(302));
+        handle.record_write_witness(WitnessKey::Page(page));
+
+        assert!(
+            !handle.holds_page_lock(page),
+            "page-scoped SSI witnesses must not claim physical page-lock ownership"
+        );
+        assert!(handle.check_write_overlap(&WitnessKey::Page(page)));
+        assert!(!handle.check_write_overlap(&WitnessKey::Page(test_page(18))));
+    }
+
+    #[test]
+    fn test_active_edge_discovery_index_indexes_page_write_witnesses_without_page_state() {
+        let mut page_writer = ConcurrentHandle::new(test_snapshot(10), test_token(303));
+        page_writer.record_write_witness(WitnessKey::Page(test_page(7)));
+        assert!(
+            !page_writer.holds_page_lock(test_page(7)),
+            "page-scoped SSI witnesses must not manufacture a held page lock"
+        );
+
+        let mut global_writer = ConcurrentHandle::new(test_snapshot(10), test_token(304));
+        global_writer.record_write_witness(WitnessKey::Custom {
+            namespace: 8,
+            bytes: b"global-writer".to_vec(),
+        });
+
+        let mut unrelated_writer = ConcurrentHandle::new(test_snapshot(10), test_token(305));
+        unrelated_writer.record_write_witness(WitnessKey::Page(test_page(9)));
+
+        let views = vec![
+            HandleView::new(&page_writer),
+            HandleView::new(&global_writer),
+            HandleView::new(&unrelated_writer),
+        ];
+        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
+
+        let mut candidate_tokens = index
+            .outgoing_candidate_refs(
+                &views,
+                test_token(399),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &read_summary,
+            )
+            .into_iter()
+            .map(|candidate| candidate.token())
+            .collect::<Vec<_>>();
+        candidate_tokens.sort_by_key(|token| token.id.get());
+
+        assert_eq!(candidate_tokens, vec![test_token(303), test_token(304)]);
     }
 
     #[test]

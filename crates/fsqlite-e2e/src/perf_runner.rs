@@ -230,6 +230,8 @@ pub struct HotPathParserProfile {
     pub rewrite_time_ns: u64,
     pub compiled_cache_hits: u64,
     pub compiled_cache_misses: u64,
+    pub prepared_cache_hits: u64,
+    pub prepared_cache_misses: u64,
     pub compile_time_ns: u64,
 }
 
@@ -301,6 +303,17 @@ pub struct HotPathConnectionCeremonyProfile {
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
+    pub prepared_insert_fast_lane_hits: u64,
+    pub prepared_insert_instrumented_lane_hits: u64,
+    pub prepared_update_delete_fast_lane_hits: u64,
+    pub prepared_update_delete_instrumented_lane_hits: u64,
+    pub prepared_update_delete_fallback_returning: u64,
+    pub prepared_update_delete_fallback_sqlite_sequence: u64,
+    pub prepared_update_delete_fallback_without_rowid: u64,
+    pub prepared_update_delete_fallback_live_vtab: u64,
+    pub prepared_update_delete_fallback_trigger: u64,
+    pub prepared_update_delete_fallback_foreign_key: u64,
+    pub prepared_table_dml_affected_only_runs: u64,
     pub autoincrement_sequence_fast_path_updates: u64,
     pub autoincrement_sequence_scan_refreshes: u64,
 }
@@ -694,6 +707,8 @@ fn parser_profile(snapshot: ParserHotPathProfileSnapshot) -> HotPathParserProfil
         rewrite_time_ns: snapshot.rewrite_time_ns,
         compiled_cache_hits: snapshot.compiled_cache_hits,
         compiled_cache_misses: snapshot.compiled_cache_misses,
+        prepared_cache_hits: snapshot.prepared_cache_hits,
+        prepared_cache_misses: snapshot.prepared_cache_misses,
         compile_time_ns: snapshot.compile_time_ns,
     }
 }
@@ -866,6 +881,23 @@ fn build_hot_path_profile_report(
         column_default_evaluation_passes: snapshot.column_default_evaluation_passes,
         prepared_table_engine_fresh_allocs: snapshot.prepared_table_engine_fresh_allocs,
         prepared_table_engine_reuses: snapshot.prepared_table_engine_reuses,
+        prepared_insert_fast_lane_hits: snapshot.prepared_insert_fast_lane_hits,
+        prepared_insert_instrumented_lane_hits: snapshot.prepared_insert_instrumented_lane_hits,
+        prepared_update_delete_fast_lane_hits: snapshot.prepared_update_delete_fast_lane_hits,
+        prepared_update_delete_instrumented_lane_hits: snapshot
+            .prepared_update_delete_instrumented_lane_hits,
+        prepared_update_delete_fallback_returning: snapshot
+            .prepared_update_delete_fallback_returning,
+        prepared_update_delete_fallback_sqlite_sequence: snapshot
+            .prepared_update_delete_fallback_sqlite_sequence,
+        prepared_update_delete_fallback_without_rowid: snapshot
+            .prepared_update_delete_fallback_without_rowid,
+        prepared_update_delete_fallback_live_vtab: snapshot
+            .prepared_update_delete_fallback_live_vtab,
+        prepared_update_delete_fallback_trigger: snapshot.prepared_update_delete_fallback_trigger,
+        prepared_update_delete_fallback_foreign_key: snapshot
+            .prepared_update_delete_fallback_foreign_key,
+        prepared_table_dml_affected_only_runs: snapshot.prepared_table_dml_affected_only_runs,
         autoincrement_sequence_fast_path_updates: snapshot.autoincrement_sequence_fast_path_updates,
         autoincrement_sequence_scan_refreshes: snapshot.autoincrement_sequence_scan_refreshes,
     };
@@ -1151,6 +1183,53 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
             .connection_ceremony
             .prepared_table_engine_fresh_allocs,
         report.connection_ceremony.prepared_table_engine_reuses
+    );
+    let _ = writeln!(
+        out,
+        "- Prepared insert fast/instrumented lanes: {}/{}",
+        report.connection_ceremony.prepared_insert_fast_lane_hits,
+        report
+            .connection_ceremony
+            .prepared_insert_instrumented_lane_hits
+    );
+    let _ = writeln!(
+        out,
+        "- Prepared update/delete fast/instrumented lanes: {}/{}",
+        report
+            .connection_ceremony
+            .prepared_update_delete_fast_lane_hits,
+        report
+            .connection_ceremony
+            .prepared_update_delete_instrumented_lane_hits
+    );
+    let _ = writeln!(
+        out,
+        "- Prepared update/delete fallback reasons (returning/sqlite_sequence/without_rowid/live_vtab/trigger/fk): {}/{}/{}/{}/{}/{}",
+        report
+            .connection_ceremony
+            .prepared_update_delete_fallback_returning,
+        report
+            .connection_ceremony
+            .prepared_update_delete_fallback_sqlite_sequence,
+        report
+            .connection_ceremony
+            .prepared_update_delete_fallback_without_rowid,
+        report
+            .connection_ceremony
+            .prepared_update_delete_fallback_live_vtab,
+        report
+            .connection_ceremony
+            .prepared_update_delete_fallback_trigger,
+        report
+            .connection_ceremony
+            .prepared_update_delete_fallback_foreign_key
+    );
+    let _ = writeln!(
+        out,
+        "- Prepared DML affected-only runs: {}",
+        report
+            .connection_ceremony
+            .prepared_table_dml_affected_only_runs
     );
     let _ = writeln!(
         out,
@@ -2083,6 +2162,25 @@ fn build_hot_path_baseline_reuse_ledger(
             )),
             rationale:
                 "compiled-plan cache hits/misses are captured directly at the prepare/compile boundary"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "prepared_statement_cache".to_owned(),
+            supported: true,
+            hits: report.parser.prepared_cache_hits,
+            misses: report.parser.prepared_cache_misses,
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.parser.prepared_cache_hits,
+                report
+                    .parser
+                    .prepared_cache_hits
+                    .saturating_add(report.parser.prepared_cache_misses),
+            )),
+            rationale:
+                "prepared-statement template cache hits/misses are measured at the `Connection::prepare()` boundary"
                     .to_owned(),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -3348,6 +3446,8 @@ mod tests {
                 rewrite_time_ns: 600,
                 compiled_cache_hits: 1,
                 compiled_cache_misses: 2,
+                prepared_cache_hits: 1,
+                prepared_cache_misses: 1,
                 compile_time_ns: 900,
             },
             background_status_checks: 2,
@@ -3361,6 +3461,17 @@ mod tests {
             column_default_evaluation_passes: 2,
             prepared_table_engine_fresh_allocs: 1,
             prepared_table_engine_reuses: 1,
+            prepared_insert_fast_lane_hits: 1,
+            prepared_insert_instrumented_lane_hits: 0,
+            prepared_update_delete_fast_lane_hits: 2,
+            prepared_update_delete_instrumented_lane_hits: 1,
+            prepared_update_delete_fallback_returning: 1,
+            prepared_update_delete_fallback_sqlite_sequence: 0,
+            prepared_update_delete_fallback_without_rowid: 0,
+            prepared_update_delete_fallback_live_vtab: 0,
+            prepared_update_delete_fallback_trigger: 1,
+            prepared_update_delete_fallback_foreign_key: 1,
+            prepared_table_dml_affected_only_runs: 1,
             autoincrement_sequence_fast_path_updates: 1,
             autoincrement_sequence_scan_refreshes: 0,
             record_decode: RecordHotPathProfileSnapshot {

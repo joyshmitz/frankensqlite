@@ -233,6 +233,8 @@ static FSQLITE_REWRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_REWRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
@@ -245,6 +247,17 @@ static FSQLITE_CACHED_READ_SNAPSHOT_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_REUSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_INSERT_FAST_LANE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_INSERT_INSTRUMENTED_LANE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FAST_LANE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_INSTRUMENTED_LANE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_RETURNING: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_SQLITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_WITHOUT_ROWID: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_LIVE_VTAB: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_TRIGGER: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_FOREIGN_KEY: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_TABLE_DML_AFFECTED_ONLY_RUNS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
@@ -260,6 +273,8 @@ pub struct ParserHotPathProfileSnapshot {
     pub rewrite_time_ns: u64,
     pub compiled_cache_hits: u64,
     pub compiled_cache_misses: u64,
+    pub prepared_cache_hits: u64,
+    pub prepared_cache_misses: u64,
     pub compile_time_ns: u64,
 }
 
@@ -277,6 +292,17 @@ pub struct HotPathProfileSnapshot {
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
+    pub prepared_insert_fast_lane_hits: u64,
+    pub prepared_insert_instrumented_lane_hits: u64,
+    pub prepared_update_delete_fast_lane_hits: u64,
+    pub prepared_update_delete_instrumented_lane_hits: u64,
+    pub prepared_update_delete_fallback_returning: u64,
+    pub prepared_update_delete_fallback_sqlite_sequence: u64,
+    pub prepared_update_delete_fallback_without_rowid: u64,
+    pub prepared_update_delete_fallback_live_vtab: u64,
+    pub prepared_update_delete_fallback_trigger: u64,
+    pub prepared_update_delete_fallback_foreign_key: u64,
+    pub prepared_table_dml_affected_only_runs: u64,
     pub autoincrement_sequence_fast_path_updates: u64,
     pub autoincrement_sequence_scan_refreshes: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
@@ -305,6 +331,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_REWRITE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILED_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILED_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_BACKGROUND_STATUS_CHECKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
@@ -317,6 +345,17 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_REUSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_INSERT_FAST_LANE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_INSERT_INSTRUMENTED_LANE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FAST_LANE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_INSTRUMENTED_LANE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_RETURNING.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_SQLITE_SEQUENCE.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_WITHOUT_ROWID.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_LIVE_VTAB.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_TRIGGER.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_FOREIGN_KEY.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_TABLE_DML_AFFECTED_ONLY_RUNS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
@@ -337,6 +376,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             rewrite_time_ns: FSQLITE_REWRITE_TIME_NS.load(AtomicOrdering::Relaxed),
             compiled_cache_hits: FSQLITE_COMPILED_CACHE_HITS.load(AtomicOrdering::Relaxed),
             compiled_cache_misses: FSQLITE_COMPILED_CACHE_MISSES.load(AtomicOrdering::Relaxed),
+            prepared_cache_hits: FSQLITE_PREPARED_CACHE_HITS.load(AtomicOrdering::Relaxed),
+            prepared_cache_misses: FSQLITE_PREPARED_CACHE_MISSES.load(AtomicOrdering::Relaxed),
             compile_time_ns: FSQLITE_COMPILE_TIME_NS.load(AtomicOrdering::Relaxed),
         },
         background_status_checks: FSQLITE_BACKGROUND_STATUS_CHECKS.load(AtomicOrdering::Relaxed),
@@ -357,6 +398,28 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         prepared_table_engine_fresh_allocs: FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS
             .load(AtomicOrdering::Relaxed),
         prepared_table_engine_reuses: FSQLITE_PREPARED_TABLE_ENGINE_REUSES
+            .load(AtomicOrdering::Relaxed),
+        prepared_insert_fast_lane_hits: FSQLITE_PREPARED_INSERT_FAST_LANE_HITS
+            .load(AtomicOrdering::Relaxed),
+        prepared_insert_instrumented_lane_hits: FSQLITE_PREPARED_INSERT_INSTRUMENTED_LANE_HITS
+            .load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fast_lane_hits: FSQLITE_PREPARED_UPDATE_DELETE_FAST_LANE_HITS
+            .load(AtomicOrdering::Relaxed),
+        prepared_update_delete_instrumented_lane_hits:
+            FSQLITE_PREPARED_UPDATE_DELETE_INSTRUMENTED_LANE_HITS.load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fallback_returning:
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_RETURNING.load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fallback_sqlite_sequence:
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_SQLITE_SEQUENCE.load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fallback_without_rowid:
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_WITHOUT_ROWID.load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fallback_live_vtab:
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_LIVE_VTAB.load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fallback_trigger: FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_TRIGGER
+            .load(AtomicOrdering::Relaxed),
+        prepared_update_delete_fallback_foreign_key:
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_FOREIGN_KEY.load(AtomicOrdering::Relaxed),
+        prepared_table_dml_affected_only_runs: FSQLITE_PREPARED_TABLE_DML_AFFECTED_ONLY_RUNS
             .load(AtomicOrdering::Relaxed),
         autoincrement_sequence_fast_path_updates: FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES
             .load(AtomicOrdering::Relaxed),
@@ -1232,6 +1295,57 @@ fn htm_metrics_row_values(snapshot: FlatCombiningMetrics) -> Vec<SqliteValue> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedDmlKind {
     Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedUpdateDeleteFallbackReason {
+    Returning,
+    SqliteSequence,
+    WithoutRowid,
+    LiveVtab,
+    Trigger,
+    ForeignKey,
+}
+
+impl PreparedDmlKind {
+    const fn statement_kind(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+fn record_prepared_update_delete_fallback(reason: PreparedUpdateDeleteFallbackReason) {
+    if !hot_path_profile_enabled() {
+        return;
+    }
+    match reason {
+        PreparedUpdateDeleteFallbackReason::Returning => {
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_RETURNING.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        PreparedUpdateDeleteFallbackReason::SqliteSequence => {
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_SQLITE_SEQUENCE
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        PreparedUpdateDeleteFallbackReason::WithoutRowid => {
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_WITHOUT_ROWID
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        PreparedUpdateDeleteFallbackReason::LiveVtab => {
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_LIVE_VTAB.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        PreparedUpdateDeleteFallbackReason::Trigger => {
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_TRIGGER.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        PreparedUpdateDeleteFallbackReason::ForeignKey => {
+            FSQLITE_PREPARED_UPDATE_DELETE_FALLBACK_FOREIGN_KEY
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1282,6 +1396,67 @@ enum PreparedDmlDispatch {
     /// Execute through a dedicated prepared-DML helper that reuses the cached
     /// program without keeping the full AST alive.
     Precompiled(PreparedPrecompiledDml),
+}
+
+#[derive(Clone)]
+struct PreparedStatementTemplate {
+    canonical_sql: String,
+    program: Arc<VdbeProgram>,
+    expression_postprocess: Option<ExpressionPostprocess>,
+    distinct: bool,
+    table_backed: bool,
+    post_distinct_limit: Option<LimitClause>,
+    schema_cookie: u32,
+    schema_generation: u64,
+    dml_dispatch: Option<PreparedDmlDispatch>,
+    deferred_query_statement: Option<Arc<Statement>>,
+    deferred_query_column_count: Option<usize>,
+    column_names: Vec<String>,
+}
+
+impl PreparedStatementTemplate {
+    fn from_statement(stmt: &PreparedStatement<'_>) -> Self {
+        Self {
+            canonical_sql: stmt.sql.clone(),
+            program: Arc::clone(&stmt.program),
+            expression_postprocess: stmt.expression_postprocess.clone(),
+            distinct: stmt.distinct,
+            table_backed: stmt.db.is_some(),
+            post_distinct_limit: stmt.post_distinct_limit.clone(),
+            schema_cookie: stmt.schema_cookie,
+            schema_generation: stmt.schema_generation,
+            dml_dispatch: stmt.dml_dispatch.clone(),
+            deferred_query_statement: stmt.deferred_query_statement.clone(),
+            deferred_query_column_count: stmt.deferred_query_column_count,
+            column_names: stmt.column_names.clone(),
+        }
+    }
+
+    fn instantiate<'conn>(&self, conn: &'conn Connection) -> PreparedStatement<'conn> {
+        PreparedStatement {
+            sql: self.canonical_sql.clone(),
+            program: Arc::clone(&self.program),
+            func_registry: Some(Arc::clone(&*conn.func_registry.borrow())),
+            expression_postprocess: self.expression_postprocess.clone(),
+            distinct: self.distinct,
+            db: self.table_backed.then(|| Rc::clone(&conn.db)),
+            pager: self.table_backed.then(|| conn.pager.clone()),
+            post_distinct_limit: self.post_distinct_limit.clone(),
+            schema_cookie: self.schema_cookie,
+            schema_generation: self.schema_generation,
+            dml_dispatch: self.dml_dispatch.clone(),
+            deferred_query_statement: self.deferred_query_statement.clone(),
+            deferred_query_column_count: self.deferred_query_column_count,
+            column_names: self.column_names.clone(),
+            conn,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PreparedCacheEntry {
+    sql: String,
+    template: PreparedStatementTemplate,
 }
 
 pub struct PreparedStatement<'conn> {
@@ -1524,6 +1699,26 @@ impl PreparedStatement<'_> {
         params: Option<&[SqliteValue]>,
         track_last_insert_rowid: bool,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
+        self.execute_table_program_with_reuse_mode(op_cx, params, track_last_insert_rowid, true)
+    }
+
+    fn execute_table_program_dml_with_reuse(
+        &self,
+        op_cx: &Cx,
+        params: Option<&[SqliteValue]>,
+        track_last_insert_rowid: bool,
+    ) -> Result<(usize, Option<i64>)> {
+        self.execute_table_program_with_reuse_mode(op_cx, params, track_last_insert_rowid, false)
+            .map(|(_, changes, last_insert_rowid)| (changes, last_insert_rowid))
+    }
+
+    fn execute_table_program_with_reuse_mode(
+        &self,
+        op_cx: &Cx,
+        params: Option<&[SqliteValue]>,
+        track_last_insert_rowid: bool,
+        collect_rows: bool,
+    ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         let Some(db) = self.db.as_ref() else {
             return Err(FrankenError::Internal(
                 "prepared table program missing database handle".to_owned(),
@@ -1609,6 +1804,8 @@ impl PreparedStatement<'_> {
                 reject_mem,
                 Some(Arc::clone(&self.conn.version_store)),
                 page_size,
+                collect_rows,
+                true,
                 cached,
             );
             *self.conn.cached_vdbe_engine.borrow_mut() = engine_back;
@@ -1641,6 +1838,8 @@ impl PreparedStatement<'_> {
                 reject_mem,
                 Some(Arc::clone(&self.conn.version_store)),
                 page_size,
+                collect_rows,
+                true,
                 cached,
             );
             *self.conn.cached_vdbe_engine.borrow_mut() = engine_back;
@@ -2505,6 +2704,15 @@ pub struct Connection {
     /// Schema cookie at the time `cached_read_snapshot` was captured.
     /// Used to detect schema changes that invalidate the cached snapshot.
     cached_read_snapshot_cookie: Cell<u32>,
+    /// Cached write transaction for `:memory:` autocommit fast path.
+    ///
+    /// After a successful autocommit write on `:memory:`, the transaction is
+    /// committed via `commit_and_retain()` and parked here.  The next
+    /// autocommit write reuses it — skipping `pager.begin()` + Mutex lock
+    /// entirely.  Invalidated on explicit BEGIN, DDL, or schema change.
+    cached_write_txn: RefCell<Option<Box<dyn TransactionHandle>>>,
+    /// Schema cookie at the time `cached_write_txn` was captured.
+    cached_write_txn_cookie: Cell<u32>,
     /// Cached VDBE engine for reuse across autocommit statements.
     ///
     /// Instead of allocating a fresh `VdbeEngine` (21+ collection allocs) for
@@ -2703,6 +2911,9 @@ pub struct Connection {
     /// repeated `execute()`/`execute_with_params()` calls skip compilation.
     /// Invalidated alongside parse_cache when schema_cookie changes.
     compiled_cache: RefCell<LruCache<u64, Arc<CompiledCacheEntry>>>,
+    /// Connection-local prepared statement template cache keyed by raw SQL.
+    /// Avoids rebuilding the prepared wrapper for repeated `prepare()` calls.
+    prepared_cache: RefCell<LruCache<u64, Arc<PreparedCacheEntry>>>,
     /// Schema-generation-scoped execution metadata cache for table-backed
     /// statements. Avoids rebuilding structural root-page maps on every VDBE
     /// run while leaving dynamic defaults and sqlite_sequence values live.
@@ -2786,6 +2997,8 @@ impl Connection {
             active_txn: RefCell::new(None),
             cached_read_snapshot: RefCell::new(None),
             cached_read_snapshot_cookie: Cell::new(0),
+            cached_write_txn: RefCell::new(None),
+            cached_write_txn_cookie: Cell::new(0),
             cached_vdbe_engine: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
             views: RefCell::new(Vec::new()),
@@ -2862,6 +3075,7 @@ impl Connection {
             parse_cache_cookie: RefCell::new(0),
             // Compiled bytecode cache (bd-1dp9.6.7.2.2)
             compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
+            prepared_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             table_execution_metadata_cache: RefCell::new(None),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
@@ -4549,6 +4763,10 @@ impl Connection {
         if let Some(mut cached) = self.cached_read_snapshot.get_mut().take() {
             let _ = cached.rollback(&cx);
         }
+        // Finalize any cached write transaction before closing.
+        if let Some(mut cached) = self.cached_write_txn.get_mut().take() {
+            let _ = cached.commit(&cx);
+        }
 
         let live_vtab_txn_open = !self.live_vtab_transactions.get_mut().is_empty();
         let had_active_txn = self.active_txn.get_mut().is_some();
@@ -4673,6 +4891,7 @@ impl Connection {
         registry.register_aggregate(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
         self.compiled_cache.borrow_mut().clear();
+        self.prepared_cache.borrow_mut().clear();
     }
 
     /// Register a custom window function.
@@ -4698,6 +4917,7 @@ impl Connection {
         registry.register_window(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
         self.compiled_cache.borrow_mut().clear();
+        self.prepared_cache.borrow_mut().clear();
     }
 
     /// Register a virtual-table module factory under the given name.
@@ -4745,6 +4965,25 @@ impl Connection {
     /// Prepare SQL into a statement.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
+        let key = Self::sql_hash(sql);
+        self.refresh_parse_cache_if_needed(sql);
+        if let Some(cached) = self.lookup_prepared_cache(key, sql) {
+            if hot_path_profile_enabled() {
+                FSQLITE_PREPARED_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.log_statement_reuse_event("prepared", sql, true, "none", 0, 0, "none");
+            return Ok(cached.template.instantiate(self));
+        }
+        if hot_path_profile_enabled() {
+            FSQLITE_PREPARED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let prepared = self.prepare_uncached(sql)?;
+        self.insert_prepared_cache(key, sql, &prepared);
+        self.log_statement_reuse_event("prepared", sql, false, "none", 0, 0, "none");
+        Ok(prepared)
+    }
+
+    fn prepare_uncached(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let statement = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -4988,6 +5227,15 @@ impl Connection {
                     p,
                     false,
                 ),
+                PreparedDmlKind::Update | PreparedDmlKind::Delete => self
+                    .execute_precompiled_prepared_update_or_delete(
+                        &op_cx,
+                        stmt,
+                        dispatch.kind,
+                        dispatch.rollback_on_constraint_violation,
+                        dispatch.preserve_prior_changes_on_constraint_violation,
+                        p,
+                    ),
             };
         }
         if let Some(dml) = stmt.deferred_dml_statement() {
@@ -4998,6 +5246,35 @@ impl Connection {
             } else {
                 Some(params)
             };
+            if stmt.dispatch_precompiled_program().is_some() {
+                match dml {
+                    Statement::Update(update)
+                        if self.prepared_update_supports_direct_dispatch_now(update) =>
+                    {
+                        return self.execute_precompiled_prepared_update_or_delete(
+                            &op_cx,
+                            stmt,
+                            PreparedDmlKind::Update,
+                            statement_rolls_back_transaction_on_constraint(dml),
+                            statement_preserves_prior_changes_on_constraint(dml),
+                            p,
+                        );
+                    }
+                    Statement::Delete(delete)
+                        if self.prepared_delete_supports_direct_dispatch_now(delete) =>
+                    {
+                        return self.execute_precompiled_prepared_update_or_delete(
+                            &op_cx,
+                            stmt,
+                            PreparedDmlKind::Delete,
+                            statement_rolls_back_transaction_on_constraint(dml),
+                            statement_preserves_prior_changes_on_constraint(dml),
+                            p,
+                        );
+                    }
+                    _ => {}
+                }
+            }
             let rows = self.execute_statement_impl_after_background_status(
                 dml,
                 p,
@@ -5038,20 +5315,48 @@ impl Connection {
         self.sync_change_tracking_context();
         let statement_trace_enabled =
             tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG);
+        let statement_reuse_enabled =
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
+        let trace_registration = {
+            let trace_registration = self.trace_registration.borrow();
+            let compat_trace_stmt_enabled = trace_registration
+                .as_ref()
+                .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
+            let compat_trace_profile_enabled = trace_registration
+                .as_ref()
+                .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
+            if !statement_trace_enabled
+                && !compat_trace_stmt_enabled
+                && !compat_trace_profile_enabled
+                && !statement_reuse_enabled
+            {
+                if hot_path_profile_enabled() {
+                    FSQLITE_PREPARED_INSERT_FAST_LANE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                return self.execute_precompiled_prepared_insert_fast(
+                    execution_cx,
+                    stmt,
+                    table_name,
+                    post_write_action,
+                    rollback_on_constraint_violation,
+                    preserve_prior_changes_on_constraint_violation,
+                    params,
+                    capture_time_travel_snapshot,
+                );
+            }
+            trace_registration.clone()
+        };
+        if hot_path_profile_enabled() {
+            FSQLITE_PREPARED_INSERT_INSTRUMENTED_LANE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let trace_id = statement_trace_enabled.then(next_trace_id).unwrap_or(0);
         let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
-        let trace_registration = self.trace_registration.borrow().clone();
         let compat_trace_stmt_enabled = trace_registration
             .as_ref()
             .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
         let compat_trace_profile_enabled = trace_registration
             .as_ref()
             .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
-        let compat_trace_row_enabled = trace_registration
-            .as_ref()
-            .is_some_and(|trace| trace.mask.contains(TraceMask::ROW));
-        let statement_reuse_enabled =
-            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
         let compat_trace_sql =
             (compat_trace_stmt_enabled || compat_trace_profile_enabled).then(|| stmt.sql.clone());
         let statement_span = statement_trace_enabled.then(|| {
@@ -5165,17 +5470,81 @@ impl Connection {
                 );
             }
         }
-        if compat_trace_row_enabled && let Ok((rows, _)) = result.as_ref() {
-            for row in rows {
-                emit_compat_trace_event(
-                    trace_registration.as_ref(),
-                    TraceEvent::Row {
-                        values: row.values().to_vec(),
-                    },
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_precompiled_prepared_insert_fast(
+        &self,
+        execution_cx: &Cx,
+        stmt: &PreparedStatement<'_>,
+        table_name: &str,
+        post_write_action: PreparedInsertPostWriteAction,
+        rollback_on_constraint_violation: bool,
+        preserve_prior_changes_on_constraint_violation: bool,
+        params: Option<&[SqliteValue]>,
+        capture_time_travel_snapshot: bool,
+    ) -> Result<usize> {
+        let was_auto = self.ensure_autocommit_txn_with_cx(execution_cx)?;
+        let previous_total_changes = *self.total_changes.borrow();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        self.txn_metrics_note_write();
+        let use_statement_savepoint = !was_auto
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !preserve_prior_changes_on_constraint_violation;
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint("insert", || {
+                self.execute_precompiled_prepared_insert_dispatch(
+                    execution_cx,
+                    stmt,
+                    table_name,
+                    post_write_action,
+                    params,
+                )
+            })
+        } else {
+            self.execute_precompiled_prepared_insert_dispatch(
+                execution_cx,
+                stmt,
+                table_name,
+                post_write_action,
+                params,
+            )
+        };
+        let result = match result {
+            Ok(affected) => Ok(affected),
+            Err(error) => {
+                self.restore_failed_statement_tracking(
+                    preserve_prior_changes_on_constraint_violation,
+                    &error,
+                    previous_total_changes,
+                    previous_last_insert_rowid,
                 );
+                match self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                }
             }
-        }
-        result.map(|(_, affected)| affected)
+        };
+        let commit_autocommit_on_error = was_auto
+            && preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            );
+        let ok = result.is_ok() || commit_autocommit_on_error;
+        self.resolve_autocommit_txn_with_capture_and_cx(
+            was_auto,
+            ok,
+            capture_time_travel_snapshot,
+            execution_cx,
+        )?;
+        result
     }
 
     fn execute_precompiled_prepared_insert_dispatch(
@@ -5185,9 +5554,9 @@ impl Connection {
         table_name: &str,
         post_write_action: PreparedInsertPostWriteAction,
         params: Option<&[SqliteValue]>,
-    ) -> Result<(Vec<Row>, usize)> {
-        let (rows, affected, last_insert_rowid) =
-            stmt.execute_table_program_with_reuse(execution_cx, params, true)?;
+    ) -> Result<usize> {
+        let (affected, last_insert_rowid) =
+            stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)?;
         match post_write_action {
             PreparedInsertPostWriteAction::None => {}
             PreparedInsertPostWriteAction::RefreshSqliteSequenceCache => {
@@ -5202,7 +5571,237 @@ impl Connection {
             }
         }
         self.record_statement_changes(affected);
-        Ok((rows, affected))
+        Ok(affected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_precompiled_prepared_update_or_delete(
+        &self,
+        execution_cx: &Cx,
+        stmt: &PreparedStatement<'_>,
+        kind: PreparedDmlKind,
+        rollback_on_constraint_violation: bool,
+        preserve_prior_changes_on_constraint_violation: bool,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        self.clear_table_program_error_state();
+        self.sync_change_tracking_context();
+        let statement_trace_enabled =
+            tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG);
+        let statement_reuse_enabled =
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
+        let trace_registration = {
+            let trace_registration = self.trace_registration.borrow();
+            let compat_trace_stmt_enabled = trace_registration
+                .as_ref()
+                .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
+            let compat_trace_profile_enabled = trace_registration
+                .as_ref()
+                .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
+            if !statement_trace_enabled
+                && !compat_trace_stmt_enabled
+                && !compat_trace_profile_enabled
+                && !statement_reuse_enabled
+            {
+                if hot_path_profile_enabled() {
+                    FSQLITE_PREPARED_UPDATE_DELETE_FAST_LANE_HITS
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                return self.execute_precompiled_prepared_update_or_delete_fast(
+                    execution_cx,
+                    stmt,
+                    kind,
+                    rollback_on_constraint_violation,
+                    preserve_prior_changes_on_constraint_violation,
+                    params,
+                );
+            }
+            trace_registration.clone()
+        };
+        if hot_path_profile_enabled() {
+            FSQLITE_PREPARED_UPDATE_DELETE_INSTRUMENTED_LANE_HITS
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let trace_id = statement_trace_enabled.then(next_trace_id).unwrap_or(0);
+        let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
+        let compat_trace_stmt_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
+        let compat_trace_profile_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
+        let compat_trace_sql =
+            (compat_trace_stmt_enabled || compat_trace_profile_enabled).then(|| stmt.sql.clone());
+        let statement_span = statement_trace_enabled.then(|| {
+            let span = tracing::span!(
+                target: "fsqlite.statement",
+                tracing::Level::DEBUG,
+                "statement",
+                trace_id,
+                decision_id,
+                statement_kind = kind.statement_kind()
+            );
+            record_trace_span_created();
+            span
+        });
+        let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
+        if compat_trace_stmt_enabled {
+            emit_compat_trace_event(
+                trace_registration.as_ref(),
+                TraceEvent::Statement {
+                    sql: compat_trace_sql.clone().unwrap_or_else(|| stmt.sql.clone()),
+                },
+            );
+        }
+        let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
+            .then(fsqlite_types::sync_primitives::Instant::now);
+        let was_auto = self.ensure_autocommit_txn_with_cx(execution_cx)?;
+        let previous_total_changes = *self.total_changes.borrow();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        self.txn_metrics_note_write();
+        let use_statement_savepoint = !was_auto
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !preserve_prior_changes_on_constraint_violation;
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint(kind.statement_kind(), || {
+                self.execute_precompiled_prepared_update_or_delete_dispatch(
+                    execution_cx,
+                    stmt,
+                    params,
+                )
+            })
+        } else {
+            self.execute_precompiled_prepared_update_or_delete_dispatch(execution_cx, stmt, params)
+        };
+        let result = match result {
+            Ok(affected) => Ok(affected),
+            Err(error) => {
+                self.restore_failed_statement_tracking(
+                    preserve_prior_changes_on_constraint_violation,
+                    &error,
+                    previous_total_changes,
+                    previous_last_insert_rowid,
+                );
+                match self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                }
+            }
+        };
+        let commit_autocommit_on_error = was_auto
+            && preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            );
+        let ok = result.is_ok() || commit_autocommit_on_error;
+        self.resolve_autocommit_txn_with_capture_and_cx(was_auto, ok, false, execution_cx)?;
+        if statement_reuse_enabled || compat_trace_profile_enabled {
+            let elapsed_ns = execution_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            if statement_reuse_enabled {
+                let failure_diag = match result.as_ref() {
+                    Ok(_) => Cow::Borrowed("none"),
+                    Err(error) => Cow::Owned(error.to_string()),
+                };
+                self.log_statement_reuse_event(
+                    "execution",
+                    &stmt.sql,
+                    true,
+                    if ok { "none" } else { "execution_error" },
+                    0,
+                    elapsed_ns,
+                    failure_diag.as_ref(),
+                );
+            }
+            if compat_trace_profile_enabled {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Profile {
+                        sql: compat_trace_sql.unwrap_or_else(|| stmt.sql.clone()),
+                        elapsed_ns,
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_precompiled_prepared_update_or_delete_fast(
+        &self,
+        execution_cx: &Cx,
+        stmt: &PreparedStatement<'_>,
+        kind: PreparedDmlKind,
+        rollback_on_constraint_violation: bool,
+        preserve_prior_changes_on_constraint_violation: bool,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        let was_auto = self.ensure_autocommit_txn_with_cx(execution_cx)?;
+        let previous_total_changes = *self.total_changes.borrow();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        self.txn_metrics_note_write();
+        let use_statement_savepoint = !was_auto
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !preserve_prior_changes_on_constraint_violation;
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint(kind.statement_kind(), || {
+                self.execute_precompiled_prepared_update_or_delete_dispatch(
+                    execution_cx,
+                    stmt,
+                    params,
+                )
+            })
+        } else {
+            self.execute_precompiled_prepared_update_or_delete_dispatch(execution_cx, stmt, params)
+        };
+        let result = match result {
+            Ok(affected) => Ok(affected),
+            Err(error) => {
+                self.restore_failed_statement_tracking(
+                    preserve_prior_changes_on_constraint_violation,
+                    &error,
+                    previous_total_changes,
+                    previous_last_insert_rowid,
+                );
+                match self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                }
+            }
+        };
+        let commit_autocommit_on_error = was_auto
+            && preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            );
+        let ok = result.is_ok() || commit_autocommit_on_error;
+        self.resolve_autocommit_txn_with_capture_and_cx(was_auto, ok, false, execution_cx)?;
+        result
+    }
+
+    fn execute_precompiled_prepared_update_or_delete_dispatch(
+        &self,
+        execution_cx: &Cx,
+        stmt: &PreparedStatement<'_>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        let (affected, _) =
+            stmt.execute_table_program_dml_with_reuse(execution_cx, params, false)?;
+        self.record_statement_changes(affected);
+        Ok(affected)
     }
 
     // ── Parse cache helpers (br-legjy.7.3) ─────────────────────────────
@@ -5329,6 +5928,7 @@ impl Connection {
         if cached_cookie != current_cookie {
             self.parse_cache.borrow_mut().clear();
             self.compiled_cache.borrow_mut().clear();
+            self.prepared_cache.borrow_mut().clear();
             self.table_execution_metadata_cache.borrow_mut().take();
             *self.parse_cache_cookie.borrow_mut() = current_cookie;
             self.log_statement_reuse_event(
@@ -5368,6 +5968,31 @@ impl Connection {
         entry
     }
 
+    fn lookup_prepared_cache(&self, key: u64, sql: &str) -> Option<Arc<PreparedCacheEntry>> {
+        let mut cache = self.prepared_cache.borrow_mut();
+        let entry = cache.get(&key)?;
+        if entry.sql == sql {
+            Some(Arc::clone(entry))
+        } else {
+            None
+        }
+    }
+
+    fn insert_prepared_cache(
+        &self,
+        key: u64,
+        sql: &str,
+        stmt: &PreparedStatement<'_>,
+    ) -> Arc<PreparedCacheEntry> {
+        let mut cache = self.prepared_cache.borrow_mut();
+        let entry = Arc::new(PreparedCacheEntry {
+            sql: sql.to_owned(),
+            template: PreparedStatementTemplate::from_statement(stmt),
+        });
+        cache.put(key, Arc::clone(&entry));
+        entry
+    }
+
     // ── bd-1dp9.6.7.2.2: Schema-scoped compiled cache ─────────────────
 
     /// Look up a cached compiled VdbeProgram by SQL hash.
@@ -5386,8 +6011,18 @@ impl Connection {
     fn invalidate_compiled_cache(&self, sql: &str) {
         let key = Self::sql_hash(sql);
         let mut cache = self.compiled_cache.borrow_mut();
-        if cache.peek(&key).is_some_and(|e| e.sql == sql) {
+        let compiled_removed = cache.peek(&key).is_some_and(|e| e.sql == sql);
+        if compiled_removed {
             cache.pop(&key);
+        }
+        drop(cache);
+
+        let mut prepared_cache = self.prepared_cache.borrow_mut();
+        let prepared_removed = prepared_cache.peek(&key).is_some_and(|e| e.sql == sql);
+        if prepared_removed {
+            prepared_cache.pop(&key);
+        }
+        if compiled_removed || prepared_removed {
             self.log_statement_reuse_event(
                 "compiled",
                 sql,
@@ -7812,6 +8447,9 @@ impl Connection {
         if is_fts5_optimize_noop_insert(insert) {
             return false;
         }
+        if !insert.returning.is_empty() {
+            return false;
+        }
 
         let table_name = insert.table.name.as_str();
         let insert_event = fsqlite_ast::TriggerEvent::Insert;
@@ -7879,6 +8517,133 @@ impl Connection {
                 .where_clause
                 .as_ref()
                 .is_some_and(expr_contains_rewritable_subquery)
+    }
+
+    fn table_is_foreign_key_parent(&self, table_name: &str) -> bool {
+        self.schema.borrow().iter().any(|table| {
+            table
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.parent_table.eq_ignore_ascii_case(table_name))
+        })
+    }
+
+    fn table_has_foreign_key_work(&self, table_name: &str) -> bool {
+        let schema = self.schema.borrow();
+        let has_outbound_foreign_keys = schema.iter().any(|table| {
+            table.name.eq_ignore_ascii_case(table_name) && !table.foreign_keys.is_empty()
+        });
+        has_outbound_foreign_keys
+            || schema.iter().any(|table| {
+                table
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_table.eq_ignore_ascii_case(table_name))
+            })
+    }
+
+    fn prepared_update_supports_direct_dispatch_now(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> bool {
+        let table_name = update.table.name.name.as_str();
+        if !update.returning.is_empty() {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Returning);
+            return false;
+        }
+        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
+            record_prepared_update_delete_fallback(
+                PreparedUpdateDeleteFallbackReason::SqliteSequence,
+            );
+            return false;
+        }
+        if self.table_declares_without_rowid(table_name) {
+            record_prepared_update_delete_fallback(
+                PreparedUpdateDeleteFallbackReason::WithoutRowid,
+            );
+            return false;
+        }
+        if self.has_live_vtab_instance(table_name) {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::LiveVtab);
+            return false;
+        }
+
+        let update_cols: Vec<String> = update
+            .assignments
+            .iter()
+            .flat_map(|assignment| match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => vec![column.clone()],
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.clone(),
+            })
+            .collect();
+        let update_event = fsqlite_ast::TriggerEvent::Update(update_cols);
+        if self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::Before,
+            &update_event,
+        ) || self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::After,
+            &update_event,
+        ) {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Trigger);
+            return false;
+        }
+
+        if self.fk_cascade_propagation_enabled() && self.table_has_foreign_key_work(table_name) {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::ForeignKey);
+            return false;
+        }
+
+        true
+    }
+
+    fn prepared_delete_supports_direct_dispatch_now(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> bool {
+        let table_name = delete.table.name.name.as_str();
+        if !delete.returning.is_empty() {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Returning);
+            return false;
+        }
+        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
+            record_prepared_update_delete_fallback(
+                PreparedUpdateDeleteFallbackReason::SqliteSequence,
+            );
+            return false;
+        }
+        if self.table_declares_without_rowid(table_name) {
+            record_prepared_update_delete_fallback(
+                PreparedUpdateDeleteFallbackReason::WithoutRowid,
+            );
+            return false;
+        }
+        if self.has_live_vtab_instance(table_name) {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::LiveVtab);
+            return false;
+        }
+
+        let delete_event = fsqlite_ast::TriggerEvent::Delete;
+        if self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::Before,
+            &delete_event,
+        ) || self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::After,
+            &delete_event,
+        ) {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Trigger);
+            return false;
+        }
+
+        if self.fk_cascade_propagation_enabled() && self.table_is_foreign_key_parent(table_name) {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::ForeignKey);
+            return false;
+        }
+
+        true
     }
 
     fn insert_runtime_requirements(
@@ -9850,6 +10615,29 @@ impl Connection {
         }
         let is_concurrent = mode == TransactionMode::Concurrent;
 
+        // Persistent write transaction reuse: if we have a cached write
+        // transaction from a prior :memory: autocommit write, reuse it.
+        // The transaction was committed via commit_and_retain() — its write-set
+        // is cleared but the pager writer state remains active, so we skip
+        // pager.begin() + Mutex lock entirely.
+        if self.pager.is_memory()
+            && mode != TransactionMode::ReadOnly
+            && self.cached_write_txn.borrow().is_some()
+            && self.cached_write_txn_cookie.get() == *self.schema_cookie.borrow()
+        {
+            // Invalidate any stale read snapshot first.
+            self.invalidate_cached_read_snapshot(cx);
+            let txn = self.cached_write_txn.borrow_mut().take().unwrap();
+            *self.active_txn.borrow_mut() = Some(txn);
+            *self.concurrent_txn.borrow_mut() = false;
+            *self.concurrent_session_id.borrow_mut() = None;
+            self.txn_metrics_mark_started();
+            return Ok(true);
+        }
+
+        // Discard stale cached write transaction if present.
+        self.invalidate_cached_write_txn(cx);
+
         // Persistent read-only snapshot reuse: if we have a cached read-only
         // pager transaction from a prior autocommit SELECT, reuse it instead
         // of creating a new one.  This eliminates per-statement begin/commit
@@ -9970,6 +10758,15 @@ impl Connection {
     fn invalidate_cached_read_snapshot(&self, cx: &Cx) {
         if let Some(mut txn) = self.cached_read_snapshot.borrow_mut().take() {
             let _ = txn.rollback(cx);
+        }
+    }
+
+    /// Discard the cached write transaction, committing it properly.
+    fn invalidate_cached_write_txn(&self, cx: &Cx) {
+        if let Some(mut txn) = self.cached_write_txn.borrow_mut().take() {
+            // The retained transaction has already committed its write-set.
+            // We need to finalize it properly (release writer state in pager).
+            let _ = txn.commit(cx);
         }
     }
 
@@ -10116,6 +10913,43 @@ impl Connection {
             } else {
                 None
             };
+            // :memory: autocommit write fast path: commit_and_retain parks the
+            // transaction for reuse, avoiding pager.begin() Mutex on the next stmt.
+            if self.pager.is_memory()
+                && !is_concurrent_txn
+                && txn_has_pending_writes
+                && concurrent_plan.is_none()
+                && self.live_vtab_transactions.borrow().is_empty()
+            {
+                match txn.commit_and_retain(cx) {
+                    Ok(true) => {
+                        // Park the retained transaction for the next autocommit.
+                        let cookie = *self.schema_cookie.borrow();
+                        // Discard any stale cached write transaction.
+                        if let Some(mut old) = self.cached_write_txn.borrow_mut().take() {
+                            let _ = old.commit(cx);
+                        }
+                        *self.cached_write_txn.borrow_mut() = Some(txn);
+                        self.cached_write_txn_cookie.set(cookie);
+                        *self.concurrent_txn.borrow_mut() = false;
+                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.txn_metrics_mark_finished();
+                        // Invalidate read snapshot — it's stale after a write.
+                        self.invalidate_cached_read_snapshot(cx);
+                        return Ok(());
+                    }
+                    Ok(false) => {} // Not retained — fall through to normal commit
+                    Err(e) => {
+                        self.txn_metrics_note_rollback();
+                        let _ = txn.rollback(cx);
+                        *self.concurrent_txn.borrow_mut() = false;
+                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.txn_metrics_mark_finished();
+                        return Err(e);
+                    }
+                }
+            }
+
             match txn.commit(cx) {
                 Ok(()) => {
                     if txn_has_pending_writes {
@@ -14170,6 +15004,7 @@ impl Connection {
             // compiled cache so the inner query recompiles with the
             // current root_page.
             self.compiled_cache.borrow_mut().clear();
+            self.prepared_cache.borrow_mut().clear();
 
             // Route through connection-level interpreted paths that read from
             // MemDatabase rather than the full dispatch chain (which reaches
@@ -14380,10 +15215,11 @@ impl Connection {
             ));
         }
 
-        // Invalidate cached read snapshot — explicit BEGIN starts a fresh txn.
+        // Invalidate cached snapshots — explicit BEGIN starts a fresh txn.
         {
             let cx = self.op_cx()?;
             self.invalidate_cached_read_snapshot(&cx);
+            self.invalidate_cached_write_txn(&cx);
         }
 
         // Determine effective mode: explicit mode wins; if absent, promote to
@@ -15372,8 +16208,9 @@ impl Connection {
         // If no explicit transaction, implicitly begin one.
         let started_implicit_txn = !*self.in_transaction.borrow();
         if started_implicit_txn {
-            // Discard cached read snapshot — implicit transaction starts fresh.
+            // Discard cached snapshots — implicit transaction starts fresh.
             self.invalidate_cached_read_snapshot(&cx);
+            self.invalidate_cached_write_txn(&cx);
             let is_concurrent = *self.concurrent_mode_default.borrow();
             let pager_mode = if is_concurrent {
                 TransactionMode::Concurrent
@@ -22354,6 +23191,7 @@ impl Connection {
             // the compile cache so that any cached programs referencing old
             // root pages for the same table name are not reused.
             self.compiled_cache.borrow_mut().clear();
+            self.prepared_cache.borrow_mut().clear();
             let mut stripped = select.clone();
             stripped.with = None;
             self.execute_statement(&Statement::Select(stripped), params)
@@ -22376,6 +23214,7 @@ impl Connection {
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_names)?;
             self.compiled_cache.borrow_mut().clear();
+            self.prepared_cache.borrow_mut().clear();
             let mut stripped = delete.clone();
             stripped.with = None;
             self.execute_statement(&Statement::Delete(stripped), params)
@@ -22398,6 +23237,7 @@ impl Connection {
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(update.with.as_ref(), params, &mut temp_names)?;
             self.compiled_cache.borrow_mut().clear();
+            self.prepared_cache.borrow_mut().clear();
             let mut stripped = update.clone();
             stripped.with = None;
             self.execute_statement(&Statement::Update(stripped), params)
@@ -23926,6 +24766,8 @@ impl Connection {
             reject_mem,
             Some(Arc::clone(&self.version_store)),
             PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
+            true,
+            false,
             cached_engine,
         );
         // Park the engine for reuse by the next statement.
@@ -24024,11 +24866,13 @@ impl Connection {
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
         self.compiled_cache.borrow_mut().clear();
+        self.prepared_cache.borrow_mut().clear();
         self.table_execution_metadata_cache.borrow_mut().take();
-        // Invalidate cached read snapshot — DDL changed schema.
+        // Invalidate cached snapshots — DDL changed schema.
         let cx_result = self.op_cx();
         if let Ok(cx) = cx_result {
             self.invalidate_cached_read_snapshot(&cx);
+            self.invalidate_cached_write_txn(&cx);
         }
         Ok(())
     }
@@ -31981,6 +32825,8 @@ fn execute_table_program_with_db(
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
     page_size: PageSize,
+    collect_rows: bool,
+    prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
 ) -> (TableProgramExecOutcome, Option<VdbeEngine>) {
     let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
@@ -31997,6 +32843,14 @@ fn execute_table_program_with_db(
     let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
     // Reuse a cached engine if available (avoids 21+ collection allocations).
     // If no cached engine exists, create a fresh one.
+    let reusing_engine = cached_engine.is_some();
+    if prepared_engine_reuse_profile && hot_path_profile_enabled() {
+        if reusing_engine {
+            FSQLITE_PREPARED_TABLE_ENGINE_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
     let mut engine = if let Some(mut cached) = cached_engine {
         cached.reset_for_reuse(program.register_count(), execution_cx, page_size);
         cached
@@ -32028,6 +32882,7 @@ fn execute_table_program_with_db(
     engine.set_shared_table_column_count_by_root_page(table_column_count_by_root_page);
     engine.set_shared_column_defaults_by_root_page(column_defaults_by_root_page);
     engine.set_shared_index_desc_flags_by_root_page(index_desc_flags_by_root_page);
+    engine.set_collect_result_rows(collect_rows);
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
     // Time-travel support: pass the MVCC version store so SetSnapshot can
@@ -32098,17 +32953,23 @@ fn execute_table_program_with_db(
 
     let changes = engine.changes();
     let result = match exec_res {
-        Ok(ExecOutcome::Done) => Ok((
-            engine
-                .take_results()
-                .into_iter()
-                .map(|values| Row {
-                    values: values.into_vec(),
-                })
-                .collect(),
-            changes,
-            engine_rowid,
-        )),
+        Ok(ExecOutcome::Done) => {
+            if !collect_rows && hot_path_profile_enabled() {
+                FSQLITE_PREPARED_TABLE_DML_AFFECTED_ONLY_RUNS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let rows = if collect_rows {
+                engine
+                    .take_results()
+                    .into_iter()
+                    .map(|values| Row {
+                        values: values.into_vec(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok((rows, changes, engine_rowid))
+        }
         Ok(ExecOutcome::Error { code, message }) => Err(TableProgramExecError {
             error: FrankenError::Internal(format!("VDBE halted with code {code}: {message}",)),
             changes,
@@ -65971,6 +66832,70 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepare_reuses_prepared_template_without_second_parse_or_compile() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_template_cache (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let sql = "SELECT val FROM prep_template_cache WHERE id = ?1";
+        let stmt1 = conn.prepare(sql).unwrap();
+        let stmt2 = conn.prepare(sql).unwrap();
+        let profile = hot_path_profile_snapshot();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&stmt1.program, &stmt2.program),
+            "prepared cache should reuse the same compiled program"
+        );
+        assert_eq!(
+            profile.parser.prepared_cache_misses, 1,
+            "first prepare should populate the prepared cache: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.prepared_cache_hits, 1,
+            "second prepare should hit the prepared cache: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.rewrite_calls, 1,
+            "prepared cache hit should skip a second rewrite pass: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.compiled_cache_misses, 1,
+            "only the first prepare should compile the statement: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.compiled_cache_hits, 0,
+            "prepared cache hit should bypass the compiled-program cache entirely: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepared_cache_invalidated_by_ddl() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_cache_ddl (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT val FROM prep_cache_ddl WHERE id = ?1")
+            .unwrap();
+        assert!(
+            stmt.db.is_some(),
+            "table-backed SELECT should produce a cacheable prepared template"
+        );
+        assert!(
+            !conn.prepared_cache.borrow().is_empty(),
+            "prepare should populate the prepared cache"
+        );
+
+        conn.execute("ALTER TABLE prep_cache_ddl ADD COLUMN extra TEXT;")
+            .unwrap();
+        assert!(
+            conn.prepared_cache.borrow().is_empty(),
+            "DDL must clear the prepared cache"
+        );
+    }
+
+    #[test]
     fn test_prepared_simple_insert_prepare_reuses_compiled_program() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_ins_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -66556,7 +67481,7 @@ mod pager_routing_tests {
             .prepare("INSERT INTO prep_engine_reuse (id, val) VALUES (?1, ?2)")
             .unwrap();
 
-        reset_hot_path_profile();
+        reset_statement_reuse_measurement(&conn);
         for id in 1_i64..=2 {
             let affected = insert_stmt
                 .execute_with_params(&[
@@ -66577,6 +67502,18 @@ mod pager_routing_tests {
             "prepared table engine should be reused on the second execution: {profile:?}"
         );
         assert_eq!(
+            profile.prepared_insert_fast_lane_hits, 2,
+            "ordinary prepared inserts should stay on the slim fast lane when tracing is off: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_insert_instrumented_lane_hits, 0,
+            "ordinary prepared inserts should avoid the instrumented lane when tracing is off: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_dml_affected_only_runs, 2,
+            "ordinary prepared inserts should use the affected-only VDBE handoff: {profile:?}"
+        );
+        assert_eq!(
             profile.autoincrement_sequence_fast_path_updates, 0,
             "ordinary prepared inserts should skip AUTOINCREMENT follow-up work: {profile:?}"
         );
@@ -66584,6 +67521,222 @@ mod pager_routing_tests {
             profile.autoincrement_sequence_scan_refreshes, 0,
             "ordinary prepared inserts should skip sqlite_sequence scan refreshes: {profile:?}"
         );
+    }
+
+    #[test]
+    fn test_prepared_update_reuses_table_engine_after_first_execution() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_update_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_update_engine_reuse VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("UPDATE prep_update_engine_reuse SET val = ?1 WHERE id = ?2")
+            .unwrap();
+
+        reset_statement_reuse_measurement(&conn);
+        let first = stmt
+            .execute_with_params(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)])
+            .unwrap();
+        let second = stmt
+            .execute_with_params(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_table_engine_fresh_allocs, 1,
+            "prepared UPDATE should allocate the table engine once on first execution: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_engine_reuses, 1,
+            "prepared UPDATE should reuse the table engine on the second execution: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_fast_lane_hits, 2,
+            "simple prepared UPDATE should stay on the update/delete fast lane: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_instrumented_lane_hits, 0,
+            "simple prepared UPDATE should avoid the instrumented lane when tracing is off: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_dml_affected_only_runs, 2,
+            "simple prepared UPDATE should use the affected-only VDBE handoff: {profile:?}"
+        );
+
+        let rows = conn
+            .query("SELECT val FROM prep_update_engine_reuse ORDER BY id")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_prepared_delete_reuses_table_engine_after_first_execution() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_delete_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_delete_engine_reuse VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("DELETE FROM prep_delete_engine_reuse WHERE id = ?1")
+            .unwrap();
+
+        reset_statement_reuse_measurement(&conn);
+        let first = stmt
+            .execute_with_params(&[SqliteValue::Integer(1)])
+            .unwrap();
+        let second = stmt
+            .execute_with_params(&[SqliteValue::Integer(3)])
+            .unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_table_engine_fresh_allocs, 1,
+            "prepared DELETE should allocate the table engine once on first execution: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_engine_reuses, 1,
+            "prepared DELETE should reuse the table engine on the second execution: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_fast_lane_hits, 2,
+            "simple prepared DELETE should stay on the update/delete fast lane: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_instrumented_lane_hits, 0,
+            "simple prepared DELETE should avoid the instrumented lane when tracing is off: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_dml_affected_only_runs, 2,
+            "simple prepared DELETE should use the affected-only VDBE handoff: {profile:?}"
+        );
+
+        let rows = conn
+            .query("SELECT id FROM prep_delete_engine_reuse ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_prepared_update_trigger_path_skips_direct_dispatch() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_update_trigger_base (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE prep_update_trigger_log (id INTEGER PRIMARY KEY, seen TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_update_trigger_base VALUES (1, 'old');")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER prep_update_trigger AFTER UPDATE ON prep_update_trigger_base
+             BEGIN
+                 INSERT INTO prep_update_trigger_log VALUES (NEW.id, NEW.val);
+             END;",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare("UPDATE prep_update_trigger_base SET val = ?1 WHERE id = ?2")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Text("new".into()), SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_update_delete_fast_lane_hits, 0,
+            "trigger-bearing UPDATE must stay off the direct-dispatch fast lane: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_instrumented_lane_hits, 0,
+            "trigger-bearing UPDATE should stay on the generic dispatcher, not the instrumented fast lane: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_dml_affected_only_runs, 0,
+            "trigger-bearing UPDATE must not skip generic trigger handling: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_fallback_trigger, 1,
+            "trigger-bearing UPDATE should attribute the generic fallback to trigger handling: {profile:?}"
+        );
+
+        let rows = conn
+            .query("SELECT seen FROM prep_update_trigger_log ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".into()));
+    }
+
+    #[test]
+    fn test_prepared_delete_fk_parent_path_skips_direct_dispatch() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE prep_delete_parent (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE prep_delete_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES prep_delete_parent(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO prep_delete_parent VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+        conn.execute("INSERT INTO prep_delete_child VALUES (10, 1), (11, 2);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("DELETE FROM prep_delete_parent WHERE id = ?1")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_update_delete_fast_lane_hits, 0,
+            "DELETE on an FK parent must stay off the direct-dispatch fast lane: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_instrumented_lane_hits, 0,
+            "DELETE on an FK parent should stay on the generic dispatcher, not the instrumented fast lane: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_dml_affected_only_runs, 0,
+            "DELETE on an FK parent must not skip generic cascade handling: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_update_delete_fallback_foreign_key, 1,
+            "DELETE on an FK parent should attribute the generic fallback to foreign-key work: {profile:?}"
+        );
+
+        let parent_rows = conn
+            .query("SELECT id FROM prep_delete_parent ORDER BY id")
+            .unwrap();
+        assert_eq!(parent_rows.len(), 1);
+        assert_eq!(parent_rows[0].values()[0], SqliteValue::Integer(2));
+        let child_rows = conn
+            .query("SELECT id FROM prep_delete_child ORDER BY id")
+            .unwrap();
+        assert_eq!(child_rows.len(), 1);
+        assert_eq!(child_rows[0].values()[0], SqliteValue::Integer(11));
     }
 
     #[test]
@@ -66855,14 +68008,20 @@ mod pager_routing_tests {
     use proptest::{prop_assert, prop_assert_eq};
 
     #[cfg(test)]
-    struct StatementReuseHotPathProfileGuard;
+    struct StatementReuseHotPathProfileGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     #[cfg(test)]
     impl StatementReuseHotPathProfileGuard {
         fn new() -> Self {
+            static HOT_PATH_PROFILE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+                std::sync::OnceLock::new();
+            let lock = HOT_PATH_PROFILE_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+            let guard = lock_unpoisoned(lock);
             reset_hot_path_profile();
             set_hot_path_profile_enabled(true);
-            Self
+            Self { _lock: guard }
         }
     }
 
@@ -66872,6 +68031,12 @@ mod pager_routing_tests {
             set_hot_path_profile_enabled(false);
             reset_hot_path_profile();
         }
+    }
+
+    #[cfg(test)]
+    fn reset_statement_reuse_measurement(conn: &Connection) {
+        reset_hot_path_profile();
+        *conn.cached_vdbe_engine.borrow_mut() = None;
     }
 
     #[cfg(test)]
@@ -67604,6 +68769,71 @@ mod pager_routing_tests {
             conn.compiled_cache_len(),
             0,
             "window registration must clear compiled cache"
+        );
+    }
+
+    #[test]
+    fn test_prepared_cache_hit_uses_current_scalar_function_registry() {
+        use fsqlite_func::ScalarFunction;
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+
+        struct Double;
+
+        impl ScalarFunction for Double {
+            fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+                Ok(SqliteValue::Integer(args[0].to_integer() * 2))
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                "scale1"
+            }
+        }
+
+        struct Triple;
+
+        impl ScalarFunction for Triple {
+            fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+                Ok(SqliteValue::Integer(args[0].to_integer() * 3))
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                "scale1"
+            }
+        }
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_scalar_function(Double);
+
+        let stmt1 = conn.prepare("SELECT scale1(?1);").unwrap();
+        let row1 = stmt1
+            .query_row_with_params(&[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(row1.values()[0], SqliteValue::Integer(4));
+
+        conn.register_scalar_function(Triple);
+
+        let stmt2 = conn.prepare("SELECT scale1(?1);").unwrap();
+        let row2 = stmt2
+            .query_row_with_params(&[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(row2.values()[0], SqliteValue::Integer(6));
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.parser.prepared_cache_hits, 1,
+            "scalar re-registration should still allow a prepared-cache hit: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.prepared_cache_misses, 1,
+            "only the first prepare should miss the prepared cache: {profile:?}"
         );
     }
 

@@ -494,6 +494,26 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// (via `FrankenError::Busy`) on serialization failure.
     fn commit(&mut self, cx: &Cx) -> Result<()>;
 
+    /// Commit dirty pages and reset for immediate reuse without destroying
+    /// the transaction handle.
+    ///
+    /// This is a performance optimization for `:memory:` autocommit: instead
+    /// of commit + destroy + begin, we commit the write set and clear it for
+    /// the next statement while keeping the transaction alive.  The pager's
+    /// `writer_active` and `active_transactions` state remain set, avoiding
+    /// a full begin/commit ceremony on the next statement.
+    ///
+    /// Returns `Ok(true)` if the transaction was retained and can be reused.
+    /// Returns `Ok(false)` if retention is not supported (falls back to
+    /// regular commit semantics — the caller should treat the transaction
+    /// as finished).
+    ///
+    /// Default implementation falls back to regular `commit`.
+    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
+        self.commit(cx)?;
+        Ok(false)
+    }
+
     /// Whether this transaction has been upgraded to a writer.
     ///
     /// Read-only and deferred transactions that never dirtied a page must

@@ -2461,6 +2461,13 @@ struct StorageCursor {
     decoded_mask: u64,
     /// Cache the cursor's physical position to avoid redundant payload reads.
     last_position_stamp: Option<(u32, u16)>,
+    /// Last rowid successfully inserted via this cursor (bd-p666i).
+    ///
+    /// When the next INSERT has a rowid strictly greater than this value,
+    /// the B-tree seek can be skipped — the cursor can use `table_last()`
+    /// which is O(1) when already positioned at the rightmost leaf.
+    /// This matches C SQLite's `BTREE_APPEND` fast-path.
+    last_successful_insert_rowid: Option<i64>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -4003,6 +4010,9 @@ pub struct VdbeEngine {
     /// Reusable buffer for `MakeRecord` serialization.
     /// Avoids allocating a new `Vec<u8>` for every row during INSERT/UPDATE.
     make_record_buf: Vec<u8>,
+    /// Whether `OP_ResultRow` should materialize and retain result rows.
+    /// DML-only execution lanes can disable this to avoid row-buffer work.
+    collect_result_rows: bool,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -4372,6 +4382,7 @@ impl VdbeEngine {
             register_subtypes: HashMap::new(),
             bloom_filters: HashMap::new(),
             make_record_buf: Vec::new(),
+            collect_result_rows: true,
         }
     }
 
@@ -4433,6 +4444,7 @@ impl VdbeEngine {
         self.register_subtypes.clear();
         self.bloom_filters.clear();
         self.make_record_buf.clear();
+        self.collect_result_rows = true;
     }
 
     /// Returns the number of rows modified (inserted, deleted, or updated).
@@ -4445,6 +4457,11 @@ impl VdbeEngine {
     pub fn last_insert_rowid(&self) -> Option<i64> {
         self.last_insert_rowid_valid
             .then_some(self.last_insert_rowid)
+    }
+
+    /// Enable or disable `OP_ResultRow` materialization.
+    pub fn set_collect_result_rows(&mut self, collect_result_rows: bool) {
+        self.collect_result_rows = collect_result_rows;
     }
 
     /// Returns the time-travel marker for a cursor, if any.
@@ -5280,6 +5297,7 @@ impl VdbeEngine {
                             header_offsets: Vec::new(),
                             decoded_mask: 0,
                             last_position_stamp: None,
+                            last_successful_insert_rowid: None,
                         },
                     );
                     tracing::info!(
@@ -5406,22 +5424,28 @@ impl VdbeEngine {
 
                 // ── Result Row ──────────────────────────────────────────
                 Opcode::ResultRow => {
-                    // Output p2 registers starting at p1.  Move values out of
-                    // the register file instead of cloning — the registers are
-                    // about to be overwritten on the next loop iteration.
-                    let materialize_start = collect_vdbe_metrics.then(Instant::now);
-                    let row = self.take_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
-                    if collect_vdbe_metrics {
-                        if let Some(materialize_start) = materialize_start {
-                            FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
-                                u64::try_from(materialize_start.elapsed().as_nanos())
-                                    .unwrap_or(u64::MAX),
-                                AtomicOrdering::Relaxed,
-                            );
+                    // Output p2 registers starting at p1. Move values out of
+                    // the register file instead of cloning. DML-only lanes can
+                    // discard the row entirely while preserving register-clearing
+                    // semantics.
+                    let count = usize::try_from(op.p2).unwrap_or(0);
+                    if self.collect_result_rows {
+                        let materialize_start = collect_vdbe_metrics.then(Instant::now);
+                        let row = self.take_reg_range(op.p1, count);
+                        if collect_vdbe_metrics {
+                            if let Some(materialize_start) = materialize_start {
+                                FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                                    u64::try_from(materialize_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX),
+                                    AtomicOrdering::Relaxed,
+                                );
+                            }
+                            record_result_row_metrics(&row);
                         }
-                        record_result_row_metrics(&row);
+                        self.results.push(row);
+                    } else {
+                        self.discard_reg_range(op.p1, count);
                     }
-                    self.results.push(row);
                     pc += 1;
                 }
 
@@ -5968,6 +5992,7 @@ impl VdbeEngine {
                                 header_offsets: Vec::new(),
                                 decoded_mask: 0,
                                 last_position_stamp: None,
+                                last_successful_insert_rowid: None,
                             },
                         );
                     }
@@ -6934,7 +6959,21 @@ impl VdbeEngine {
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
                             let blob = record_blob_bytes(&record_val);
-                            let exists = sc.cursor.table_move_to(&sc.cx, rowid)?.is_found();
+                            // bd-p666i: Append fast-path — if the new rowid
+                            // is strictly greater than the last successfully
+                            // inserted rowid on this cursor, the row cannot
+                            // already exist (B-tree keys are unique) and we
+                            // can skip the full B-tree seek.  This matches
+                            // C SQLite's BTREE_APPEND optimization.
+                            let exists = if !is_update
+                                && sc
+                                    .last_successful_insert_rowid
+                                    .is_some_and(|last| rowid > last)
+                            {
+                                false // Append: key is larger than anything in the table
+                            } else {
+                                sc.cursor.table_move_to(&sc.cx, rowid)?.is_found()
+                            };
 
                             if exists {
                                 // Match on the low OE_* bits directly — p5 is
@@ -6953,6 +6992,7 @@ impl VdbeEngine {
                                     )?;
                                     sc2.cursor.table_insert(&sc2.cx, rowid, blob)?;
                                     invalidate_storage_cursor_row_cache(sc2);
+                                    sc2.last_successful_insert_rowid = Some(rowid);
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
                                     // OE_IGNORE: Skip insert for conflicting row
@@ -6973,6 +7013,7 @@ impl VdbeEngine {
                                 // No conflict — insert normally
                                 sc.cursor.table_insert(&sc.cx, rowid, blob)?;
                                 invalidate_storage_cursor_row_cache(sc);
+                                sc.last_successful_insert_rowid = Some(rowid);
                                 actually_inserted = true;
                             }
                         }
@@ -9026,6 +9067,15 @@ impl VdbeEngine {
         row
     }
 
+    #[inline]
+    fn discard_reg_range(&mut self, start: i32, count: usize) {
+        for offset in 0..count {
+            if let Some(reg) = Self::reg_with_offset(start, offset) {
+                let _ = self.take_reg(reg);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn collect_reg_range_refs(&self, start: i32, count: usize) -> Vec<&SqliteValue> {
         let mut row = Vec::with_capacity(count);
@@ -9718,6 +9768,7 @@ impl VdbeEngine {
                         cx: txn_cx,
                         writable,
                         last_alloc_rowid: 0,
+                        last_successful_insert_rowid: None,
                         payload_buf: Vec::new(),
                         target_vals_buf: Vec::new(),
                         cur_vals_buf: Vec::new(),
@@ -9800,6 +9851,7 @@ impl VdbeEngine {
                         cx: txn_cx,
                         writable,
                         last_alloc_rowid: 0,
+                        last_successful_insert_rowid: None,
                         payload_buf: Vec::new(),
                         target_vals_buf: Vec::new(),
                         cur_vals_buf: Vec::new(),
@@ -9918,6 +9970,7 @@ impl VdbeEngine {
                 cx,
                 writable,
                 last_alloc_rowid: 0,
+                last_successful_insert_rowid: None,
                 payload_buf: Vec::new(),
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
@@ -11014,6 +11067,41 @@ mod tests {
             engine.result_buffer_capacity(),
             64,
             "taking results should preserve buffer capacity for the next execution"
+        );
+    }
+
+    #[test]
+    fn test_disabling_result_row_collection_still_clears_result_registers() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r1 = b.alloc_reg();
+        let r2 = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 7, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::IntCopy, r1, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_collect_result_rows(false);
+        let outcome = engine.execute(&program).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(
+            engine.results().is_empty(),
+            "rowless execution should not retain ResultRow payloads"
+        );
+        assert_eq!(
+            engine.get_reg(r1),
+            &SqliteValue::Null,
+            "discarded ResultRow should still clear its source registers"
+        );
+        assert_eq!(
+            engine.get_reg(r2),
+            &SqliteValue::Null,
+            "later ResultRow opcodes should observe the same cleared-register semantics"
         );
     }
 

@@ -45,13 +45,14 @@ use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
+#[cfg(test)]
+use fsqlite_e2e::perf_runner::HotPathConnectionCeremonyProfile;
 use fsqlite_e2e::perf_runner::{
     FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
-    HotPathArtifactProvenance, HotPathConnectionCeremonyProfile,
-    HotPathCounterCaptureManifestSummary, HotPathMicroarchitecturalContext, HotPathProfileReport,
-    build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
-    build_hot_path_subsystem_profile, profile_fsqlite_hot_path, render_hot_path_profile_markdown,
-    write_hot_path_profile_artifacts,
+    HotPathArtifactProvenance, HotPathCounterCaptureManifestSummary,
+    HotPathMicroarchitecturalContext, HotPathProfileReport, build_hot_path_actionable_ranking,
+    build_hot_path_opcode_profile, build_hot_path_subsystem_profile, profile_fsqlite_hot_path,
+    render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
@@ -5259,6 +5260,8 @@ mod tests {
                 rewrite_time_ns: 0,
                 compiled_cache_hits: 0,
                 compiled_cache_misses: 1,
+                prepared_cache_hits: 0,
+                prepared_cache_misses: 1,
                 compile_time_ns: 10,
             },
             record_decode: HotPathRecordDecodeProfile {
@@ -5343,6 +5346,17 @@ mod tests {
                 column_default_evaluation_passes: 0,
                 prepared_table_engine_fresh_allocs: 1,
                 prepared_table_engine_reuses: 2,
+                prepared_insert_fast_lane_hits: 0,
+                prepared_insert_instrumented_lane_hits: 0,
+                prepared_update_delete_fast_lane_hits: 0,
+                prepared_update_delete_instrumented_lane_hits: 0,
+                prepared_update_delete_fallback_returning: 0,
+                prepared_update_delete_fallback_sqlite_sequence: 0,
+                prepared_update_delete_fallback_without_rowid: 0,
+                prepared_update_delete_fallback_live_vtab: 0,
+                prepared_update_delete_fallback_trigger: 0,
+                prepared_update_delete_fallback_foreign_key: 0,
+                prepared_table_dml_affected_only_runs: 0,
                 autoincrement_sequence_fast_path_updates: 1,
                 autoincrement_sequence_scan_refreshes: 0,
             },

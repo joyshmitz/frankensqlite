@@ -2939,6 +2939,137 @@ where
         commit_result
     }
 
+    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
+        // Only supported for in-memory pagers where we can skip I/O.
+        if !self.vfs.is_memory() {
+            self.commit(cx)?;
+            return Ok(false);
+        }
+
+        // If not a writer or no pending writes, just commit normally.
+        if !self.is_writer || !self.has_pending_writes() {
+            self.commit(cx)?;
+            return Ok(false);
+        }
+
+        // Perform the full commit but don't release writer state.
+        // This is the same as commit() except we:
+        //  - Don't decrement active_transactions
+        //  - Don't set writer_active = false
+        //  - Don't set committed/finished = true
+        //  - Clear write_set for reuse instead
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        inner.freelist.append(&mut self.page_lease);
+
+        let committed_db_size = self.committed_db_size_with_inner(&inner);
+        let commit_result = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction cache lock poisoned"))?;
+            let freelist_dirty = self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            for page_no in self.freed_pages.drain(..) {
+                inner.freelist.push(page_no);
+            }
+            if freelist_dirty {
+                serialize_freelist_to_write_set(
+                    cx,
+                    &mut inner,
+                    &mut cache,
+                    &self.pool,
+                    &mut self.write_set,
+                    &mut self.write_pages_sorted,
+                    committed_db_size,
+                )?;
+            }
+
+            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            let must_write_page1 = if self.journal_mode == JournalMode::Wal {
+                wal_page1_plan.requires_page_one_rewrite()
+            } else {
+                true
+            };
+            if must_write_page1 {
+                let mut page1 = ensure_page_one_in_write_set(
+                    cx,
+                    &mut inner,
+                    &mut cache,
+                    &self.pool,
+                    &mut self.write_set,
+                )?;
+                if page1.len() >= DATABASE_HEADER_SIZE {
+                    let mut page_count_bytes = [0_u8; 4];
+                    page_count_bytes.copy_from_slice(&page1[28..32]);
+                    let existing_page_count = u32::from_be_bytes(page_count_bytes);
+                    let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
+                    page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                    if self.journal_mode != JournalMode::Wal
+                        || wal_page1_plan.requires_page_count_advance()
+                    {
+                        let new_db_size = committed_db_size.max(existing_page_count);
+                        page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                    }
+                    page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                }
+                insert_staged_page(
+                    &mut self.write_set,
+                    &mut self.write_pages_sorted,
+                    PageNumber::ONE,
+                    StagedPage::from_buf(page1),
+                );
+            }
+
+            if self.journal_mode == JournalMode::Wal {
+                drop(cache);
+                Self::commit_wal(cx, &mut inner, &self.write_set, &self.write_pages_sorted)
+            } else {
+                Self::commit_journal(
+                    cx,
+                    &self.vfs,
+                    &self.journal_path,
+                    &mut inner,
+                    &self.write_set,
+                    self.original_db_size,
+                )
+            }
+        };
+
+        if commit_result.is_ok() {
+            inner.db_size = committed_db_size;
+            inner.commit_seq = inner.commit_seq.next();
+            // NOTE: We intentionally do NOT decrement active_transactions or
+            // set writer_active=false — the transaction stays "active" for reuse.
+            let publish_update = PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            };
+            self.publish_committed_state(cx, publish_update);
+            drop(inner);
+
+            // Clear write set for reuse (no allocation — just clears existing maps).
+            self.write_set.clear();
+            self.write_pages_sorted.clear();
+            self.freed_pages.clear();
+            self.allocated_from_freelist.clear();
+            self.allocated_from_eof.clear();
+            self.savepoint_stack.clear();
+            self.original_db_size = committed_db_size;
+            self.published_visible_commit_seq = publish_update.visible_commit_seq;
+            // Transaction stays active — committed/finished remain false.
+            Ok(true)
+        } else {
+            drop(inner);
+            commit_result?;
+            unreachable!()
+        }
+    }
+
     fn is_writer(&self) -> bool {
         self.is_writer
     }
