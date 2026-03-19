@@ -163,7 +163,7 @@ rand = "0.8"
 hashbrown = { version = "0.14", features = ["serde"] }
 lru = "0.12"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-asupersync = { version = "0.2.8", path = "../asupersync" }
+asupersync = { version = "0.2.8", git = "https://github.com/Dicklesworthstone/asupersync", rev = "82cee07" }
 
 # Dev dependencies
 criterion = { version = "0.5", features = ["html_reports"] }
