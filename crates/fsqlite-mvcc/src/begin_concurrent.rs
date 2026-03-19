@@ -1533,16 +1533,51 @@ impl PreparedConcurrentCommit {
 }
 
 /// Snapshot of one active transaction used during SSI edge discovery.
+#[derive(Debug, Clone, Copy, Default)]
+struct HandleViewFlags(u8);
+
+impl HandleViewFlags {
+    const ACTIVE: u8 = 1 << 0;
+    const GLOBAL_READ_WITNESSES: u8 = 1 << 1;
+    const GLOBAL_WRITE_WITNESSES: u8 = 1 << 2;
+
+    fn from_handle(handle: &ConcurrentHandle) -> Self {
+        let mut bits = 0;
+        if handle.is_active() {
+            bits |= Self::ACTIVE;
+        }
+        if handle.has_global_read_witnesses() {
+            bits |= Self::GLOBAL_READ_WITNESSES;
+        }
+        if handle.has_global_write_witnesses() {
+            bits |= Self::GLOBAL_WRITE_WITNESSES;
+        }
+        Self(bits)
+    }
+
+    const fn contains(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    const fn is_active(self) -> bool {
+        self.contains(Self::ACTIVE)
+    }
+
+    const fn has_global_read_witnesses(self) -> bool {
+        self.contains(Self::GLOBAL_READ_WITNESSES)
+    }
+
+    const fn has_global_write_witnesses(self) -> bool {
+        self.contains(Self::GLOBAL_WRITE_WITNESSES)
+    }
+}
+
 struct HandleView {
     token: TxnToken,
     begin_seq: CommitSeq,
-    is_active: bool,
+    flags: HandleViewFlags,
     read_pages: HashSet<PageNumber>,
     write_pages: HashSet<PageNumber>,
-    has_read_witnesses: bool,
-    has_write_witnesses: bool,
-    has_global_read_witnesses: bool,
-    has_global_write_witnesses: bool,
     has_in_rw: Cell<bool>,
     has_out_rw: Cell<bool>,
 }
@@ -1555,17 +1590,32 @@ impl HandleView {
         Self {
             token: handle.token(),
             begin_seq: handle.begin_seq(),
-            is_active: handle.is_active(),
+            flags: HandleViewFlags::from_handle(handle),
             read_pages: handle.read_set().clone(),
             write_pages,
-            has_read_witnesses: !handle.read_set().is_empty() || handle.has_global_read_witnesses(),
-            has_write_witnesses: !handle.write_index.is_empty()
-                || handle.has_global_write_witnesses(),
-            has_global_read_witnesses: handle.has_global_read_witnesses(),
-            has_global_write_witnesses: handle.has_global_write_witnesses(),
             has_in_rw: Cell::new(handle.has_in_rw()),
             has_out_rw: Cell::new(handle.has_out_rw()),
         }
+    }
+
+    const fn is_currently_active(&self) -> bool {
+        self.flags.is_active()
+    }
+
+    fn has_read_witnesses(&self) -> bool {
+        !self.read_pages.is_empty() || self.has_global_read_witnesses()
+    }
+
+    fn has_write_witnesses(&self) -> bool {
+        !self.write_pages.is_empty() || self.has_global_write_witnesses()
+    }
+
+    const fn has_global_read_witnesses(&self) -> bool {
+        self.flags.has_global_read_witnesses()
+    }
+
+    const fn has_global_write_witnesses(&self) -> bool {
+        self.flags.has_global_write_witnesses()
     }
 }
 
@@ -1648,18 +1698,18 @@ impl ActiveEdgeDiscoveryIndex {
     fn build(views: &[HandleView]) -> Self {
         let mut index = Self::default();
         for (idx, view) in views.iter().enumerate() {
-            if view.has_read_witnesses {
+            if view.has_read_witnesses() {
                 index.all_readers.push(idx);
-                if view.has_global_read_witnesses {
+                if view.has_global_read_witnesses() {
                     index.readers_with_global_keys.push(idx);
                 }
                 for &page in &view.read_pages {
                     index.readers_by_page.entry(page).or_default().push(idx);
                 }
             }
-            if view.has_write_witnesses {
+            if view.has_write_witnesses() {
                 index.all_writers.push(idx);
-                if view.has_global_write_witnesses {
+                if view.has_global_write_witnesses() {
                     index.writers_with_global_keys.push(idx);
                 }
                 for &page in &view.write_pages {
@@ -1693,7 +1743,7 @@ impl ActiveEdgeDiscoveryIndex {
             .filter_map(|idx| views.get(idx))
             .filter(|view| {
                 view.token != committing_txn
-                    && view.is_active
+                    && view.is_currently_active()
                     && view.begin_seq.get() < committing_end
             })
             .map(|view| view as &dyn ActiveTxnView)
@@ -1723,7 +1773,7 @@ impl ActiveEdgeDiscoveryIndex {
             .filter_map(|idx| views.get(idx))
             .filter(|view| {
                 view.token != committing_txn
-                    && view.is_active
+                    && view.is_currently_active()
                     && view.begin_seq.get() < committing_end
             })
             .map(|view| view as &dyn ActiveTxnView)
@@ -1741,7 +1791,7 @@ impl ActiveTxnView for HandleView {
     }
 
     fn is_active(&self) -> bool {
-        self.is_active
+        self.is_currently_active()
     }
 
     fn read_keys(&self) -> &[WitnessKey] {
@@ -1759,7 +1809,7 @@ impl ActiveTxnView for HandleView {
             | WitnessKey::ByteRange { page: p, .. }
             | WitnessKey::KeyRange { btree_root: p, .. } => self.read_pages.contains(p),
             WitnessKey::Custom { .. } => {
-                !self.read_pages.is_empty() || self.has_global_read_witnesses
+                !self.read_pages.is_empty() || self.has_global_read_witnesses()
             }
         }
     }
@@ -1771,7 +1821,7 @@ impl ActiveTxnView for HandleView {
             | WitnessKey::ByteRange { page: p, .. }
             | WitnessKey::KeyRange { btree_root: p, .. } => self.write_pages.contains(p),
             WitnessKey::Custom { .. } => {
-                !self.write_pages.is_empty() || self.has_global_write_witnesses
+                !self.write_pages.is_empty() || self.has_global_write_witnesses()
             }
         }
     }
@@ -4067,6 +4117,34 @@ mod tests {
         candidate_tokens.sort_by_key(|token| token.id.get());
 
         assert_eq!(candidate_tokens, vec![test_token(303), test_token(304)]);
+    }
+
+    #[test]
+    fn test_active_edge_discovery_index_keeps_tracked_write_pages_without_write_index() {
+        let mut tracked_writer = ConcurrentHandle::new(test_snapshot(10), test_token(306));
+        tracked_writer
+            .ensure_page_state(test_page(11))
+            .is_conflict_only = true;
+        assert!(tracked_writer.tracks_write_conflict_page(test_page(11)));
+        assert!(tracked_writer.write_index.is_empty());
+
+        let views = vec![HandleView::new(&tracked_writer)];
+        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(11))]);
+
+        let candidate_tokens = index
+            .outgoing_candidate_refs(
+                &views,
+                test_token(399),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &read_summary,
+            )
+            .into_iter()
+            .map(|candidate| candidate.token())
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidate_tokens, vec![test_token(306)]);
     }
 
     #[test]

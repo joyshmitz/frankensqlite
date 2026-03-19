@@ -8,10 +8,15 @@
 //! 3. Regression detection works with configurable thresholds.
 //! 4. Baselines can be captured for both FrankenSQLite and C SQLite.
 
+use fsqlite_core::connection::{
+    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+};
 use fsqlite_e2e::baseline::{
     BaselineReport, DEFAULT_REGRESSION_THRESHOLD, LatencyStats, Operation, OperationBaseline,
     RegressionResult, measure_operation,
 };
+use fsqlite_types::SqliteValue;
+use std::sync::{Mutex, OnceLock};
 
 // ─── Baseline module unit integration tests ─────────────────────────────
 
@@ -498,6 +503,144 @@ fn median_f64(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
+fn manual_hot_path_profile_mutex() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct ManualHotPathProfileGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ManualHotPathProfileGuard {
+    fn new() -> Self {
+        let guard = manual_hot_path_profile_mutex().lock().unwrap();
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(true);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for ManualHotPathProfileGuard {
+    fn drop(&mut self) {
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(false);
+    }
+}
+
+#[derive(Debug)]
+struct PrepareCacheProbeRun {
+    rows_per_sec: f64,
+    parse_cache_hits: u64,
+    parse_cache_misses: u64,
+    compiled_cache_hits: u64,
+    compiled_cache_misses: u64,
+    prepared_cache_hits: u64,
+    prepared_cache_misses: u64,
+}
+
+#[derive(Debug)]
+struct DecodeCacheProbeRun {
+    rows_per_sec: f64,
+    decode_cache_hits: u64,
+    decode_cache_misses: u64,
+    decode_cache_invalidations_position: u64,
+    decode_cache_invalidations_write: u64,
+    decode_cache_invalidations_pseudo: u64,
+}
+
+fn run_fsqlite_prepare_cache_probe<'a, I>(sqls: I, row_count: i64) -> PrepareCacheProbeRun
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);";
+
+    fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
+        for pragma in [
+            "PRAGMA page_size = 4096;",
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA synchronous = NORMAL;",
+            "PRAGMA cache_size = -64000;",
+        ] {
+            let _ = conn.execute(pragma);
+        }
+    }
+
+    let _profile_guard = ManualHotPathProfileGuard::new();
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_pragmas_fsqlite(&conn);
+    conn.execute(CREATE_TABLE).unwrap();
+
+    let start = std::time::Instant::now();
+    for (idx, sql) in sqls.into_iter().enumerate() {
+        let stmt = conn.prepare(sql).unwrap();
+        stmt.execute_with_params(&[SqliteValue::Integer(i64::try_from(idx).unwrap())])
+            .unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(row_count));
+
+    let profile = hot_path_profile_snapshot();
+    PrepareCacheProbeRun {
+        rows_per_sec: row_count as f64 / elapsed.as_secs_f64(),
+        parse_cache_hits: profile.parser.parse_cache_hits,
+        parse_cache_misses: profile.parser.parse_cache_misses,
+        compiled_cache_hits: profile.parser.compiled_cache_hits,
+        compiled_cache_misses: profile.parser.compiled_cache_misses,
+        prepared_cache_hits: profile.parser.prepared_cache_hits,
+        prepared_cache_misses: profile.parser.prepared_cache_misses,
+    }
+}
+
+fn run_fsqlite_decode_cache_probe(sql: &str, iterations: usize) -> DecodeCacheProbeRun {
+    const CREATE_TABLE: &str = "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT);";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ?2);";
+
+    fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
+        for pragma in [
+            "PRAGMA page_size = 4096;",
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA synchronous = NORMAL;",
+            "PRAGMA cache_size = -64000;",
+        ] {
+            let _ = conn.execute(pragma);
+        }
+    }
+
+    let _profile_guard = ManualHotPathProfileGuard::new();
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_pragmas_fsqlite(&conn);
+    conn.execute(CREATE_TABLE).unwrap();
+    conn.execute_with_params(
+        INSERT_SQL,
+        &[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("decode-cache-hot-row".to_owned()),
+        ],
+    )
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(rows.len(), 1, "probe query should return exactly one row");
+    }
+    let elapsed = start.elapsed();
+
+    let profile = hot_path_profile_snapshot();
+    DecodeCacheProbeRun {
+        rows_per_sec: iterations as f64 / elapsed.as_secs_f64(),
+        decode_cache_hits: profile.vdbe.decode_cache_hits_total,
+        decode_cache_misses: profile.vdbe.decode_cache_misses_total,
+        decode_cache_invalidations_position: profile.vdbe.decode_cache_invalidations_position_total,
+        decode_cache_invalidations_write: profile.vdbe.decode_cache_invalidations_write_total,
+        decode_cache_invalidations_pseudo: profile.vdbe.decode_cache_invalidations_pseudo_total,
+    }
+}
+
 #[test]
 #[ignore = "manual perf probe; run via rch when investigating write throughput"]
 fn manual_perf_probe_write_10k_autocommit_prepared_and_ad_hoc() {
@@ -635,4 +778,92 @@ fn manual_perf_probe_write_10k_autocommit_prepared_and_ad_hoc() {
     assert!(csqlite_ad_hoc_median > 0.0);
     assert!(fsqlite_prepared_median > 0.0);
     assert!(fsqlite_ad_hoc_median > 0.0);
+}
+
+#[test]
+#[ignore = "manual perf probe; run via rch when investigating repeated prepare reuse"]
+fn manual_perf_probe_prepare_cache_reuse_vs_unique_sql_variants() {
+    const ROW_COUNT: i64 = 10_000;
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137))";
+
+    let unique_sqls: Vec<String> = (0..ROW_COUNT)
+        .map(|i| format!("{INSERT_SQL} -- prepare-cache-miss-{i}"))
+        .collect();
+
+    let reused = run_fsqlite_prepare_cache_probe(
+        std::iter::repeat_n(INSERT_SQL, usize::try_from(ROW_COUNT).unwrap()),
+        ROW_COUNT,
+    );
+    let unique = run_fsqlite_prepare_cache_probe(unique_sqls.iter().map(String::as_str), ROW_COUNT);
+
+    eprintln!(
+        "manual_perf_probe.prepare_cache_reuse.reused rows_per_sec={:.1} parse_cache_hit={} parse_cache_miss={} compiled_cache_hit={} compiled_cache_miss={} prepared_cache_hit={} prepared_cache_miss={}",
+        reused.rows_per_sec,
+        reused.parse_cache_hits,
+        reused.parse_cache_misses,
+        reused.compiled_cache_hits,
+        reused.compiled_cache_misses,
+        reused.prepared_cache_hits,
+        reused.prepared_cache_misses,
+    );
+    eprintln!(
+        "manual_perf_probe.prepare_cache_reuse.unique_sql rows_per_sec={:.1} parse_cache_hit={} parse_cache_miss={} compiled_cache_hit={} compiled_cache_miss={} prepared_cache_hit={} prepared_cache_miss={}",
+        unique.rows_per_sec,
+        unique.parse_cache_hits,
+        unique.parse_cache_misses,
+        unique.compiled_cache_hits,
+        unique.compiled_cache_misses,
+        unique.prepared_cache_hits,
+        unique.prepared_cache_misses,
+    );
+    eprintln!(
+        "manual_perf_probe.prepare_cache_reuse.ratio reused_vs_unique={:.4}",
+        reused.rows_per_sec / unique.rows_per_sec
+    );
+
+    assert!(reused.rows_per_sec > 0.0);
+    assert!(unique.rows_per_sec > 0.0);
+    assert_eq!(reused.prepared_cache_misses, 1);
+    assert!(
+        reused.prepared_cache_hits >= u64::try_from(ROW_COUNT - 1).unwrap(),
+        "stable SQL should hit the prepared cache after the first prepare: {reused:?}"
+    );
+    assert_eq!(unique.prepared_cache_hits, 0);
+    assert_eq!(
+        unique.prepared_cache_misses,
+        u64::try_from(ROW_COUNT).unwrap()
+    );
+    assert!(
+        reused.rows_per_sec > unique.rows_per_sec,
+        "prepared-cache reuse should outperform forced unique-SQL misses: reused={reused:?} unique={unique:?}"
+    );
+}
+
+#[test]
+#[ignore = "manual perf probe; run via rch when investigating record-decode cache reuse"]
+fn manual_perf_probe_record_decode_cache_repeated_column_reads() {
+    const ITERATIONS: usize = 10_000;
+    const REPEATED_COLUMN_SQL: &str =
+        "SELECT data, data, data, data, data FROM bench WHERE id = 1;";
+
+    let repeated = run_fsqlite_decode_cache_probe(REPEATED_COLUMN_SQL, ITERATIONS);
+
+    eprintln!(
+        "manual_perf_probe.record_decode_cache.repeated_column_reads rows_per_sec={:.1} decode_cache_hit={} decode_cache_miss={} invalidation_position={} invalidation_write={} invalidation_pseudo={}",
+        repeated.rows_per_sec,
+        repeated.decode_cache_hits,
+        repeated.decode_cache_misses,
+        repeated.decode_cache_invalidations_position,
+        repeated.decode_cache_invalidations_write,
+        repeated.decode_cache_invalidations_pseudo,
+    );
+
+    assert!(repeated.rows_per_sec > 0.0);
+    assert!(
+        repeated.decode_cache_hits > repeated.decode_cache_misses,
+        "repeated-column query should produce more decode-cache hits than misses: {repeated:?}"
+    );
+    assert_eq!(repeated.decode_cache_invalidations_position, 0);
+    assert_eq!(repeated.decode_cache_invalidations_write, 0);
+    assert_eq!(repeated.decode_cache_invalidations_pseudo, 0);
 }

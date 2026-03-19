@@ -247,6 +247,11 @@ pub struct HotPathRecordDecodeProfile {
     pub vdbe_record_decode_calls_total: u64,
     pub vdbe_column_reads_total: u64,
     pub vdbe_decoded_value_heap_bytes_total: u64,
+    pub decode_cache_hits_total: u64,
+    pub decode_cache_misses_total: u64,
+    pub decode_cache_invalidations_position_total: u64,
+    pub decode_cache_invalidations_write_total: u64,
+    pub decode_cache_invalidations_pseudo_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -766,6 +771,17 @@ fn build_hot_path_profile_report(
         vdbe_record_decode_calls_total: snapshot.vdbe.record_decode_calls_total,
         vdbe_column_reads_total: snapshot.vdbe.column_reads_total,
         vdbe_decoded_value_heap_bytes_total: snapshot.vdbe.decoded_value_heap_bytes_total,
+        decode_cache_hits_total: snapshot.vdbe.decode_cache_hits_total,
+        decode_cache_misses_total: snapshot.vdbe.decode_cache_misses_total,
+        decode_cache_invalidations_position_total: snapshot
+            .vdbe
+            .decode_cache_invalidations_position_total,
+        decode_cache_invalidations_write_total: snapshot
+            .vdbe
+            .decode_cache_invalidations_write_total,
+        decode_cache_invalidations_pseudo_total: snapshot
+            .vdbe
+            .decode_cache_invalidations_pseudo_total,
     };
     let row_materialization = HotPathRowMaterializationProfile {
         result_rows_total: snapshot.vdbe.result_rows_total,
@@ -2093,7 +2109,7 @@ fn baseline_reuse_implication(surface: &str) -> (&'static str, &'static [&'stati
             &["bd-db300.10.4"],
         ),
         "record_decode_cache" => (
-            "J5 target: decode reuse is still invisible, so the report should assume repeated record parsing until explicit cache hits exist.",
+            "J5 target: decode-cache hits/misses are now surfaced directly, so the next cuts should push the hit rate up and the invalidation counts down instead of treating decode churn as opaque.",
             &["bd-db300.10.5"],
         ),
         "cursor_frame_reuse" => (
@@ -2188,13 +2204,23 @@ fn build_hot_path_baseline_reuse_ledger(
         HotPathBaselineReuseLedgerEntry {
             rank: 0,
             surface: "record_decode_cache".to_owned(),
-            supported: false,
-            hits: 0,
-            misses: 0,
-            hit_rate_basis_points: None,
+            supported: true,
+            hits: report.record_decode.decode_cache_hits_total,
+            misses: report.record_decode.decode_cache_misses_total,
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.record_decode.decode_cache_hits_total,
+                report
+                    .record_decode
+                    .decode_cache_hits_total
+                    .saturating_add(report.record_decode.decode_cache_misses_total),
+            )),
             rationale: format!(
-                "record decode activity is measured ({} decode calls), but decode-cache hits/misses are not yet surfaced in the report layer",
-                decode_calls
+                "record decode cache hits/misses are measured directly in the VDBE ({hits} hits, {misses} misses; invalidations: position={position}, write={write}, pseudo={pseudo}) across {decode_calls} decode entrypoints",
+                hits = report.record_decode.decode_cache_hits_total,
+                misses = report.record_decode.decode_cache_misses_total,
+                position = report.record_decode.decode_cache_invalidations_position_total,
+                write = report.record_decode.decode_cache_invalidations_write_total,
+                pseudo = report.record_decode.decode_cache_invalidations_pseudo_total,
             ),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -3515,6 +3541,11 @@ mod tests {
                 type_coercion_changes_total: 0,
                 column_reads_total: 6,
                 record_decode_calls_total: 4,
+                decode_cache_hits_total: 4,
+                decode_cache_misses_total: 3,
+                decode_cache_invalidations_position_total: 2,
+                decode_cache_invalidations_write_total: 1,
+                decode_cache_invalidations_pseudo_total: 1,
                 decoded_values_total: 10,
                 decoded_value_heap_bytes_total: 96,
                 result_rows_total: 4,
@@ -4228,6 +4259,20 @@ mod tests {
         assert_eq!(
             cursor_frame_reuse.mapped_beads,
             vec!["bd-db300.10.7".to_owned()]
+        );
+
+        let record_decode_cache = actionable_ranking
+            .baseline_reuse_ledger
+            .iter()
+            .find(|entry| entry.surface == "record_decode_cache")
+            .unwrap();
+        assert!(record_decode_cache.supported);
+        assert_eq!(record_decode_cache.hits, 4);
+        assert_eq!(record_decode_cache.misses, 3);
+        assert_eq!(record_decode_cache.hit_rate_basis_points, Some(5_714));
+        assert_eq!(
+            record_decode_cache.mapped_beads,
+            vec!["bd-db300.10.5".to_owned()]
         );
 
         let page_data_reuse = actionable_ranking

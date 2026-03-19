@@ -316,6 +316,14 @@ struct SorterCursor {
     rows: Vec<SorterRow>,
     /// Current position after `SorterSort`/`SorterNext`.
     position: Option<usize>,
+    /// Position for which the lazy output decode cache is currently valid.
+    cached_row_position: Option<usize>,
+    /// Pre-parsed record header offsets for the current output row.
+    cached_row_header_offsets: Vec<fsqlite_types::record::ColumnOffset>,
+    /// Lazily materialized decoded output values for the current output row.
+    cached_row_values: Vec<SqliteValue>,
+    /// Bitmask tracking which `cached_row_values` entries are decoded.
+    cached_row_decoded_mask: u64,
     /// Estimated bytes consumed by `rows` (approximate).
     memory_used: usize,
     /// Memory limit before spilling to disk (default 100 MiB).
@@ -338,6 +346,13 @@ enum SortKeyOrder {
     AscNullsLast,
     /// DESC with NULLS FIRST (explicit NULLS FIRST).
     DescNullsFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeCacheInvalidationReason {
+    PositionChange,
+    WriteMutation,
+    PseudoRowChange,
 }
 
 /// Default spill threshold: 100 MiB.
@@ -434,6 +449,10 @@ impl SorterCursor {
             collation_registry,
             rows: Vec::new(),
             position: None,
+            cached_row_position: None,
+            cached_row_header_offsets: Vec::new(),
+            cached_row_values: Vec::new(),
+            cached_row_decoded_mask: 0,
             memory_used: 0,
             spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
             spill_runs: Vec::new(),
@@ -460,6 +479,10 @@ impl SorterCursor {
     fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
         self.memory_used += Self::estimate_row_size(&values, &blob);
         self.rows.push(SorterRow { values, blob });
+        self.cached_row_position = None;
+        self.cached_row_header_offsets.clear();
+        self.cached_row_values.clear();
+        self.cached_row_decoded_mask = 0;
 
         if self.memory_used >= self.spill_threshold {
             self.spill_to_disk()?;
@@ -547,6 +570,10 @@ impl SorterCursor {
 
         self.rows_sorted_total += record_count;
         self.rows.clear();
+        self.cached_row_position = None;
+        self.cached_row_header_offsets.clear();
+        self.cached_row_values.clear();
+        self.cached_row_decoded_mask = 0;
         self.memory_used = 0;
         Ok(())
     }
@@ -677,6 +704,10 @@ impl SorterCursor {
         }
         self.spill_runs.clear();
         self.rows = merged;
+        self.cached_row_position = None;
+        self.cached_row_header_offsets.clear();
+        self.cached_row_values.clear();
+        self.cached_row_decoded_mask = 0;
         self.memory_used = 0;
         Ok(())
     }
@@ -685,6 +716,10 @@ impl SorterCursor {
     fn reset(&mut self) {
         self.rows.clear();
         self.position = None;
+        self.cached_row_position = None;
+        self.cached_row_header_offsets.clear();
+        self.cached_row_values.clear();
+        self.cached_row_decoded_mask = 0;
         self.memory_used = 0;
         // Clean up temp files.
         for run in &self.spill_runs {
@@ -2838,6 +2873,16 @@ static FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_VDBE_COLUMN_READS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total number of record decode calls that materialized a full row vector.
 static FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of decode-cache hits across storage, sorter, and pseudo-row paths.
+static FSQLITE_VDBE_DECODE_CACHE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of decode-cache misses across storage, sorter, and pseudo-row paths.
+static FSQLITE_VDBE_DECODE_CACHE_MISSES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of decode-cache invalidations caused by row-position changes.
+static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of decode-cache invalidations caused by write-path mutations.
+static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of decode-cache invalidations caused by pseudo-row image changes.
+static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total number of values materialized while decoding records/columns.
 static FSQLITE_VDBE_DECODED_VALUES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Estimated heap bytes materialized while decoding records/columns.
@@ -3281,6 +3326,16 @@ pub struct VdbeMetricsSnapshot {
     pub column_reads_total: u64,
     /// Total full-record decode calls.
     pub record_decode_calls_total: u64,
+    /// Total decode-cache hits across storage, sorter, and pseudo-row paths.
+    pub decode_cache_hits_total: u64,
+    /// Total decode-cache misses across storage, sorter, and pseudo-row paths.
+    pub decode_cache_misses_total: u64,
+    /// Total decode-cache invalidations caused by row-position changes.
+    pub decode_cache_invalidations_position_total: u64,
+    /// Total decode-cache invalidations caused by write-path mutations.
+    pub decode_cache_invalidations_write_total: u64,
+    /// Total decode-cache invalidations caused by pseudo-row image changes.
+    pub decode_cache_invalidations_pseudo_total: u64,
     /// Total values materialized from record/column decode.
     pub decoded_values_total: u64,
     /// Estimated heap bytes materialized from record/column decode.
@@ -3358,6 +3413,15 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
         column_reads_total: FSQLITE_VDBE_COLUMN_READS_TOTAL.load(AtomicOrdering::Relaxed),
         record_decode_calls_total: FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
             .load(AtomicOrdering::Relaxed),
+        decode_cache_hits_total: FSQLITE_VDBE_DECODE_CACHE_HITS_TOTAL.load(AtomicOrdering::Relaxed),
+        decode_cache_misses_total: FSQLITE_VDBE_DECODE_CACHE_MISSES_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        decode_cache_invalidations_position_total:
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL.load(AtomicOrdering::Relaxed),
+        decode_cache_invalidations_write_total: FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        decode_cache_invalidations_pseudo_total:
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_TOTAL.load(AtomicOrdering::Relaxed),
         decoded_values_total: FSQLITE_VDBE_DECODED_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
         decoded_value_heap_bytes_total: FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL
             .load(AtomicOrdering::Relaxed),
@@ -3451,6 +3515,11 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_COLUMN_READS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODE_CACHE_HITS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODE_CACHE_MISSES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_VALUES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_RESULT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
@@ -3568,6 +3637,41 @@ fn record_decoded_value_metrics(value: &SqliteValue) {
         blob_bytes: &FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL,
     };
     record_value_type_metrics(value, &counters);
+}
+
+fn note_decode_cache_hit(collect_vdbe_metrics: bool) {
+    if collect_vdbe_metrics {
+        FSQLITE_VDBE_DECODE_CACHE_HITS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+fn note_decode_cache_miss(collect_vdbe_metrics: bool) {
+    if collect_vdbe_metrics {
+        FSQLITE_VDBE_DECODE_CACHE_MISSES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+fn note_decode_cache_invalidation(
+    collect_vdbe_metrics: bool,
+    reason: DecodeCacheInvalidationReason,
+) {
+    if !collect_vdbe_metrics {
+        return;
+    }
+    match reason {
+        DecodeCacheInvalidationReason::PositionChange => {
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        DecodeCacheInvalidationReason::WriteMutation => {
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_TOTAL
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        DecodeCacheInvalidationReason::PseudoRowChange => {
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_TOTAL
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
 }
 
 fn record_result_row_metrics(row: &[SqliteValue]) {
@@ -4555,7 +4659,11 @@ impl VdbeEngine {
                 if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id) {
                     if sc.writable && sc.cursor.index_move_to(&sc.cx, &key_bytes)?.is_found() {
                         sc.cursor.delete(&sc.cx)?;
-                        invalidate_storage_cursor_row_cache(sc);
+                        invalidate_storage_cursor_row_cache_with_reason(
+                            sc,
+                            self.collect_vdbe_metrics,
+                            DecodeCacheInvalidationReason::WriteMutation,
+                        );
                     }
                 }
             }
@@ -4565,7 +4673,11 @@ impl VdbeEngine {
         if let Some(tsc) = self.storage_cursors.get_mut(&tbl_cursor_id) {
             tsc.cursor.table_move_to(&tsc.cx, conflict_rowid)?;
             tsc.cursor.delete(&tsc.cx)?;
-            invalidate_storage_cursor_row_cache(tsc);
+            invalidate_storage_cursor_row_cache_with_reason(
+                tsc,
+                self.collect_vdbe_metrics,
+                DecodeCacheInvalidationReason::WriteMutation,
+            );
         }
 
         Ok(())
@@ -4578,7 +4690,11 @@ impl VdbeEngine {
                 && isc.cursor.index_move_to(&isc.cx, &idx_key)?.is_found()
             {
                 isc.cursor.delete(&isc.cx)?;
-                invalidate_storage_cursor_row_cache(isc);
+                invalidate_storage_cursor_row_cache_with_reason(
+                    isc,
+                    self.collect_vdbe_metrics,
+                    DecodeCacheInvalidationReason::WriteMutation,
+                );
             }
         }
 
@@ -4601,7 +4717,11 @@ impl VdbeEngine {
             ));
         }
         tsc.cursor.delete(&tsc.cx)?;
-        invalidate_storage_cursor_row_cache(tsc);
+        invalidate_storage_cursor_row_cache_with_reason(
+            tsc,
+            self.collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::WriteMutation,
+        );
         self.changes = self.changes.checked_sub(1).ok_or_else(|| {
             FrankenError::internal("secondary-index rollback underflowed change counter")
         })?;
@@ -4628,7 +4748,11 @@ impl VdbeEngine {
                     FrankenError::internal("table cursor missing during UPDATE conflict restore")
                 })?;
                 tsc.cursor.table_insert(&tsc.cx, rowid, &payload)?;
-                invalidate_storage_cursor_row_cache(tsc);
+                invalidate_storage_cursor_row_cache_with_reason(
+                    tsc,
+                    self.collect_vdbe_metrics,
+                    DecodeCacheInvalidationReason::WriteMutation,
+                );
 
                 let table_index_meta = Arc::clone(&self.table_index_meta);
                 if let Some(index_metas) = table_index_meta.get(&cursor_id) {
@@ -4650,7 +4774,11 @@ impl VdbeEngine {
                             && sc.writable
                         {
                             sc.cursor.index_insert(&sc.cx, &key_bytes)?;
-                            invalidate_storage_cursor_row_cache(sc);
+                            invalidate_storage_cursor_row_cache_with_reason(
+                                sc,
+                                self.collect_vdbe_metrics,
+                                DecodeCacheInvalidationReason::WriteMutation,
+                            );
                         }
                     }
                 }
@@ -6965,7 +7093,16 @@ impl VdbeEngine {
                             // already exist (B-tree keys are unique) and we
                             // can skip the full B-tree seek.  This matches
                             // C SQLite's BTREE_APPEND optimization.
+                            //
+                            // Only safe in serialized mode (no concurrent
+                            // writers). In concurrent mode, another writer
+                            // could commit a higher rowid between our inserts.
+                            let is_concurrent_mode = self
+                                .txn_page_io
+                                .as_ref()
+                                .is_some_and(|io| io.concurrent.is_some());
                             let exists = if !is_update
+                                && !is_concurrent_mode
                                 && sc
                                     .last_successful_insert_rowid
                                     .is_some_and(|last| rowid > last)
@@ -6991,7 +7128,11 @@ impl VdbeEngine {
                                         },
                                     )?;
                                     sc2.cursor.table_insert(&sc2.cx, rowid, blob)?;
-                                    invalidate_storage_cursor_row_cache(sc2);
+                                    invalidate_storage_cursor_row_cache_with_reason(
+                                        sc2,
+                                        self.collect_vdbe_metrics,
+                                        DecodeCacheInvalidationReason::WriteMutation,
+                                    );
                                     sc2.last_successful_insert_rowid = Some(rowid);
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
@@ -7012,7 +7153,11 @@ impl VdbeEngine {
                             } else {
                                 // No conflict — insert normally
                                 sc.cursor.table_insert(&sc.cx, rowid, blob)?;
-                                invalidate_storage_cursor_row_cache(sc);
+                                invalidate_storage_cursor_row_cache_with_reason(
+                                    sc,
+                                    self.collect_vdbe_metrics,
+                                    DecodeCacheInvalidationReason::WriteMutation,
+                                );
                                 sc.last_successful_insert_rowid = Some(rowid);
                                 actually_inserted = true;
                             }
@@ -7144,7 +7289,11 @@ impl VdbeEngine {
                                 });
                             }
                             sc.cursor.delete(&sc.cx)?;
-                            invalidate_storage_cursor_row_cache(sc);
+                            invalidate_storage_cursor_row_cache_with_reason(
+                                sc,
+                                self.collect_vdbe_metrics,
+                                DecodeCacheInvalidationReason::WriteMutation,
+                            );
                             deleted = true;
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -7227,7 +7376,11 @@ impl VdbeEngine {
                                     columns_label,
                                 ) {
                                     Ok(()) => {
-                                        invalidate_storage_cursor_row_cache(sc);
+                                        invalidate_storage_cursor_row_cache_with_reason(
+                                            sc,
+                                            self.collect_vdbe_metrics,
+                                            DecodeCacheInvalidationReason::WriteMutation,
+                                        );
                                         self.pending_idx_entries
                                             .push((cursor_id, key_bytes.to_vec()));
                                     }
@@ -7276,7 +7429,11 @@ impl VdbeEngine {
                                                         FrankenError::internal("cursor must exist")
                                                     })?;
                                                 sc2.cursor.index_insert(&sc2.cx, key_bytes)?;
-                                                invalidate_storage_cursor_row_cache(sc2);
+                                                invalidate_storage_cursor_row_cache_with_reason(
+                                                    sc2,
+                                                    self.collect_vdbe_metrics,
+                                                    DecodeCacheInvalidationReason::WriteMutation,
+                                                );
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -7293,7 +7450,11 @@ impl VdbeEngine {
                                 }
                             } else {
                                 sc.cursor.index_insert(&sc.cx, key_bytes)?;
-                                invalidate_storage_cursor_row_cache(sc);
+                                invalidate_storage_cursor_row_cache_with_reason(
+                                    sc,
+                                    self.collect_vdbe_metrics,
+                                    DecodeCacheInvalidationReason::WriteMutation,
+                                );
                                 self.pending_idx_entries
                                     .push((cursor_id, key_bytes.to_vec()));
                             }
@@ -7351,12 +7512,20 @@ impl VdbeEngine {
                                 // Seek to the key first, then delete.
                                 if sc.cursor.index_move_to(&sc.cx, key)?.is_found() {
                                     sc.cursor.delete(&sc.cx)?;
-                                    invalidate_storage_cursor_row_cache(sc);
+                                    invalidate_storage_cursor_row_cache_with_reason(
+                                        sc,
+                                        self.collect_vdbe_metrics,
+                                        DecodeCacheInvalidationReason::WriteMutation,
+                                    );
                                 }
                             } else if !sc.cursor.eof() {
                                 // Delete at current position.
                                 sc.cursor.delete(&sc.cx)?;
-                                invalidate_storage_cursor_row_cache(sc);
+                                invalidate_storage_cursor_row_cache_with_reason(
+                                    sc,
+                                    self.collect_vdbe_metrics,
+                                    DecodeCacheInvalidationReason::WriteMutation,
+                                );
                             }
                         }
                     }
@@ -9236,36 +9405,7 @@ impl VdbeEngine {
             return Ok(true);
         }
 
-        // ── Ensure payload loaded and header parsed ────────────────
-        let position_stamp = cursor.cursor.position_stamp();
-        if cursor.last_position_stamp != position_stamp {
-            cursor
-                .cursor
-                .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
-            let col_count = fsqlite_types::record::parse_record_header_into(
-                &cursor.payload_buf,
-                &mut cursor.header_offsets,
-            )
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "malformed record header in cursor payload (direct path)".to_owned(),
-            })?;
-            if col_count > 64 {
-                cursor.row_vals_buf.clear();
-                fsqlite_types::record::parse_record_into(
-                    &cursor.payload_buf,
-                    &mut cursor.row_vals_buf,
-                )
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "malformed record payload in cursor (>64-column eager decode)"
-                        .to_owned(),
-                })?;
-                cursor.decoded_mask = u64::MAX;
-            } else {
-                cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
-                cursor.decoded_mask = 0;
-            }
-            cursor.last_position_stamp = position_stamp;
-        }
+        let refresh_state = ensure_storage_cursor_row_cache(cursor, self.collect_vdbe_metrics)?;
 
         // ── Resolve IPK alias and payload column index ────────────
         let root_page = self.cursor_root_pages.get(&cursor_id).copied();
@@ -9304,8 +9444,18 @@ impl VdbeEngine {
 
         if payload_idx < cursor.header_offsets.len() {
             // Already decoded? Write from cache to register with buffer reuse.
-            if payload_idx < 64 && cursor.decoded_mask & (1u64 << payload_idx) != 0 {
+            let cached_value_ready = if payload_idx < 64 {
+                cursor.decoded_mask & (1u64 << payload_idx) != 0
+            } else {
+                cursor.decoded_mask == u64::MAX
+            };
+            if cached_value_ready {
                 if let Some(cached) = cursor.row_vals_buf.get(payload_idx) {
+                    if refresh_state.refreshed && refresh_state.eager_values_ready {
+                        note_decode_cache_miss(collect_vdbe_metrics);
+                    } else {
+                        note_decode_cache_hit(collect_vdbe_metrics);
+                    }
                     if collect_vdbe_metrics {
                         FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                         record_decoded_value_metrics(cached);
@@ -9336,6 +9486,7 @@ impl VdbeEngine {
             }
 
             // Not yet decoded: decode from raw payload.
+            note_decode_cache_miss(collect_vdbe_metrics);
             let val = fsqlite_types::record::decode_column_from_offset(
                 &cursor.payload_buf,
                 &cursor.header_offsets[payload_idx],
@@ -9403,45 +9554,7 @@ impl VdbeEngine {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
-            let position_stamp = cursor.cursor.position_stamp();
-            if cursor.last_position_stamp != position_stamp {
-                // ── Position changed: re-read payload, parse header only ──
-                cursor
-                    .cursor
-                    .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
-
-                // Parse header offset table (serial types + byte ranges).
-                let col_count = fsqlite_types::record::parse_record_header_into(
-                    &cursor.payload_buf,
-                    &mut cursor.header_offsets,
-                )
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "malformed record header in cursor payload".to_owned(),
-                })?;
-
-                if col_count > 64 {
-                    // Wide record: fall back to eager full decode so we
-                    // don't need a heap-allocated bitmask.
-                    cursor.row_vals_buf.clear();
-                    fsqlite_types::record::parse_record_into(
-                        &cursor.payload_buf,
-                        &mut cursor.row_vals_buf,
-                    )
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "malformed record payload in cursor (>64-column eager decode)"
-                            .to_owned(),
-                    })?;
-                    cursor.decoded_mask = u64::MAX; // mark all as decoded
-                } else {
-                    // Narrow record (≤64 cols): lazy path.
-                    // Resize row_vals_buf to column count, filling new
-                    // slots with Null (placeholder — decoded_mask tracks
-                    // which are real).
-                    cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
-                    cursor.decoded_mask = 0;
-                }
-                cursor.last_position_stamp = position_stamp;
-            }
+            let refresh_state = ensure_storage_cursor_row_cache(cursor, collect_vdbe_metrics)?;
 
             let root_page = self.cursor_root_pages.get(&cursor_id).copied();
             let rowid = cursor.cursor.rowid(&cursor.cx)?;
@@ -9480,9 +9593,19 @@ impl VdbeEngine {
             // ── Lazy column decode: decode on demand ─────────────────
             if payload_idx < cursor.header_offsets.len() {
                 // Check if already decoded via bitmask.
-                if payload_idx < 64 && cursor.decoded_mask & (1u64 << payload_idx) != 0 {
+                let cached_value_ready = if payload_idx < 64 {
+                    cursor.decoded_mask & (1u64 << payload_idx) != 0
+                } else {
+                    cursor.decoded_mask == u64::MAX
+                };
+                if cached_value_ready {
                     // Already materialized — return cached value.
                     if let Some(val) = cursor.row_vals_buf.get(payload_idx).cloned() {
+                        if refresh_state.refreshed && refresh_state.eager_values_ready {
+                            note_decode_cache_miss(collect_vdbe_metrics);
+                        } else {
+                            note_decode_cache_hit(collect_vdbe_metrics);
+                        }
                         if collect_vdbe_metrics {
                             FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                             record_decoded_value_metrics(&val);
@@ -9491,6 +9614,7 @@ impl VdbeEngine {
                     }
                 }
                 // Decode just this column from the offset table + raw payload.
+                note_decode_cache_miss(collect_vdbe_metrics);
                 let val = fsqlite_types::record::decode_column_from_offset(
                     &cursor.payload_buf,
                     &cursor.header_offsets[payload_idx],
@@ -9564,6 +9688,16 @@ impl VdbeEngine {
                     };
 
                     if !use_cache {
+                        if let Some(cursor) = self.cursors.get(&cursor_id)
+                            && let Some((cached_blob, _)) = &cursor.cached_pseudo_row
+                            && cached_blob != &blob
+                        {
+                            note_decode_cache_invalidation(
+                                collect_vdbe_metrics,
+                                DecodeCacheInvalidationReason::PseudoRowChange,
+                            );
+                        }
+                        note_decode_cache_miss(collect_vdbe_metrics);
                         if let Ok(values) = decode_record_with_metrics(&blob, collect_vdbe_metrics)
                         {
                             if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -9576,6 +9710,9 @@ impl VdbeEngine {
 
                     if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some((_, values)) = &cursor.cached_pseudo_row {
+                            if use_cache {
+                                note_decode_cache_hit(collect_vdbe_metrics);
+                            }
                             let value = values.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
                             if collect_vdbe_metrics {
                                 record_decoded_value_metrics(&value);
@@ -9604,33 +9741,74 @@ impl VdbeEngine {
         }
 
         // Sorter cursor: read column directly from the sorted row.
-        if let Some(sorter) = self.sorters.get(&cursor_id) {
+        if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
             if let Some(pos) = sorter.position {
-                if let Some(row) = sorter.rows.get(pos) {
-                    // Sorter rows cache only the sort-key prefix. Decode any
-                    // non-key output columns lazily from the serialized row.
-                    let value = if let Some(value) = row.values.get(col_idx).cloned() {
+                if let Some(value) = sorter
+                    .rows
+                    .get(pos)
+                    .and_then(|row| row.values.get(col_idx))
+                    .cloned()
+                {
+                    note_decode_cache_hit(collect_vdbe_metrics);
+                    if collect_vdbe_metrics {
+                        record_decoded_value_metrics(&value);
+                    }
+                    return Ok(value);
+                }
+                let refresh_state = ensure_sorter_row_cache(sorter, collect_vdbe_metrics, pos)?;
+                let (rows, cached_row_header_offsets, cached_row_values, cached_row_decoded_mask) = (
+                    &sorter.rows,
+                    &sorter.cached_row_header_offsets,
+                    &mut sorter.cached_row_values,
+                    &mut sorter.cached_row_decoded_mask,
+                );
+                let row = rows.get(pos).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("missing sorter row at position {pos}"),
+                })?;
+                let value = if col_idx < cached_row_header_offsets.len() {
+                    let cached_value_ready = if col_idx < 64 {
+                        *cached_row_decoded_mask & (1u64 << col_idx) != 0
+                    } else {
+                        *cached_row_decoded_mask == u64::MAX
+                    };
+                    if cached_value_ready {
+                        if refresh_state.refreshed && refresh_state.eager_values_ready {
+                            note_decode_cache_miss(collect_vdbe_metrics);
+                        } else {
+                            note_decode_cache_hit(collect_vdbe_metrics);
+                        }
+                        cached_row_values
+                            .get(col_idx)
+                            .cloned()
+                            .unwrap_or(SqliteValue::Null)
+                    } else if let Some(value) = fsqlite_types::record::decode_column_from_offset(
+                        &row.blob,
+                        &cached_row_header_offsets[col_idx],
+                        collect_vdbe_metrics,
+                    ) {
+                        note_decode_cache_miss(collect_vdbe_metrics);
+                        if col_idx >= cached_row_values.len() {
+                            cached_row_values.resize(col_idx + 1, SqliteValue::Null);
+                        }
+                        cached_row_values[col_idx] = value.clone();
+                        if col_idx < 64 {
+                            *cached_row_decoded_mask |= 1u64 << col_idx;
+                        }
                         value
-                    } else if let Some(value) =
-                        fsqlite_types::record::parse_record_column(&row.blob, col_idx)
-                    {
-                        value
-                    } else if fsqlite_types::record::record_column_count(&row.blob)
-                        .is_some_and(|column_count| col_idx >= column_count)
-                    {
-                        SqliteValue::Null
                     } else {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "malformed sorter record while reading column {col_idx}"
                             ),
                         });
-                    };
-                    if collect_vdbe_metrics {
-                        record_decoded_value_metrics(&value);
                     }
-                    return Ok(value);
+                } else {
+                    SqliteValue::Null
+                };
+                if collect_vdbe_metrics {
+                    record_decoded_value_metrics(&value);
                 }
+                return Ok(value);
             }
         }
 
@@ -10359,11 +10537,135 @@ fn payload_includes_rowid_alias_lazy(
     }
 }
 
-fn invalidate_storage_cursor_row_cache(cursor: &mut StorageCursor) {
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeCacheRefreshState {
+    refreshed: bool,
+    eager_values_ready: bool,
+}
+
+fn ensure_storage_cursor_row_cache(
+    cursor: &mut StorageCursor,
+    collect_vdbe_metrics: bool,
+) -> Result<DecodeCacheRefreshState> {
+    let position_stamp = cursor.cursor.position_stamp();
+    if cursor.last_position_stamp == position_stamp {
+        return Ok(DecodeCacheRefreshState::default());
+    }
+    if cursor.last_position_stamp.is_some() {
+        note_decode_cache_invalidation(
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::PositionChange,
+        );
+    }
+    cursor
+        .cursor
+        .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
+    let col_count = fsqlite_types::record::parse_record_header_into(
+        &cursor.payload_buf,
+        &mut cursor.header_offsets,
+    )
+    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: "malformed record header in cursor payload".to_owned(),
+    })?;
+
+    let eager_values_ready = if col_count > 64 {
+        cursor.row_vals_buf.clear();
+        fsqlite_types::record::parse_record_into(&cursor.payload_buf, &mut cursor.row_vals_buf)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed record payload in cursor (>64-column eager decode)".to_owned(),
+            })?;
+        cursor.decoded_mask = u64::MAX;
+        true
+    } else {
+        cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
+        cursor.decoded_mask = 0;
+        false
+    };
+    cursor.last_position_stamp = position_stamp;
+    Ok(DecodeCacheRefreshState {
+        refreshed: true,
+        eager_values_ready,
+    })
+}
+
+fn ensure_sorter_row_cache(
+    sorter: &mut SorterCursor,
+    collect_vdbe_metrics: bool,
+    position: usize,
+) -> Result<DecodeCacheRefreshState> {
+    let (
+        rows,
+        cached_row_position,
+        cached_row_header_offsets,
+        cached_row_values,
+        cached_row_decoded_mask,
+    ) = (
+        &sorter.rows,
+        &mut sorter.cached_row_position,
+        &mut sorter.cached_row_header_offsets,
+        &mut sorter.cached_row_values,
+        &mut sorter.cached_row_decoded_mask,
+    );
+    if *cached_row_position == Some(position) {
+        return Ok(DecodeCacheRefreshState::default());
+    }
+    let row = rows
+        .get(position)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("missing sorter row at position {position}"),
+        })?;
+    if cached_row_position.is_some() {
+        note_decode_cache_invalidation(
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::PositionChange,
+        );
+    }
+    let col_count =
+        fsqlite_types::record::parse_record_header_into(&row.blob, cached_row_header_offsets)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed sorter record header".to_owned(),
+            })?;
+    let eager_values_ready = if col_count > 64 {
+        cached_row_values.clear();
+        fsqlite_types::record::parse_record_into(&row.blob, cached_row_values).ok_or_else(
+            || FrankenError::DatabaseCorrupt {
+                detail: "malformed sorter record payload (>64-column eager decode)".to_owned(),
+            },
+        )?;
+        *cached_row_decoded_mask = u64::MAX;
+        true
+    } else {
+        cached_row_values.resize(col_count, SqliteValue::Null);
+        *cached_row_decoded_mask = 0;
+        false
+    };
+    *cached_row_position = Some(position);
+    Ok(DecodeCacheRefreshState {
+        refreshed: true,
+        eager_values_ready,
+    })
+}
+
+fn invalidate_storage_cursor_row_cache_with_reason(
+    cursor: &mut StorageCursor,
+    collect_vdbe_metrics: bool,
+    reason: DecodeCacheInvalidationReason,
+) {
+    if cursor.last_position_stamp.is_some() || !cursor.header_offsets.is_empty() {
+        note_decode_cache_invalidation(collect_vdbe_metrics, reason);
+    }
     cursor.row_vals_buf.clear();
     cursor.header_offsets.clear();
     cursor.decoded_mask = 0;
     cursor.last_position_stamp = None;
+}
+
+fn invalidate_storage_cursor_row_cache(cursor: &mut StorageCursor) {
+    invalidate_storage_cursor_row_cache_with_reason(
+        cursor,
+        false,
+        DecodeCacheInvalidationReason::WriteMutation,
+    );
 }
 
 #[allow(dead_code)]
@@ -16200,6 +16502,326 @@ mod tests {
         assert_eq!(
             after_with_metrics.decoded_values_total,
             after_without_metrics.decoded_values_total + 2
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_storage_cursor_decode_cache_metrics_track_hits_misses_and_position_changes() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+
+        let before = vdbe_metrics_snapshot();
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(10), SqliteValue::Integer(10)],
+                vec![SqliteValue::Integer(20), SqliteValue::Integer(20)],
+            ]
+        );
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            2
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            2
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_pseudo_total
+                - before.decode_cache_invalidations_pseudo_total,
+            0
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_pseudo_cursor_decode_cache_metrics_track_hits_and_blob_changes() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut engine = VdbeEngine::new(2);
+        engine.collect_vdbe_metrics = true;
+        engine.cursors.insert(0, MemCursor::new_pseudo(1));
+
+        engine.set_reg_fast(
+            1,
+            SqliteValue::Blob(
+                encode_record(&[SqliteValue::Integer(7), SqliteValue::Text("alpha".into())]).into(),
+            ),
+        );
+
+        let before = vdbe_metrics_snapshot();
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("pseudo row should decode"),
+            SqliteValue::Integer(7)
+        );
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("pseudo row cache should hit"),
+            SqliteValue::Integer(7)
+        );
+
+        engine.set_reg_fast(
+            1,
+            SqliteValue::Blob(
+                encode_record(&[SqliteValue::Integer(9), SqliteValue::Text("beta".into())]).into(),
+            ),
+        );
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("changed pseudo row should decode"),
+            SqliteValue::Integer(9)
+        );
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            2
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_pseudo_total
+                - before.decode_cache_invalidations_pseudo_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            0
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_sorter_decode_cache_metrics_track_hits_misses_and_position_changes() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
+        sorter
+            .insert_row(
+                vec![SqliteValue::Integer(1)],
+                encode_record(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]),
+            )
+            .expect("sorter insert should succeed");
+        sorter
+            .insert_row(
+                vec![SqliteValue::Integer(2)],
+                encode_record(&[SqliteValue::Integer(2), SqliteValue::Text("beta".into())]),
+            )
+            .expect("sorter insert should succeed");
+        sorter.sort().expect("sorter sort should succeed");
+        sorter.position = Some(0);
+
+        let mut engine = VdbeEngine::new(1);
+        engine.collect_vdbe_metrics = true;
+        engine.sorters.insert(0, sorter);
+
+        let before = vdbe_metrics_snapshot();
+        assert_eq!(
+            engine
+                .cursor_column(0, 1)
+                .expect("first sorter decode should succeed"),
+            SqliteValue::Text("alpha".into())
+        );
+        assert_eq!(
+            engine
+                .cursor_column(0, 1)
+                .expect("second sorter read should hit cache"),
+            SqliteValue::Text("alpha".into())
+        );
+        engine
+            .sorters
+            .get_mut(&0)
+            .expect("sorter cursor should exist")
+            .position = Some(1);
+        assert_eq!(
+            engine
+                .cursor_column(0, 1)
+                .expect("next sorter row should decode"),
+            SqliteValue::Text("beta".into())
+        );
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            2
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_pseudo_total
+                - before.decode_cache_invalidations_pseudo_total,
+            0
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_storage_cursor_decode_cache_hits_wide_row_tail_column_after_eager_decode() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(65);
+        let row = (0_i64..65).map(SqliteValue::Integer).collect::<Vec<_>>();
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert(1, row);
+
+        let before = vdbe_metrics_snapshot();
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(65), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 64, 1, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 64, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(64), SqliteValue::Integer(64)]]
+        );
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            1
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_sorter_decode_cache_hits_wide_row_tail_column_after_eager_decode() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let record = encode_record(&(0_i64..65).map(SqliteValue::Integer).collect::<Vec<_>>());
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
+        sorter
+            .insert_row(vec![SqliteValue::Integer(0)], record)
+            .expect("sorter insert should succeed");
+        sorter.sort().expect("sorter sort should succeed");
+        sorter.position = Some(0);
+
+        let mut engine = VdbeEngine::new(1);
+        engine.collect_vdbe_metrics = true;
+        engine.sorters.insert(0, sorter);
+
+        let before = vdbe_metrics_snapshot();
+        assert_eq!(
+            engine
+                .cursor_column(0, 64)
+                .expect("first wide sorter decode should succeed"),
+            SqliteValue::Integer(64)
+        );
+        assert_eq!(
+            engine
+                .cursor_column(0, 64)
+                .expect("second wide sorter read should hit cache"),
+            SqliteValue::Integer(64)
+        );
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            1
         );
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
