@@ -1033,11 +1033,37 @@ where
         let active_transactions_before_begin = inner.active_transactions;
 
         // ── In-memory fast path ─────────────────────────────────────
-        // For in-memory VFS, skip journal recovery, file locking, WAL
-        // snapshot refresh, and publication updates. There are no
-        // on-disk artifacts to recover, no cross-process locks to
-        // acquire, and the committed state is already authoritative.
+        // For in-memory VFS, skip journal recovery and file locking.
+        // We still need to refresh connection-local metadata/publication
+        // state when the first local transaction starts, because another
+        // pager sharing the same `MemoryVfs` can advance page-1 metadata or
+        // the shared WAL backend between transactions.
         if self.vfs.is_memory() {
+            let commit_seq_before_refresh = inner.commit_seq;
+            if active_transactions_before_begin == 0 {
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimplePager cache lock poisoned"))?;
+                inner.refresh_committed_state(cx, &mut cache)?;
+                let clear_published_pages = inner.commit_seq != commit_seq_before_refresh;
+                self.published.publish(
+                    cx,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq,
+                        db_size: inner.db_size,
+                        journal_mode: inner.journal_mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: inner.checkpoint_active,
+                    },
+                    |pages| {
+                        if clear_published_pages {
+                            pages.clear();
+                        }
+                    },
+                );
+            }
+
             let eager_writer = matches!(
                 mode,
                 TransactionMode::Immediate | TransactionMode::Exclusive
@@ -1051,7 +1077,7 @@ where
             inner.active_transactions += 1;
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
-            let published_visible_commit_seq = inner.commit_seq;
+            let published_visible_commit_seq = self.published.snapshot().visible_commit_seq;
             let pool = self.pool.clone();
             let cleanup_cx = cx.clone();
             return Ok(SimpleTransaction {
@@ -9082,8 +9108,7 @@ mod tests {
         {
             let inner = pager2.inner.lock().unwrap();
             assert_eq!(
-                inner.commit_seq,
-                latest_seq,
+                inner.commit_seq, latest_seq,
                 "bead_id={BEAD_ID} case=wal_headerless_interior_commit_refreshes_inner_commit_seq"
             );
         }
