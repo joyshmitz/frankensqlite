@@ -1,15 +1,20 @@
 {
-  "trace_id": "trace-prof-1770975442851",
+  "trace_id": "trace-prof-1773889832011",
   "scenario_id": "bm-checkpoint-plan-micro",
   "git_sha": "local-dev",
   "artifact_paths": {
     "flamegraph": "profiling/flamegraph.svg",
+    "flamegraph_top_01": "profiling/flamegraph_top_01.svg",
+    "flamegraph_top_02": "profiling/flamegraph_top_02.svg",
+    "flamegraph_top_03": "profiling/flamegraph_top_03.svg",
+    "flamegraph_top_manifest": "profiling/flamegraph_top3.json",
     "heaptrack": "profiling/heaptrack.out",
     "hyperfine": "profiling/hyperfine.json",
     "strace": "profiling/strace.txt"
   },
   "metadata": {
     "build_flags": "RUSTFLAGS=-C force-frame-pointers=yes;features=perf",
+    "flamegraph_top_scenarios": "bm-wal-checksum-recovery-micro,bm-recovery-crash-replay-macro,bm-write-contention-macro",
     "git_sha": "local-dev",
     "platform": "linux x86_64",
     "scenario": "bm-checkpoint-plan-micro?seed=3070733372282402248",
