@@ -1015,6 +1015,7 @@ name = "fsqlite-mvcc"
 version = "0.1.1"
 dependencies = [
  "blake3",
+ "crc32c",
  "criterion",
  "crossbeam-epoch",
  "fsqlite-error",

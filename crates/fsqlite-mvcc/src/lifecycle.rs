@@ -1070,6 +1070,7 @@ impl TransactionManager {
             txn.serialized_write_lock_held = true;
             if !had_snapshot {
                 mvcc_snapshot_established();
+                self.register_active_snapshot(txn.txn_id, txn.snapshot.high);
             }
 
             tracing::debug!(
@@ -5885,6 +5886,28 @@ mod tests {
         assert!(
             mgr.cached_gc_horizon().is_none(),
             "releasing last active snapshot should clear cached horizon"
+        );
+    }
+
+    #[test]
+    fn test_cached_gc_horizon_tracks_deferred_first_write_lifecycle() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_784).unwrap();
+        assert!(mgr.cached_gc_horizon().is_none());
+
+        let mut deferred = mgr.begin(BeginKind::Deferred).unwrap();
+        mgr.write_page(&mut deferred, pgno, test_data(0x7A))
+            .expect("first deferred write should upgrade and establish a snapshot");
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(deferred.snapshot.high),
+            "first deferred write should register the active snapshot horizon"
+        );
+
+        mgr.abort(&mut deferred);
+        assert!(
+            mgr.cached_gc_horizon().is_none(),
+            "aborting the last deferred writer should release the cached horizon"
         );
     }
 

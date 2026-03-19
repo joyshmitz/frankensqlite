@@ -15648,11 +15648,8 @@ impl Connection {
         // before opening the pager txn. If a writer commits during begin, this
         // can only make the snapshot older than the pager view (safe
         // over-abort), never newer (unsafe).
-        let concurrent_snapshot = if let Some(publication) = prebound_publication {
-            Some(self.concurrent_snapshot_from_publication(publication))
-        } else {
-            None
-        };
+        let concurrent_snapshot = prebound_publication
+            .map(|publication| self.concurrent_snapshot_from_publication(publication));
         let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode)?;
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for

@@ -308,25 +308,26 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         };
         let commit_count_result = match last_commit_frame {
             None => Ok(0),
-            Some(current_last_commit) => match (previous_generation == generation, previous_last_commit)
-            {
-                (true, Some(previous_last_commit))
-                    if previous_last_commit < current_last_commit =>
-                {
-                    self.count_commit_frames_in_range(
-                        cx,
-                        previous_last_commit.saturating_add(1),
-                        current_last_commit,
-                    )
-                    .map(|delta| previous_commit_count.saturating_add(delta))
+            Some(current_last_commit) => {
+                match (previous_generation == generation, previous_last_commit) {
+                    (true, Some(previous_last_commit))
+                        if previous_last_commit < current_last_commit =>
+                    {
+                        self.count_commit_frames_in_range(
+                            cx,
+                            previous_last_commit.saturating_add(1),
+                            current_last_commit,
+                        )
+                        .map(|delta| previous_commit_count.saturating_add(delta))
+                    }
+                    (true, Some(previous_last_commit))
+                        if previous_last_commit == current_last_commit =>
+                    {
+                        Ok(previous_commit_count)
+                    }
+                    _ => self.count_commit_frames_in_range(cx, 0, current_last_commit),
                 }
-                (true, Some(previous_last_commit))
-                    if previous_last_commit == current_last_commit =>
-                {
-                    Ok(previous_commit_count)
-                }
-                _ => self.count_commit_frames_in_range(cx, 0, current_last_commit),
-            },
+            }
         };
         if let Err(error) = update_result {
             if previous_generation == generation {
@@ -2049,8 +2050,7 @@ mod tests {
             "commit append should publish the visible commit horizon"
         );
         assert_eq!(
-            adapter.published_snapshot.commit_count,
-            1,
+            adapter.published_snapshot.commit_count, 1,
             "commit append should track the visible WAL commit count"
         );
         assert_eq!(
@@ -2100,8 +2100,7 @@ mod tests {
             "prepared commit append should publish the visible commit horizon"
         );
         assert_eq!(
-            adapter.published_snapshot.commit_count,
-            1,
+            adapter.published_snapshot.commit_count, 1,
             "prepared commit append should track the visible WAL commit count"
         );
         assert_eq!(
@@ -2153,8 +2152,7 @@ mod tests {
             "local commit should publish on top of refreshed external WAL state"
         );
         assert_eq!(
-            follower.published_snapshot.commit_count,
-            3,
+            follower.published_snapshot.commit_count, 3,
             "local commit publication should include refreshed external commits"
         );
         assert_eq!(

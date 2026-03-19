@@ -1607,6 +1607,7 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     fn free_overflow_chain(&mut self, cx: &Cx, first: PageNumber) -> Result<()> {
+        let _mask = cx.masked();
         let mut current = Some(first);
         let mut visited = 0usize;
 
@@ -2957,6 +2958,54 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CancelAfterFirstOverflowFreeStore {
+        inner: Rc<RefCell<MemPageStore>>,
+        cancelled: Rc<RefCell<bool>>,
+    }
+
+    impl CancelAfterFirstOverflowFreeStore {
+        fn new(inner: Rc<RefCell<MemPageStore>>) -> Self {
+            Self {
+                inner,
+                cancelled: Rc::new(RefCell::new(false)),
+            }
+        }
+    }
+
+    impl PageReader for CancelAfterFirstOverflowFreeStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            self.inner.borrow().read_page(cx, page_no)
+        }
+    }
+
+    impl PageWriter for CancelAfterFirstOverflowFreeStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.inner.borrow_mut().write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.borrow_mut().allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            self.inner.borrow_mut().free_page(cx, page_no)?;
+
+            let mut cancelled = self.cancelled.borrow_mut();
+            if !*cancelled {
+                cx.cancel();
+                *cancelled = true;
+            }
+            Ok(())
+        }
+
+        fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
+            self.inner.borrow_mut().record_write_witness(cx, key);
+        }
+    }
+
     const USABLE: u32 = 4096;
 
     fn collect_reachable_pages(
@@ -3926,6 +3975,47 @@ mod tests {
             shared.borrow().pages.len(),
             1,
             "only the root page should remain after failed overflow write"
+        );
+    }
+
+    #[test]
+    fn test_cursor_delete_masks_overflow_cleanup_cancellation() {
+        let root_page = pn(2);
+        let mut base = MemPageStore::new(USABLE);
+        base.init_leaf_table_root(root_page);
+        let shared = Rc::new(RefCell::new(base));
+
+        let store = CancelAfterFirstOverflowFreeStore::new(Rc::clone(&shared));
+        let mut cursor = BtCursor::new(store, root_page, USABLE, true);
+
+        let insert_cx = Cx::new();
+        let payload = vec![0xAB; 9_000];
+        cursor.table_insert(&insert_cx, 7, &payload).unwrap();
+
+        let pages_before: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
+        assert!(
+            pages_before.len() > 2,
+            "test requires a multi-page overflow chain, found pages {pages_before:?}"
+        );
+
+        let delete_cx = Cx::new();
+        assert!(cursor.table_move_to(&delete_cx, 7).unwrap().is_found());
+        cursor
+            .delete(&delete_cx)
+            .expect("overflow cleanup must finish even if cancellation arrives mid-chain");
+        assert!(
+            delete_cx.checkpoint().is_err(),
+            "test store should request cancellation during overflow cleanup"
+        );
+
+        let recovery_cx = Cx::new();
+        assert!(!cursor.first(&recovery_cx).unwrap());
+
+        let remaining_pages: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
+        assert_eq!(
+            remaining_pages,
+            BTreeSet::from([root_page.get()]),
+            "masked cleanup must reclaim every overflow page before returning"
         );
     }
 

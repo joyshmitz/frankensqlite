@@ -56,6 +56,7 @@ impl WalCommitSyncPolicy {
 }
 
 /// The inner mutable pager state protected by a mutex.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: F,
@@ -1033,22 +1034,49 @@ where
         let active_transactions_before_begin = inner.active_transactions;
 
         // ── In-memory fast path ─────────────────────────────────────
-        // For in-memory VFS, skip journal recovery and file locking.
-        // We still need to refresh connection-local metadata/publication
-        // state when the first local transaction starts, because another
-        // pager sharing the same `MemoryVfs` can advance page-1 metadata or
-        // the shared WAL backend between transactions.
+        // For in-memory VFS, skip persistent shared-lock ownership between
+        // local transactions. We still need to recover any externally-created
+        // hot journal and refresh connection-local metadata/publication state
+        // when the first local transaction starts, because another pager
+        // sharing the same `MemoryVfs` can mutate the durable image or the
+        // shared WAL backend between transactions.
         if self.vfs.is_memory() {
+            let had_recovery_pending = inner.rollback_journal_recovery_pending;
             let commit_seq_before_refresh = inner.commit_seq;
             if active_transactions_before_begin == 0 {
+                let journal_path = Self::journal_path(&self.db_path);
+                let journal_exists = self.vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
+                let journal_visibility_invalidation = had_recovery_pending || journal_exists;
                 {
                     let mut cache = self
                         .cache
                         .lock()
                         .map_err(|_| FrankenError::internal("SimplePager cache lock poisoned"))?;
+                    if inner.rollback_journal_recovery_pending || journal_exists {
+                        let page_size = inner.page_size;
+                        match Self::recover_rollback_journal_if_present_locked(
+                            cx,
+                            &*self.vfs,
+                            &mut inner.db_file,
+                            &journal_path,
+                            page_size,
+                            LockLevel::None,
+                        ) {
+                            Ok(false) if had_recovery_pending => {
+                                return Err(FrankenError::internal(
+                                    "rollback journal missing while local recovery was pending",
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(err) => return Err(err),
+                        }
+                        cache.clear();
+                        inner.rollback_journal_recovery_pending = false;
+                    }
                     inner.refresh_committed_state(cx, &mut cache)?;
                 }
-                let clear_published_pages = inner.commit_seq != commit_seq_before_refresh;
+                let clear_published_pages = journal_visibility_invalidation
+                    || inner.commit_seq != commit_seq_before_refresh;
                 self.published.publish(
                     cx,
                     PublishedPagerUpdate {

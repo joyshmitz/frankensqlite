@@ -8,10 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite_e2e::benchmark::BenchmarkSummary;
 use fsqlite_e2e::fixture_select::{
-    build_benchmark_artifact_manifest, load_beads_benchmark_campaign, BenchmarkArtifactCommand,
-    BenchmarkArtifactManifest, BenchmarkArtifactProvenanceCapture, BenchmarkArtifactRetentionClass,
+    BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BenchmarkArtifactCommand, BenchmarkArtifactManifest,
+    BenchmarkArtifactProvenanceCapture, BenchmarkArtifactRetentionClass,
     BenchmarkArtifactToolVersion, BenchmarkMode, ExpandedBenchmarkCell,
-    BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, PLACEMENT_PROFILE_BASELINE_UNPINNED,
+    PLACEMENT_PROFILE_BASELINE_UNPINNED, build_benchmark_artifact_manifest,
+    load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
 use serde::Serialize;
@@ -25,15 +26,68 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn artifact_dir() -> PathBuf {
-    let repo_root = repo_root();
-    std::env::var_os("FSQLITE_MATRIX_ARTIFACT_DIR").map_or_else(
+fn short_hash(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+fn default_matrix_artifact_dir(
+    repo_root: &Path,
+    campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
+    run_id: &str,
+    source_revision: &str,
+    beads_data_hash: &str,
+) -> PathBuf {
+    repo_root
+        .join(&campaign.artifact_contract.artifact_root_relpath)
+        .join(format!(
+            "matrix_suite__run_{run_id}__rev_{}__beads_{}",
+            short_hash(source_revision),
+            short_hash(beads_data_hash),
+        ))
+}
+
+fn resolve_matrix_artifact_dir(
+    repo_root: &Path,
+    campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
+    override_path: Option<PathBuf>,
+    run_id: &str,
+    source_revision: &str,
+    beads_data_hash: &str,
+) -> PathBuf {
+    override_path.map_or_else(
         || {
-            repo_root.join(
-                "artifacts/perf/bd-db300.1.2/run_20260317T083212Z__rev_6b071b159606__beads_60f9bb3f1ace",
+            default_matrix_artifact_dir(
+                repo_root,
+                campaign,
+                run_id,
+                source_revision,
+                beads_data_hash,
             )
         },
-        PathBuf::from,
+        |path| {
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        },
+    )
+}
+
+fn artifact_dir(
+    repo_root: &Path,
+    campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
+    run_id: &str,
+    source_revision: &str,
+    beads_data_hash: &str,
+) -> PathBuf {
+    resolve_matrix_artifact_dir(
+        repo_root,
+        campaign,
+        std::env::var_os("FSQLITE_MATRIX_ARTIFACT_DIR").map(PathBuf::from),
+        run_id,
+        source_revision,
+        beads_data_hash,
     )
 }
 
@@ -263,7 +317,7 @@ fn resolve_canonical_cell(
                 summary.concurrency,
                 benchmark_mode_id(mode)
             )
-            .into())
+            .into());
         }
         [row] => *row,
         rows => {
@@ -366,6 +420,46 @@ fn beads_campaign_row_keys_are_unambiguous() -> Result<(), Box<dyn Error>> {
         "campaign row keys must stay unique for canonical resolution:\n{}",
         ambiguous.join("\n")
     );
+    Ok(())
+}
+
+#[test]
+fn matrix_artifact_dir_default_tracks_current_run_identity() -> Result<(), Box<dyn Error>> {
+    let repo_root = repo_root();
+    let campaign = load_beads_benchmark_campaign(&repo_root)
+        .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
+    let beads_data_hash = "a".repeat(64);
+    let artifact_dir = resolve_matrix_artifact_dir(
+        &repo_root,
+        &campaign,
+        None,
+        "matrix-123",
+        "0123456789abcdef0123456789abcdef01234567",
+        &beads_data_hash,
+    );
+    assert_eq!(
+        artifact_dir,
+        repo_root
+            .join(&campaign.artifact_contract.artifact_root_relpath)
+            .join("matrix_suite__run_matrix-123__rev_0123456789ab__beads_aaaaaaaaaaaa")
+    );
+    Ok(())
+}
+
+#[test]
+fn matrix_artifact_dir_relative_override_is_repo_relative() -> Result<(), Box<dyn Error>> {
+    let repo_root = repo_root();
+    let campaign = load_beads_benchmark_campaign(&repo_root)
+        .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
+    let artifact_dir = resolve_matrix_artifact_dir(
+        &repo_root,
+        &campaign,
+        Some(PathBuf::from("tmp/matrix-output")),
+        "matrix-123",
+        "0123456789abcdef0123456789abcdef01234567",
+        &"a".repeat(64),
+    );
+    assert_eq!(artifact_dir, repo_root.join("tmp/matrix-output"));
     Ok(())
 }
 
@@ -597,7 +691,18 @@ fn rewrite_jsonl_with_canonical_records(
 #[ignore = "Runs the complete canonical benchmark matrix and writes artifact bundles."]
 fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     let repo_root = repo_root();
-    let artifact_dir = artifact_dir();
+    let campaign = load_beads_benchmark_campaign(&repo_root)
+        .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
+    let run_id = matrix_run_id();
+    let source_revision = git_head_revision(&repo_root)?;
+    let beads_data_hash = sha256_file(&repo_root.join(&campaign.beads_data_relpath))?;
+    let artifact_dir = artifact_dir(
+        &repo_root,
+        &campaign,
+        &run_id,
+        &source_revision,
+        &beads_data_hash,
+    );
     fs::create_dir_all(&artifact_dir)?;
 
     let fixture_filter = std::env::var("FSQLITE_MATRIX_DB").ok();
@@ -694,11 +799,6 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         single_command_args = Some(args);
     }
 
-    let campaign = load_beads_benchmark_campaign(&repo_root)
-        .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
-    let run_id = matrix_run_id();
-    let source_revision = git_head_revision(&repo_root)?;
-    let beads_data_hash = sha256_file(&repo_root.join(&campaign.beads_data_relpath))?;
     let mut generated_bundles = Vec::new();
 
     let mut combined = String::new();
@@ -762,7 +862,19 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
 #[test]
 #[ignore = "Runs a targeted hot-path diagnosis for a single FrankenSQLite workload cell."]
 fn hot_profile_diagnosis() -> Result<(), Box<dyn Error>> {
-    let artifact_root = artifact_dir();
+    let repo_root = repo_root();
+    let campaign = load_beads_benchmark_campaign(&repo_root)
+        .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
+    let run_id = matrix_run_id();
+    let source_revision = git_head_revision(&repo_root)?;
+    let beads_data_hash = sha256_file(&repo_root.join(&campaign.beads_data_relpath))?;
+    let artifact_root = artifact_dir(
+        &repo_root,
+        &campaign,
+        &run_id,
+        &source_revision,
+        &beads_data_hash,
+    );
     fs::create_dir_all(&artifact_root)?;
 
     let db = std::env::var("FSQLITE_DIAG_DB")
@@ -777,7 +889,14 @@ fn hot_profile_diagnosis() -> Result<(), Box<dyn Error>> {
     let scale = std::env::var("FSQLITE_DIAG_SCALE").unwrap_or_else(|_| "100".to_owned());
     let output_dir = std::env::var_os("FSQLITE_DIAG_OUTPUT_DIR").map_or_else(
         || artifact_root.join(format!("{db}_{workload}_c{concurrency}_hot_profile")),
-        PathBuf::from,
+        |path| {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        },
     );
     fs::create_dir_all(&output_dir)?;
 

@@ -201,6 +201,8 @@ where
     let mut verify_proof_path: Option<String> = None;
     let mut verify_policy_id = DEFAULT_VERIFY_POLICY_ID;
     let mut verify_slack = DEFAULT_VERIFY_SLACK;
+    let mut verify_policy_id_set = false;
+    let mut verify_slack_set = false;
     let mut show_help = false;
 
     while let Some(argument) = iter.next() {
@@ -245,17 +247,27 @@ where
                 verify_proof_path = Some(next.to_string_lossy().into_owned());
             }
             "--verify-policy-id" => {
+                if verify_policy_id_set {
+                    return Err(String::from(
+                        "`--verify-policy-id` may only be provided once",
+                    ));
+                }
                 let next = iter.next().ok_or_else(|| {
                     String::from("missing integer argument for `--verify-policy-id`")
                 })?;
                 verify_policy_id =
                     parse_u32_option(next.to_string_lossy().as_ref(), "--verify-policy-id")?;
+                verify_policy_id_set = true;
             }
             "--verify-slack" => {
+                if verify_slack_set {
+                    return Err(String::from("`--verify-slack` may only be provided once"));
+                }
                 let next = iter
                     .next()
                     .ok_or_else(|| String::from("missing integer argument for `--verify-slack`"))?;
                 verify_slack = parse_u32_option(next.to_string_lossy().as_ref(), "--verify-slack")?;
+                verify_slack_set = true;
             }
             _ => {
                 if let Some(value) = arg_str.strip_prefix("-c=") {
@@ -303,12 +315,22 @@ where
                 }
 
                 if let Some(value) = arg_str.strip_prefix("--verify-policy-id=") {
+                    if verify_policy_id_set {
+                        return Err(String::from(
+                            "`--verify-policy-id` may only be provided once",
+                        ));
+                    }
                     verify_policy_id = parse_u32_option(value, "--verify-policy-id")?;
+                    verify_policy_id_set = true;
                     continue;
                 }
 
                 if let Some(value) = arg_str.strip_prefix("--verify-slack=") {
+                    if verify_slack_set {
+                        return Err(String::from("`--verify-slack` may only be provided once"));
+                    }
                     verify_slack = parse_u32_option(value, "--verify-slack")?;
+                    verify_slack_set = true;
                     continue;
                 }
 
@@ -331,6 +353,12 @@ where
                 has_path = true;
             }
         }
+    }
+
+    if !show_help && verify_proof_path.is_none() && (verify_policy_id_set || verify_slack_set) {
+        return Err(String::from(
+            "`--verify-policy-id` and `--verify-slack` require `--verify-proof`",
+        ));
     }
 
     Ok(CliOptions {
@@ -1284,6 +1312,57 @@ mod tests {
         let error = parse_from(&["fsqlite", "--verify-proof", "proof.json", "-c", "SELECT 1;"])
             .expect_err("verify-proof and command should conflict");
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_parse_verify_policy_id_requires_verify_proof() {
+        let error = parse_from(&["fsqlite", "--verify-policy-id", "7"])
+            .expect_err("verify-policy-id should require verify-proof mode");
+        assert!(error.contains("require `--verify-proof`"));
+    }
+
+    #[test]
+    fn test_parse_verify_slack_requires_verify_proof() {
+        let error = parse_from(&["fsqlite", "--verify-slack=3"])
+            .expect_err("verify-slack should require verify-proof mode");
+        assert!(error.contains("require `--verify-proof`"));
+    }
+
+    #[test]
+    fn test_parse_verify_policy_id_rejects_duplicates() {
+        let error = parse_from(&[
+            "fsqlite",
+            "--verify-proof",
+            "proof.json",
+            "--verify-policy-id=7",
+            "--verify-policy-id",
+            "8",
+        ])
+        .expect_err("duplicate verify-policy-id flags should fail");
+        assert_eq!(error, "`--verify-policy-id` may only be provided once");
+    }
+
+    #[test]
+    fn test_parse_verify_slack_rejects_duplicates() {
+        let error = parse_from(&[
+            "fsqlite",
+            "--verify-proof",
+            "proof.json",
+            "--verify-slack",
+            "3",
+            "--verify-slack=4",
+        ])
+        .expect_err("duplicate verify-slack flags should fail");
+        assert_eq!(error, "`--verify-slack` may only be provided once");
+    }
+
+    #[test]
+    fn test_parse_help_still_allows_verify_flags_without_verify_proof() {
+        let options = parse_from(&["fsqlite", "--help", "--verify-policy-id", "7"])
+            .expect("help should short-circuit option-specific validation");
+        assert!(options.show_help);
+        assert_eq!(options.verify_policy_id, 7);
+        assert!(options.verify_proof_path.is_none());
     }
 
     #[test]

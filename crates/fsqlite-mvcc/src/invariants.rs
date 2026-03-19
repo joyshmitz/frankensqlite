@@ -653,9 +653,7 @@ impl VersionStore {
         snapshot: &Snapshot,
     ) -> Option<PageVersion> {
         'retry: loop {
-            let Some(head_idx) = self.chain_heads.get_head(page) else {
-                return None;
-            };
+            let head_idx = self.chain_heads.get_head(page)?;
 
             let arena = self.arena.read();
             let mut current_idx = head_idx;
@@ -671,9 +669,7 @@ impl VersionStore {
                     return Some(version.clone());
                 }
 
-                let Some(prev_ptr) = version.prev else {
-                    return None;
-                };
+                let prev_ptr = version.prev?;
                 current_idx = version_pointer_to_idx(prev_ptr);
             }
         }
@@ -689,9 +685,7 @@ impl VersionStore {
         snapshot: &Snapshot,
     ) -> Option<CommitSeq> {
         'retry: loop {
-            let Some(head_idx) = self.chain_heads.get_head(page) else {
-                return None;
-            };
+            let head_idx = self.chain_heads.get_head(page)?;
 
             let arena = self.arena.read();
             let mut current_idx = head_idx;
@@ -705,9 +699,7 @@ impl VersionStore {
                     return Some(version.commit_seq);
                 }
 
-                let Some(prev_ptr) = version.prev else {
-                    return None;
-                };
+                let prev_ptr = version.prev?;
                 current_idx = version_pointer_to_idx(prev_ptr);
             }
         }
@@ -722,9 +714,7 @@ impl VersionStore {
     #[allow(clippy::significant_drop_tightening)]
     pub fn chain_head_version(&self, page: PageNumber) -> Option<PageVersion> {
         'retry: loop {
-            let Some(head_idx) = self.chain_heads.get_head(page) else {
-                return None;
-            };
+            let head_idx = self.chain_heads.get_head(page)?;
 
             let arena = self.arena.read();
             let Some(version) = arena.get(head_idx) else {

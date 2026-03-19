@@ -251,13 +251,13 @@ type CellExtract<'a> = (&'a [u8], Option<i64>, [u8; 16]);
 ///
 /// Returns [`MergeError::PageParseError`] or [`MergeError::InvalidPageBuffer`]
 /// if the page buffer is invalid or truncated.
-pub fn parse_btree_page<'a>(
-    page: &'a [u8],
+pub fn parse_btree_page(
+    page: &[u8],
     page_size: PageSize,
     reserved_per_page: u8,
     is_page1: bool,
     btree_ref: BtreeRef,
-) -> Result<ParsedPage<'a>, MergeError> {
+) -> Result<ParsedPage<'_>, MergeError> {
     let header = BTreePageHeader::parse(page, page_size, reserved_per_page, is_page1)
         .map_err(|e| MergeError::PageParseError(format!("{e}")))?;
 
@@ -305,13 +305,13 @@ pub fn parse_btree_page<'a>(
 
 /// Extract a single cell's raw bytes, rowid (if table B-tree), and key digest.
 #[allow(clippy::cast_possible_truncation)]
-fn extract_cell_with_digest<'a>(
-    page: &'a [u8],
+fn extract_cell_with_digest(
+    page: &[u8],
     cell_offset: usize,
     usable: usize,
     page_type: BTreePageType,
     btree_ref: BtreeRef,
-) -> Result<CellExtract<'a>, MergeError> {
+) -> Result<CellExtract<'_>, MergeError> {
     let remaining = &page[cell_offset..usable.min(page.len())];
 
     match page_type {
@@ -325,11 +325,11 @@ fn extract_cell_with_digest<'a>(
 }
 
 /// Parse a leaf table cell: `[varint payload_size][varint rowid][payload...][overflow?]`
-fn parse_leaf_table_cell<'a>(
-    data: &'a [u8],
+fn parse_leaf_table_cell(
+    data: &[u8],
     btree_ref: BtreeRef,
     usable: u32,
-) -> Result<CellExtract<'a>, MergeError> {
+) -> Result<CellExtract<'_>, MergeError> {
     let (payload_size, n1) =
         fsqlite_types::serial_type::read_varint(data).ok_or(MergeError::InvalidPageBuffer)?;
     let (rowid_u64, n2) = fsqlite_types::serial_type::read_varint(&data[n1..])
@@ -355,11 +355,11 @@ fn parse_leaf_table_cell<'a>(
 }
 
 /// Parse a leaf index cell: `[varint payload_size][payload...][overflow?]`
-fn parse_leaf_index_cell<'a>(
-    data: &'a [u8],
+fn parse_leaf_index_cell(
+    data: &[u8],
     btree_ref: BtreeRef,
     usable: u32,
-) -> Result<CellExtract<'a>, MergeError> {
+) -> Result<CellExtract<'_>, MergeError> {
     let (payload_size, n1) =
         fsqlite_types::serial_type::read_varint(data).ok_or(MergeError::InvalidPageBuffer)?;
 
@@ -383,10 +383,10 @@ fn parse_leaf_index_cell<'a>(
 }
 
 /// Parse an interior table cell: `[4-byte left_child][varint rowid]`
-fn parse_interior_table_cell<'a>(
-    data: &'a [u8],
+fn parse_interior_table_cell(
+    data: &[u8],
     btree_ref: BtreeRef,
-) -> Result<CellExtract<'a>, MergeError> {
+) -> Result<CellExtract<'_>, MergeError> {
     if data.len() < 4 {
         return Err(MergeError::InvalidPageBuffer);
     }
@@ -406,11 +406,11 @@ fn parse_interior_table_cell<'a>(
 }
 
 /// Parse an interior index cell: `[4-byte left_child][varint payload_size][payload...][overflow?]`
-fn parse_interior_index_cell<'a>(
-    data: &'a [u8],
+fn parse_interior_index_cell(
+    data: &[u8],
     btree_ref: BtreeRef,
     usable: u32,
-) -> Result<CellExtract<'a>, MergeError> {
+) -> Result<CellExtract<'_>, MergeError> {
     if data.len() < 4 {
         return Err(MergeError::InvalidPageBuffer);
     }

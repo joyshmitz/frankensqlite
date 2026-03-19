@@ -10,6 +10,9 @@
 pub mod begin_concurrent;
 pub mod bocpd;
 pub mod cache_aligned;
+pub mod cell_delta_wal;
+pub mod cell_mvcc_boundary;
+pub mod cell_visibility;
 pub mod compat;
 pub mod conflict_model;
 pub mod conformal_martingale;
@@ -71,6 +74,15 @@ pub use cache_aligned::{
     SLOT_TAG_SHIFT, SharedTxnSlot, SlotAcquireError, TAG_CLAIMING, TAG_CLEANING, TxnSlotArray,
     decode_payload, decode_tag, encode_claiming, encode_cleaning, is_sentinel, rcri_bloom,
     slot_mode, slot_state,
+};
+pub use cell_delta_wal::{
+    CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_FRAME_TYPE, CELL_DELTA_HEADER_SIZE,
+    CELL_DELTA_MAX_DATA_LEN, CELL_DELTA_MIN_FRAME_SIZE, CellDeltaOp, CellDeltaRecoverySummary,
+    CellDeltaWalFrame, deserialize_cell_delta_batch, serialize_cell_delta_batch,
+};
+pub use cell_visibility::{
+    CellConflict, CellDelta, CellDeltaArena, CellDeltaIdx, CellDeltaKind, CellGcStats, CellKey,
+    CellVisibilityLog, MutationOutcome, can_be_logical_insert, will_be_logical_delete,
 };
 pub use compat::{
     CompatMode, CoordinatorProbeResult, HybridShmState, ReadLockOutcome, RecoveryPlan,

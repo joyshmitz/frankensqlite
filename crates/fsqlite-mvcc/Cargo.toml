@@ -15,6 +15,7 @@ linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
 
 [dependencies]
 blake3 = { workspace = true }
+crc32c = { workspace = true }
 crossbeam-epoch = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
