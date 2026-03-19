@@ -199,6 +199,16 @@ pub trait WalBackend: Send {
         Ok(0)
     }
 
+    /// Count committed transactions visible in the current WAL snapshot.
+    ///
+    /// This lets the pager derive a connection-local visible commit sequence
+    /// from the durable database header change-counter plus the currently
+    /// visible WAL commit horizon, without depending on whether page 1 was
+    /// rewritten in recent WAL commits.
+    fn committed_txn_count(&mut self, _cx: &Cx) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Sync the WAL file to stable storage.
     fn sync(&mut self, cx: &Cx) -> Result<()>;
 

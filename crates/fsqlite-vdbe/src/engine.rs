@@ -7527,6 +7527,11 @@ impl VdbeEngine {
                                                     self.collect_vdbe_metrics,
                                                     DecodeCacheInvalidationReason::WriteMutation,
                                                 );
+                                                self.mark_statement_cold_state(
+                                                    StatementColdState::CONFLICT_TRACKING,
+                                                );
+                                                self.pending_idx_entries
+                                                    .push((cursor_id, key_bytes.to_vec()));
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -11747,6 +11752,86 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(0)]]
         );
+    }
+
+    #[test]
+    fn test_secondary_index_rollback_removes_tracked_replace_entry() {
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(1);
+        let index_root = db.allocate_root_page();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+
+        let payload = encode_record(&[SqliteValue::Integer(99)]);
+        {
+            let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &payload)
+                .expect("provisional table row should insert");
+            assert!(
+                table_cursor
+                    .cursor
+                    .table_move_to(&table_cursor.cx, 2)
+                    .expect("table seek should succeed")
+                    .is_found()
+            );
+        }
+
+        let index_key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(2)]);
+        {
+            let index_cursor = engine.storage_cursors.get_mut(&1).unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &index_key)
+                .expect("index entry should insert");
+            assert!(
+                index_cursor
+                    .cursor
+                    .index_move_to(&index_cursor.cx, &index_key)
+                    .expect("index seek should succeed")
+                    .is_found()
+            );
+        }
+
+        engine.changes = 1;
+        engine.pending_insert_rollback = Some(PendingInsertRollback {
+            cursor_id: 0,
+            rowid: 2,
+            previous_last_insert_rowid: 0,
+            previous_last_insert_rowid_valid: false,
+            update_restore: None,
+        });
+        engine.pending_idx_entries.push((1, index_key.clone()));
+
+        engine
+            .rollback_pending_insert_after_index_conflict()
+            .expect("rollback should remove provisional row and tracked index entries");
+
+        let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
+        assert!(
+            !table_cursor
+                .cursor
+                .table_move_to(&table_cursor.cx, 2)
+                .expect("post-rollback table seek should succeed")
+                .is_found()
+        );
+
+        let index_cursor = engine.storage_cursors.get_mut(&1).unwrap();
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &index_key)
+                .expect("post-rollback index seek should succeed")
+                .is_found()
+        );
+        assert_eq!(engine.changes(), 0);
     }
 
     #[test]

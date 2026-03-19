@@ -105,6 +105,7 @@ struct WalPublishedSnapshot {
     publication_seq: u64,
     generation: WalGenerationIdentity,
     last_commit_frame: Option<usize>,
+    commit_count: u64,
     page_index: Arc<HashMap<u32, usize>>,
     index_is_partial: bool,
 }
@@ -116,6 +117,7 @@ impl WalPublishedSnapshot {
             publication_seq,
             generation,
             last_commit_frame: None,
+            commit_count: 0,
             page_index: Arc::new(HashMap::new()),
             index_is_partial: false,
         }
@@ -126,6 +128,7 @@ impl WalPublishedSnapshot {
 struct PendingPublicationFrame {
     page_number: u32,
     frame_index: usize,
+    is_commit: bool,
 }
 
 pub struct WalBackendAdapter<F: VfsFile> {
@@ -240,6 +243,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
 
         let previous_generation = self.published_snapshot.generation;
         let previous_last_commit = self.published_snapshot.last_commit_frame;
+        let previous_commit_count = if previous_generation == generation {
+            self.published_snapshot.commit_count
+        } else {
+            0
+        };
         let mut page_index = if previous_generation == generation {
             std::mem::replace(
                 &mut self.published_snapshot.page_index,
@@ -298,12 +306,43 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 }
             }
         };
+        let commit_count_result = match last_commit_frame {
+            None => Ok(0),
+            Some(current_last_commit) => match (previous_generation == generation, previous_last_commit)
+            {
+                (true, Some(previous_last_commit))
+                    if previous_last_commit < current_last_commit =>
+                {
+                    self.count_commit_frames_in_range(
+                        cx,
+                        previous_last_commit.saturating_add(1),
+                        current_last_commit,
+                    )
+                    .map(|delta| previous_commit_count.saturating_add(delta))
+                }
+                (true, Some(previous_last_commit))
+                    if previous_last_commit == current_last_commit =>
+                {
+                    Ok(previous_commit_count)
+                }
+                _ => self.count_commit_frames_in_range(cx, 0, current_last_commit),
+            },
+        };
         if let Err(error) = update_result {
             if previous_generation == generation {
                 self.published_snapshot.page_index = page_index;
             }
             return Err(error);
         }
+        let commit_count = match commit_count_result {
+            Ok(commit_count) => commit_count,
+            Err(error) => {
+                if previous_generation == generation {
+                    self.published_snapshot.page_index = page_index;
+                }
+                return Err(error);
+            }
+        };
 
         let publication_seq = self.next_publication_seq;
         self.next_publication_seq = self.next_publication_seq.saturating_add(1);
@@ -312,6 +351,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             publication_seq,
             generation,
             last_commit_frame,
+            commit_count,
             page_index,
             index_is_partial,
         };
@@ -397,6 +437,21 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             }
         }
         Ok(())
+    }
+
+    /// Count commit frames within the visible range `start..=end`.
+    fn count_commit_frames_in_range(&mut self, cx: &Cx, start: usize, end: usize) -> Result<u64> {
+        if start > end {
+            return Ok(0);
+        }
+
+        let mut commit_count = 0_u64;
+        for frame_index in start..=end {
+            if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                commit_count = commit_count.saturating_add(1);
+            }
+        }
+        Ok(commit_count)
     }
 
     /// Backwards linear scan of committed frames to find a page that was not
@@ -568,6 +623,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 .push(PendingPublicationFrame {
                     page_number,
                     frame_index,
+                    is_commit: db_size_if_commit != 0,
                 });
             if db_size_if_commit != 0 {
                 last_commit_frame = Some(frame_index);
@@ -607,8 +663,14 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         } else {
             None
         };
+        let previous_commit_count = if can_extend_previous {
+            self.published_snapshot.commit_count
+        } else {
+            0
+        };
 
         let mut frame_delta_count = 0_usize;
+        let mut commit_delta_count = 0_u64;
         for frame in &self.pending_publication_frames {
             if previous_last_commit
                 .is_some_and(|previous_last_commit| frame.frame_index <= previous_last_commit)
@@ -626,6 +688,9 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             } else {
                 index_is_partial = true;
             }
+            if frame.is_commit {
+                commit_delta_count = commit_delta_count.saturating_add(1);
+            }
         }
 
         if frame_delta_count == 0 {
@@ -640,6 +705,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             publication_seq,
             generation,
             last_commit_frame: Some(last_commit_frame),
+            commit_count: previous_commit_count.saturating_add(commit_delta_count),
             page_index,
             index_is_partial,
         };
@@ -1061,6 +1127,16 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         }
 
         Ok(committed_txns_after_page)
+    }
+
+    fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {
+        let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
+            snapshot
+        } else {
+            self.publish_latest_committed_snapshot(cx, "committed_txn_count")?;
+            self.published_snapshot.clone()
+        };
+        Ok(snapshot.commit_count)
     }
 
     fn sync(&mut self, cx: &Cx) -> Result<()> {
@@ -1973,6 +2049,11 @@ mod tests {
             "commit append should publish the visible commit horizon"
         );
         assert_eq!(
+            adapter.published_snapshot.commit_count,
+            1,
+            "commit append should track the visible WAL commit count"
+        );
+        assert_eq!(
             adapter.published_snapshot.page_index.len(),
             2,
             "published snapshot should track both committed pages"
@@ -2017,6 +2098,11 @@ mod tests {
             adapter.published_snapshot.last_commit_frame,
             Some(1),
             "prepared commit append should publish the visible commit horizon"
+        );
+        assert_eq!(
+            adapter.published_snapshot.commit_count,
+            1,
+            "prepared commit append should track the visible WAL commit count"
         );
         assert_eq!(
             adapter.published_snapshot.page_index.len(),
@@ -2065,6 +2151,11 @@ mod tests {
             follower.published_snapshot.last_commit_frame,
             Some(2),
             "local commit should publish on top of refreshed external WAL state"
+        );
+        assert_eq!(
+            follower.published_snapshot.commit_count,
+            3,
+            "local commit publication should include refreshed external commits"
         );
         assert_eq!(
             follower.published_snapshot.page_index.get(&1),
@@ -2321,6 +2412,12 @@ mod tests {
             adapter
                 .committed_txns_since_page(&cx, 99)
                 .expect("count txns since missing page"),
+            2
+        );
+        assert_eq!(
+            adapter
+                .committed_txn_count(&cx)
+                .expect("count visible transactions"),
             2
         );
     }

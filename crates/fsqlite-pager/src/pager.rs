@@ -71,6 +71,9 @@ pub(crate) struct PagerInner<F: VfsFile> {
     active_transactions: u32,
     /// Whether a checkpoint is currently running.
     checkpoint_active: bool,
+    /// Whether this pager was opened in read-only mode (skip freelist
+    /// scans during refresh since we never allocate pages).
+    readonly: bool,
     /// Deallocated pages available for reuse.
     freelist: Vec<PageNumber>,
     /// Current journal mode (rollback journal vs WAL).
@@ -174,17 +177,45 @@ impl<F: VfsFile> PagerInner<F> {
         Ok(out)
     }
 
+    /// Read a page directly from the main database file, bypassing WAL state.
+    ///
+    /// WAL-mode refresh uses this to obtain the durable database-header
+    /// change-counter as the base commit sequence, then layers the visible WAL
+    /// commit count on top. Metadata such as db_size/freelist still comes from
+    /// [`Self::read_committed_page_copy`], which includes the current visible
+    /// WAL snapshot.
+    fn read_database_file_page_copy(&mut self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        let page_size = self.page_size.as_usize();
+        let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
+        let file_size = self.db_file.file_size(cx)?;
+        if offset >= file_size {
+            return Ok(vec![0_u8; page_size]);
+        }
+
+        let mut out = vec![0_u8; page_size];
+        let bytes_read = self.db_file.read(cx, &mut out, offset)?;
+        if bytes_read < page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read fetching database-file page {page}: got {bytes_read} of {page_size}",
+                    page = page_no.get()
+                ),
+            });
+        }
+        Ok(out)
+    }
+
     /// Refresh connection-local pager metadata from the latest committed state.
     ///
     /// Returns `true` when WAL snapshot setup was already performed as part of
     /// the refresh and does not need to be repeated for the new transaction.
     fn refresh_committed_state(&mut self, cx: &Cx, cache: &mut PageCache) -> Result<bool> {
-        let wal_post_page1_commits = if self.journal_mode == JournalMode::Wal {
+        let wal_visible_commit_count = if self.journal_mode == JournalMode::Wal {
             let wal = self.wal_backend.as_mut().ok_or_else(|| {
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
             wal.begin_transaction(cx)?;
-            wal.committed_txns_since_page(cx, PageNumber::ONE.get())?
+            wal.committed_txn_count(cx)?
         } else {
             0
         };
@@ -218,13 +249,19 @@ impl<F: VfsFile> PagerInner<F> {
             header.page_count
         }
         .max(1);
-        let freelist = load_freelist_from_committed_state(
-            cx,
-            self,
-            db_size,
-            header.freelist_trunk,
-            header.freelist_count,
-        )?;
+        // Skip freelist scan for read-only pagers — the freelist is only
+        // needed for page allocation during writes.
+        let freelist = if self.readonly {
+            Vec::new()
+        } else {
+            load_freelist_from_committed_state(
+                cx,
+                self,
+                db_size,
+                header.freelist_trunk,
+                header.freelist_count,
+            )?
+        };
 
         self.db_size = db_size;
         self.next_page = if db_size >= 2 {
@@ -234,12 +271,34 @@ impl<F: VfsFile> PagerInner<F> {
         };
         self.freelist = freelist;
 
+        let wal_base_change_counter = if self.journal_mode == JournalMode::Wal {
+            let base_page1 = self.read_database_file_page_copy(cx, PageNumber::ONE)?;
+            if base_page1.len() < DATABASE_HEADER_SIZE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database-file page 1 too small for header during WAL refresh: got {}, need {}",
+                        base_page1.len(),
+                        DATABASE_HEADER_SIZE
+                    ),
+                });
+            }
+            let mut base_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+            base_header_bytes.copy_from_slice(&base_page1[..DATABASE_HEADER_SIZE]);
+            let base_header = DatabaseHeader::from_bytes(&base_header_bytes).map_err(|error| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid database-file header during WAL refresh: {error}"),
+                }
+            })?;
+            u64::from(base_header.change_counter)
+        } else {
+            u64::from(header.change_counter)
+        };
+
         let new_commit_seq =
-            CommitSeq::new(u64::from(header.change_counter).saturating_add(wal_post_page1_commits));
+            CommitSeq::new(wal_base_change_counter.saturating_add(wal_visible_commit_count));
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
-        // change-counter plus any committed transactions that occurred after
-        // the most recent committed page-1 frame.
+        // durable header baseline plus the visible WAL commit horizon.
         if new_commit_seq != self.commit_seq {
             cache.clear();
         }
@@ -1765,6 +1824,7 @@ where
                 writer_active: false,
                 active_transactions: 0,
                 checkpoint_active: false,
+                readonly: false,
                 freelist,
                 journal_mode: JournalMode::Delete,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -1877,6 +1937,7 @@ where
                 freelist,
                 journal_mode: JournalMode::Delete,
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
+                readonly: true,
                 rollback_journal_recovery_pending: false,
                 wal_backend: None,
                 commit_seq: initial_commit_seq,
@@ -6630,6 +6691,20 @@ mod tests {
             Ok(None)
         }
 
+        fn committed_txn_count(&mut self, cx: &Cx) -> fsqlite_error::Result<u64> {
+            let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
+                return Ok(0);
+            };
+
+            let mut commit_count = 0_u64;
+            for frame_index in 0..=last_commit_frame {
+                if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                    commit_count = commit_count.saturating_add(1);
+                }
+            }
+            Ok(commit_count)
+        }
+
         fn sync(&mut self, cx: &Cx) -> fsqlite_error::Result<()> {
             self.wal.sync(cx, SyncFlags::NORMAL)
         }
@@ -6785,6 +6860,20 @@ mod tests {
             _page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
             Ok(None)
+        }
+
+        fn committed_txn_count(&mut self, cx: &Cx) -> fsqlite_error::Result<u64> {
+            let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
+                return Ok(0);
+            };
+
+            let mut commit_count = 0_u64;
+            for frame_index in 0..=last_commit_frame {
+                if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                    commit_count = commit_count.saturating_add(1);
+                }
+            }
+            Ok(commit_count)
         }
 
         fn sync(&mut self, cx: &Cx) -> fsqlite_error::Result<()> {
@@ -7280,6 +7369,16 @@ mod tests {
             Ok(committed_txns_after_page)
         }
 
+        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
+            Ok(self
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                .count() as u64)
+        }
+
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
             *self.sync_calls.lock().unwrap() += 1;
             Ok(())
@@ -7427,6 +7526,16 @@ mod tests {
                 .rev()
                 .find(|(pn, _, _)| *pn == page_number)
                 .map(|(_, data, _)| data.clone()))
+        }
+
+        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
+            Ok(self
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                .count() as u64)
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -11163,6 +11272,7 @@ mod tests {
                 journal_mode: JournalMode::Wal,
                 freelist_count: 0,
                 checkpoint_active: false,
+                readonly: false,
             },
             page_no,
             page.clone(),
@@ -11199,6 +11309,7 @@ mod tests {
                 db_size: 4,
                 journal_mode: JournalMode::Wal,
                 freelist_count: 0,
+                readonly: false,
                 checkpoint_active: false,
             },
             |pages| {
@@ -11212,6 +11323,7 @@ mod tests {
                 visible_commit_seq: CommitSeq::new(7),
                 db_size: 4,
                 journal_mode: JournalMode::Wal,
+                readonly: false,
                 freelist_count: 0,
                 checkpoint_active: false,
             },
