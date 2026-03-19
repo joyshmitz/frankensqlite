@@ -52707,6 +52707,96 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_concurrent_rounds_single_connection_preserve_increment_base_bd_rjc() {
+        const TXNS: usize = 128;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bd_rjc_explicit_concurrent_rounds_single_conn.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (1, 0);").unwrap();
+
+        for round in 0..TXNS {
+            conn.execute("BEGIN CONCURRENT;").unwrap();
+            assert_eq!(
+                conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;").unwrap(),
+                1,
+                "explicit concurrent round {round} should affect exactly one row"
+            );
+            conn.execute("COMMIT;").unwrap();
+
+            let expected = i64::try_from(round + 1).unwrap();
+            let observed = conn
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .get(0)
+                .cloned();
+            assert_eq!(
+                observed,
+                Some(SqliteValue::Integer(expected)),
+                "single-connection explicit concurrent rounds must advance monotonically after round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_explicit_concurrent_rounds_two_connections_without_overlap_preserve_increment_base_bd_rjc(
+    ) {
+        const ROUNDS_PER_CONN: usize = 96;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("bd_rjc_explicit_concurrent_rounds_two_conn_no_overlap.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        let setup = Connection::open(&db).unwrap();
+        setup.execute("PRAGMA busy_timeout=5000;").unwrap();
+        setup.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        setup.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        setup.execute("INSERT INTO t (id, v) VALUES (1, 0);").unwrap();
+        drop(setup);
+
+        let conn_a = Connection::open(&db).unwrap();
+        let conn_b = Connection::open(&db).unwrap();
+        for conn in [&conn_a, &conn_b] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        let mut committed = 0_i64;
+        for round in 0..ROUNDS_PER_CONN {
+            for (label, conn) in [("a", &conn_a), ("b", &conn_b)] {
+                conn.execute("BEGIN CONCURRENT;").unwrap();
+                assert_eq!(
+                    conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;").unwrap(),
+                    1,
+                    "connection {label} round {round} should affect exactly one row"
+                );
+                conn.execute("COMMIT;").unwrap();
+
+                committed += 1;
+                let observed = conn
+                    .query_row("SELECT v FROM t WHERE id = 1;")
+                    .unwrap()
+                    .get(0)
+                    .cloned();
+                assert_eq!(
+                    observed,
+                    Some(SqliteValue::Integer(committed)),
+                    "two long-lived connections without overlap must keep rebinding the latest committed row after connection {label} round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_sequential_single_account_increment_oracle_probe_bd_rjc() {
         const TXNS: usize = 640;
 

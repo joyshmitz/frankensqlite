@@ -8418,16 +8418,15 @@ impl VdbeEngine {
                             ))
                         })?;
 
+                    let accum_reg = op.p3;
+                    let is_distinct = op.p1 != 0;
+                    self.mark_statement_cold_state(StatementColdState::AGGREGATES);
                     let start_idx = usize::try_from(op.p2).unwrap_or(0);
                     let count = usize::from(op.p5);
                     let end_idx = start_idx.saturating_add(count);
                     let limit = self.registers.len();
                     let clamped_start = start_idx.min(limit);
                     let args = &self.registers[clamped_start..end_idx.min(limit)];
-
-                    let accum_reg = op.p3;
-                    let is_distinct = op.p1 != 0;
-                    self.mark_statement_cold_state(StatementColdState::AGGREGATES);
                     let ctx = self.aggregates.entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         AggregateContext {
@@ -8540,15 +8539,14 @@ impl VdbeEngine {
                         ))
                     })?;
 
+                    let accum_reg = op.p3;
+                    self.mark_statement_cold_state(StatementColdState::WINDOW_CONTEXTS);
                     let start_idx = usize::try_from(op.p2).unwrap_or(0);
                     let count = usize::from(op.p5);
                     let end_idx = start_idx.saturating_add(count);
                     let limit = self.registers.len();
                     let clamped_start = start_idx.min(limit);
                     let args = &self.registers[clamped_start..end_idx.min(limit)];
-
-                    let accum_reg = op.p3;
-                    self.mark_statement_cold_state(StatementColdState::WINDOW_CONTEXTS);
                     let ctx = self.window_contexts.entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         WindowContext {

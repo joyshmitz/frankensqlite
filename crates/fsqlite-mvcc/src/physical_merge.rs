@@ -652,7 +652,7 @@ pub fn apply_patch<'a>(
                     op.cell_key_digest,
                     ParsedCell {
                         cell_key_digest: op.cell_key_digest,
-                        cell_bytes: cell_bytes,
+                        cell_bytes,
                         rowid,
                     },
                 );
@@ -678,8 +678,8 @@ pub fn apply_patch<'a>(
     cells.sort_by(|a, b| match (a.rowid, b.rowid) {
         (Some(ra), Some(rb)) => ra.cmp(&rb),
         (None, None) => {
-            let key_a = extract_index_key_from_cell(&a.cell_bytes, base.page_type, usable);
-            let key_b = extract_index_key_from_cell(&b.cell_bytes, base.page_type, usable);
+            let key_a = extract_index_key_from_cell(a.cell_bytes, base.page_type, usable);
+            let key_b = extract_index_key_from_cell(b.cell_bytes, base.page_type, usable);
             key_a.cmp(key_b)
         }
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -832,7 +832,7 @@ pub fn repack_btree_page(
         write_offset -= cell_len;
 
         // Write cell bytes
-        page[write_offset..write_offset + cell_len].copy_from_slice(&cell.cell_bytes);
+        page[write_offset..write_offset + cell_len].copy_from_slice(cell.cell_bytes);
 
         // Write cell pointer
         #[allow(clippy::cast_possible_truncation)]

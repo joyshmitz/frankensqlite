@@ -807,7 +807,17 @@ impl TransactionManager {
                 GLOBAL_EBR_METRICS.record_gc_freed(freed_u64);
             }
 
-            chain_len = self.version_store.chain_length(pgno);
+            // `enforce_chain_bound_for_page()` is only reached while the caller
+            // still owns write exclusion for `pgno` (page lock in concurrent
+            // mode, global write exclusion in serialized mode), so the page
+            // cannot gain a newer committed version between this prune and the
+            // immediate length check. Reuse the observed removal count to avoid
+            // a second full chain walk after successful eager GC.
+            chain_len = if freed > 0 {
+                chain_len.saturating_sub(freed)
+            } else {
+                self.version_store.chain_length(pgno)
+            };
             self.record_chain_length_sample(chain_len);
             if chain_len < self.max_chain_length {
                 return Ok(());

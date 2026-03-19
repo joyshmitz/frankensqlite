@@ -713,7 +713,7 @@ impl VersionStore {
         }
     }
 
-    /// Read and clone the latest committed chain head for `page`.
+    /// Retrieve the most recent visible version of a page (the head of the chain).
     ///
     /// This is the newest committed version regardless of snapshot
     /// visibility. The helper keeps head lookup + arena read in a single
@@ -1832,7 +1832,7 @@ mod tests {
         let t2_id = mgr.alloc_txn_id().unwrap();
         let mut t2 = Transaction::new(t2_id, TxnEpoch::new(0), snap0, TransactionMode::Concurrent);
 
-        // t2: T1 writes P1 (private write_set version)
+        // t2: T1 writes P1 (private write-set version)
         lock_table.try_acquire(p1, t1_id).unwrap();
         t1.page_locks.insert(p1);
         t1.write_set.push(p1);
