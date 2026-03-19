@@ -291,16 +291,14 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             _ => continue,
         };
 
-        // Stock SQLite virtual tables (FTS5, rtree, etc.) have
-        // rootpage=0 and CREATE SQL beginning with CREATE VIRTUAL TABLE.
-        // Skip only that combination: FrankenSQLite may preserve virtual-table
-        // SQL text while still materializing the table onto a real root page.
-        let is_virtual = root_page_num == 0
-            && create_sql
-                .trim_start()
-                .to_ascii_uppercase()
-                .starts_with("CREATE VIRTUAL TABLE");
-        if is_virtual {
+        // Detect virtual tables by either of two patterns:
+        //   1. rootpage=0 — the stock SQLite convention (FTS5, rtree, etc.)
+        //   2. CREATE SQL starts with CREATE VIRTUAL TABLE — FrankenSQLite-native
+        //      virtual tables that are assigned a positive rootpage number.
+        // Using AND here was the bug (PR #33): a positive-rootpage virtual table
+        // would fail condition 1, fall through, and be reloaded as an ordinary
+        // B-tree table on reopen, silently breaking FTS5 and other vtab modules.
+        if root_page_num == 0 || is_virtual_table_sql(&create_sql) {
             continue;
         }
         let root_page_u32 = validate_sqlite_master_root_page(&name, root_page_num)?;
