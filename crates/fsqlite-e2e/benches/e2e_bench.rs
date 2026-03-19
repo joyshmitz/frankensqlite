@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use fsqlite::SqliteValue;
 
 fn criterion_config() -> Criterion {
     Criterion::default().configure_from_args()
@@ -40,12 +41,10 @@ fn bench_sequential_inserts(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                for i in 0..100 {
-                    conn.execute_with_params(
-                        "INSERT INTO t VALUES (?, 'val');",
-                        &[fsqlite_types::value::SqliteValue::Integer(i)],
-                    )
-                    .unwrap();
+                let stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
+                for i in 0..100_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
             },
             BatchSize::LargeInput,
@@ -96,9 +95,11 @@ fn bench_bulk_inserts(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN;").unwrap();
-                for i in 0..1000 {
-                    let val = f64::from(i) * 1.1;
-                    conn.execute(&format!("INSERT INTO t VALUES ({i}, 'name_{i}', {val});"))
+                let stmt = conn
+                    .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 1.1));")
+                    .unwrap();
+                for i in 0..1000_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
                         .unwrap();
                 }
                 conn.execute("COMMIT;").unwrap();
@@ -147,15 +148,21 @@ fn bench_select_queries(c: &mut Criterion) {
         let conn = fsqlite::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
             .unwrap();
-        for i in 0..100 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}');"))
+        {
+            let stmt = conn
+                .prepare("INSERT INTO t VALUES (?1, ('v' || ?1));")
                 .unwrap();
+            for i in 0..100_i64 {
+                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                    .unwrap();
+            }
         }
+        let stmt = conn
+            .prepare("SELECT * FROM t WHERE id >= 25 AND id < 75")
+            .unwrap();
 
         b.iter(|| {
-            let rows = conn
-                .query("SELECT * FROM t WHERE id >= 25 AND id < 75;")
-                .unwrap();
+            let rows = stmt.query().unwrap();
             assert_eq!(rows.len(), 50);
         });
     });
@@ -223,31 +230,42 @@ fn bench_mixed_dml(c: &mut Criterion) {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INTEGER);")
                     .unwrap();
-                for i in 0..200 {
-                    conn.execute(&format!(
-                        "INSERT INTO t VALUES ({i}, 'val_{i}', {});",
-                        i * 10
-                    ))
+                let insert_stmt = conn
+                    .prepare("INSERT INTO t VALUES (?1, ('val_' || ?1), (?1 * 10));")
                     .unwrap();
+                for i in 0..200_i64 {
+                    insert_stmt
+                        .execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
                 conn
             },
             |conn| {
-                for i in 0..50 {
-                    conn.execute(&format!("UPDATE t SET n = {} WHERE id = {i};", i * 100))
+                let update_stmt = conn
+                    .prepare("UPDATE t SET n = (?1 * 100) WHERE id = ?1;")
+                    .unwrap();
+                for i in 0..50_i64 {
+                    update_stmt
+                        .execute_with_params(&[SqliteValue::Integer(i)])
                         .unwrap();
                 }
-                for i in 150..200 {
-                    conn.execute(&format!("DELETE FROM t WHERE id = {i};"))
+                let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1;").unwrap();
+                for i in 150..200_i64 {
+                    delete_stmt
+                        .execute_with_params(&[SqliteValue::Integer(i)])
                         .unwrap();
                 }
-                for i in 200..250 {
-                    conn.execute(&format!("INSERT INTO t VALUES ({i}, 'new_{i}', {i});"))
+                let insert_stmt = conn
+                    .prepare("INSERT INTO t VALUES (?1, ('new_' || ?1), ?1);")
+                    .unwrap();
+                for i in 200..250_i64 {
+                    insert_stmt
+                        .execute_with_params(&[SqliteValue::Integer(i)])
                         .unwrap();
                 }
-                let rows = conn.query("SELECT count(*) FROM t;").unwrap();
-                let count = &rows[0].values()[0];
-                assert_eq!(*count, fsqlite_types::value::SqliteValue::Integer(200));
+                let stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+                let count = &stmt.query_row().unwrap().values()[0];
+                assert_eq!(*count, SqliteValue::Integer(200));
             },
             BatchSize::LargeInput,
         );
@@ -294,12 +312,12 @@ fn bench_write_throughput_autocommit(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                for i in 0..10_000 {
-                    let val = f64::from(i) * 0.137;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'data_{i}', {val});"
-                    ))
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
                     .unwrap();
+                for i in 0..10_000_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
             },
             BatchSize::LargeInput,
@@ -350,15 +368,15 @@ fn bench_write_throughput_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
+                    .unwrap();
                 for batch in 0..10 {
                     conn.execute("BEGIN;").unwrap();
-                    let base = batch * 1000;
+                    let base = batch as i64 * 1000;
                     for i in base..base + 1000 {
-                        let val = f64::from(i) * 0.137;
-                        conn.execute(&format!(
-                            "INSERT INTO bench VALUES ({i}, 'data_{i}', {val});"
-                        ))
-                        .unwrap();
+                        stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                            .unwrap();
                     }
                     conn.execute("COMMIT;").unwrap();
                 }
@@ -409,12 +427,12 @@ fn bench_write_throughput_single_txn(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN;").unwrap();
-                for i in 0..10_000 {
-                    let val = f64::from(i) * 0.137;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'data_{i}', {val});"
-                    ))
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
                     .unwrap();
+                for i in 0..10_000_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
                 conn.execute("COMMIT;").unwrap();
             },
@@ -493,34 +511,42 @@ fn bench_read_heavy_select(c: &mut Criterion) {
         let conn = fsqlite::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, tag TEXT, val INTEGER);")
             .unwrap();
-        for i in 0..1000 {
-            let tag_idx = i % 10;
-            let val = i * 7;
-            conn.execute(&format!(
-                "INSERT INTO t VALUES ({i}, 'name_{i}', 'tag_{tag_idx}', {val});"
-            ))
-            .unwrap();
+        {
+            let stmt = conn
+                .prepare(
+                    "INSERT INTO t VALUES (?1, ('name_' || ?1), \
+                     ('tag_' || (?1 % 10)), (?1 * 7));",
+                )
+                .unwrap();
+            for i in 0..1000_i64 {
+                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                    .unwrap();
+            }
         }
+        let q_range = conn
+            .prepare("SELECT * FROM t WHERE id BETWEEN 100 AND 200")
+            .unwrap();
+        let q_agg = conn
+            .prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM t")
+            .unwrap();
+        let q_group = conn
+            .prepare("SELECT tag, COUNT(*) FROM t GROUP BY tag")
+            .unwrap();
+        let q_compound = conn
+            .prepare("SELECT * FROM t WHERE val > 3500 AND val < 5000")
+            .unwrap();
 
         b.iter(|| {
-            let rows = conn
-                .query("SELECT * FROM t WHERE id BETWEEN 100 AND 200;")
-                .unwrap();
+            let rows = q_range.query().unwrap();
             assert_eq!(rows.len(), 101);
 
-            let agg = conn
-                .query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM t;")
-                .unwrap();
+            let agg = q_agg.query().unwrap();
             assert_eq!(agg.len(), 1);
 
-            let groups = conn
-                .query("SELECT tag, COUNT(*) FROM t GROUP BY tag;")
-                .unwrap();
+            let groups = q_group.query().unwrap();
             assert_eq!(groups.len(), 10);
 
-            let _ = conn
-                .query("SELECT * FROM t WHERE val > 3500 AND val < 5000;")
-                .unwrap();
+            let _ = q_compound.query().unwrap();
         });
     });
 
@@ -593,36 +619,43 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);")
                     .unwrap();
-                for i in 0..500 {
-                    let val = i * 3;
-                    conn.execute(&format!("INSERT INTO t VALUES ({i}, 'name_{i}', {val});"))
+                let insert_stmt = conn
+                    .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 3));")
+                    .unwrap();
+                for i in 0..500_i64 {
+                    insert_stmt
+                        .execute_with_params(&[SqliteValue::Integer(i)])
                         .unwrap();
                 }
                 conn
             },
             |conn| {
-                let mut next_id = 500;
-                for op in 0..100 {
+                let mut next_id = 500_i64;
+                for op in 0..100_i64 {
                     if op % 5 == 0 {
                         if op % 10 == 0 {
-                            conn.execute(&format!(
-                                "INSERT INTO t VALUES ({next_id}, 'new_{next_id}', {next_id});"
-                            ))
+                            conn.execute_with_params(
+                                "INSERT INTO t VALUES (?1, 'new', ?1)",
+                                &[SqliteValue::Integer(next_id)],
+                            )
                             .unwrap();
                             next_id += 1;
                         } else {
-                            conn.execute(&format!(
-                                "UPDATE t SET val = {} WHERE id = {op};",
-                                op * 100
-                            ))
+                            conn.execute_with_params(
+                                "UPDATE t SET val = ?1 WHERE id = ?2",
+                                &[SqliteValue::Integer(op * 100), SqliteValue::Integer(op)],
+                            )
                             .unwrap();
                         }
                     } else {
                         let target = (op * 5) % 500;
-                        let rows = conn
-                            .query(&format!("SELECT val FROM t WHERE id = {target};"))
+                        let row = conn
+                            .query_row_with_params(
+                                "SELECT val FROM t WHERE id = ?1",
+                                &[SqliteValue::Integer(target)],
+                            )
                             .unwrap();
-                        assert_eq!(rows.len(), 1);
+                        assert_eq!(row.values().len(), 1);
                     }
                 }
             },
@@ -676,12 +709,12 @@ fn bench_large_txn_100k(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN;").unwrap();
-                for i in 0..100_000 {
-                    let val = i * 3;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'data_{i}', {val});"
-                    ))
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
                     .unwrap();
+                for i in 0..100_000_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
                 conn.execute("COMMIT;").unwrap();
             },
@@ -733,12 +766,12 @@ fn bench_large_txn_1m(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN;").unwrap();
-                for i in 0..1_000_000 {
-                    let val = i * 3;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'data_{i}', {val});"
-                    ))
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
                     .unwrap();
+                for i in 0..1_000_000_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
                 conn.execute("COMMIT;").unwrap();
             },
@@ -801,8 +834,11 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                                 conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
                                     .unwrap();
                                 conn.execute("BEGIN;").unwrap();
-                                for i in 0..1000 {
-                                    conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}');"))
+                                let stmt = conn
+                                    .prepare("INSERT INTO t VALUES (?1, ('v' || ?1));")
+                                    .unwrap();
+                                for i in 0..1000_i64 {
+                                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
                                         .unwrap();
                                 }
                                 conn.execute("COMMIT;").unwrap();

@@ -39,6 +39,35 @@ This crate sits at the very top of the fsqlite workspace dependency graph. It de
 - `concurrent_write_bench` - Concurrent write benchmarks
 - `operation_baseline_bench` - Operation-level baseline benchmarks
 
+## Benchmark Discipline
+
+Performance comparisons in this crate must be structurally fair:
+
+- If the rusqlite side uses a prepared statement in a hot loop, the FrankenSQLite side must do the same.
+- If the rusqlite side uses stable parameterized SQL, the FrankenSQLite side must not use per-iteration `format!()` SQL strings.
+- If a FrankenSQLite benchmark is only a control and does **not** exercise the real persistent concurrent-writer path, its name and comments must say so explicitly.
+- Benchmark reports should always state whether the path is prepared vs ad hoc, file-backed vs in-memory, and concurrent vs sequential control.
+
+## Canonical Hot-Profile Workflow
+
+The standard way to answer “where is FrankenSQLite spending time?” is `realdb-e2e hot-profile`, not ad hoc speculation.
+
+Example:
+
+```bash
+rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile \
+  --db beads-proj-a \
+  --workload mixed_read_write \
+  --concurrency 4 \
+  --seed 42 \
+  --scale 50 \
+  --output-dir artifacts/perf/hot-profile/mixed_read_write_c4 \
+  --mvcc \
+  --pretty
+```
+
+This emits structured hot-path artifacts that break execution down by parser, rewrite/compile, VDBE, record decode, retries/conflicts, and other subsystems. Use it before proposing optimization work.
+
 ## Key Modules
 
 - `golden` - Golden copy management and snapshot comparison

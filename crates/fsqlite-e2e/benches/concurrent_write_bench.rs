@@ -19,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use fsqlite::SqliteValue;
 
 const ROWS_PER_THREAD: i64 = 1000;
 const RANGE_SIZE: i64 = 100_000;
@@ -107,8 +108,9 @@ fn bench_concurrent_csqlite(c: &mut Criterion, n_threads: usize, label: &str) {
         );
     });
 
-    // FrankenSQLite: sequential equivalent (same total work).
-    group.bench_function("frankensqlite_sequential", |b| {
+    // FrankenSQLite control: same total work, but still sequential because the
+    // persistent concurrent-writer path is not benchmarkable here yet.
+    group.bench_function("frankensqlite_sequential_prepared_control", |b| {
         b.iter_batched(
             || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
@@ -117,17 +119,16 @@ fn bench_concurrent_csqlite(c: &mut Criterion, n_threads: usize, label: &str) {
                 conn
             },
             |conn| {
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7));")
+                    .unwrap();
                 for tid in 0..n_threads {
                     conn.execute("BEGIN").unwrap();
                     #[allow(clippy::cast_possible_wrap)]
                     let base = tid as i64 * RANGE_SIZE;
                     for i in 0..ROWS_PER_THREAD {
-                        let id = base + i;
-                        conn.execute(&format!(
-                            "INSERT INTO bench VALUES ({id}, 't{id}', {})",
-                            id * 7,
-                        ))
-                        .unwrap();
+                        stmt.execute_with_params(&[SqliteValue::Integer(base + i)])
+                            .unwrap();
                     }
                     conn.execute("COMMIT").unwrap();
                 }
