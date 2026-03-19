@@ -26,6 +26,22 @@ use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::{PageCache, PageCacheMetricsSnapshot};
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
+type WalAppendGate = Arc<Mutex<()>>;
+
+static WAL_APPEND_GATES: OnceLock<Mutex<HashMap<PathBuf, WalAppendGate>>> = OnceLock::new();
+
+fn wal_append_gate_for_path(db_path: &Path) -> WalAppendGate {
+    let gates = WAL_APPEND_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        gates
+            .entry(db_path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 /// The inner mutable pager state protected by a mutex.
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
@@ -966,7 +982,9 @@ where
             let cleanup_cx = cx.clone();
             return Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
+                db_path: self.db_path.clone(),
                 journal_path: Self::journal_path(&self.db_path),
+                wal_append_gate: wal_append_gate_for_path(&self.db_path),
                 inner: Arc::clone(&self.inner),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
@@ -1148,7 +1166,9 @@ where
 
         Ok(SimpleTransaction {
             vfs: Arc::clone(&self.vfs),
+            db_path: self.db_path.clone(),
             journal_path: Self::journal_path(&self.db_path),
+            wal_append_gate: wal_append_gate_for_path(&self.db_path),
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
@@ -1953,7 +1973,9 @@ const PAGE_LEASE_BATCH_SIZE: u32 = 8;
 
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
+    db_path: PathBuf,
     journal_path: PathBuf,
+    wal_append_gate: WalAppendGate,
     inner: Arc<Mutex<PagerInner<V::File>>>,
     cache: Arc<Mutex<PageCache>>,
     published: Arc<PublishedPagerState>,
@@ -2792,6 +2814,20 @@ where
             self.finished = true;
             return Ok(());
         }
+
+        // Queue same-process WAL commits through a narrow append gate so
+        // concurrent writers do not bounce off the cross-process EXCLUSIVE
+        // file-lock escalation and surface avoidable Busy retries.
+        let wal_append_gate = Arc::clone(&self.wal_append_gate);
+        let _wal_append_guard = if self.journal_mode == JournalMode::Wal {
+            Some(
+                wal_append_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        } else {
+            None
+        };
 
         let mut inner = self
             .inner

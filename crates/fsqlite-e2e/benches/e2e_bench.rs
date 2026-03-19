@@ -264,7 +264,8 @@ fn bench_mixed_dml(c: &mut Criterion) {
                         .unwrap();
                 }
                 let stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
-                let count = &stmt.query_row().unwrap().values()[0];
+                let row = stmt.query_row().unwrap();
+                let count = &row.values()[0];
                 assert_eq!(*count, SqliteValue::Integer(200));
             },
             BatchSize::LargeInput,
