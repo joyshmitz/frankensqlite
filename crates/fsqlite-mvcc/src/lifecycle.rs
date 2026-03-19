@@ -648,8 +648,9 @@ impl TransactionManager {
         }
 
         // Resolve visible version from the version store.
-        let idx = self.version_store.resolve(pgno, &txn.snapshot)?;
-        let version = self.version_store.get_version(idx)?;
+        let version = self
+            .version_store
+            .resolve_visible_version(pgno, &txn.snapshot)?;
         txn.record_page_read(pgno, version.commit_seq);
         Some(version.data)
     }
@@ -1293,11 +1294,11 @@ impl TransactionManager {
     /// them to produce a merged page and updates the transaction's write set.
     fn try_rebase_page(&self, txn: &mut Transaction, pgno: PageNumber) -> bool {
         // Get base version visible at txn's snapshot.
-        let base_data = match self.version_store.resolve(pgno, &txn.snapshot) {
-            Some(idx) => match self.version_store.get_version(idx) {
-                Some(v) => v.data,
-                None => return false,
-            },
+        let base_data = match self
+            .version_store
+            .resolve_visible_version(pgno, &txn.snapshot)
+        {
+            Some(version) => version.data,
             None => {
                 // Page didn't exist at txn's snapshot — insert-insert conflict,
                 // cannot rebase without higher-level intent replay.
@@ -1306,11 +1307,8 @@ impl TransactionManager {
         };
 
         // Get latest committed version (chain head = "theirs").
-        let (latest_data, latest_seq) = match self.version_store.chain_head(pgno) {
-            Some(idx) => match self.version_store.get_version(idx) {
-                Some(v) => (v.data.clone(), v.commit_seq),
-                None => return false,
-            },
+        let (latest_data, latest_seq) = match self.version_store.chain_head_version(pgno) {
+            Some(version) => (version.data.clone(), version.commit_seq),
             None => return false,
         };
 
@@ -1350,19 +1348,16 @@ impl TransactionManager {
         pgno: PageNumber,
         page_kind: MergePageKind,
     ) -> bool {
-        let base_data = match self.version_store.resolve(pgno, &txn.snapshot) {
-            Some(idx) => match self.version_store.get_version(idx) {
-                Some(v) => v.data,
-                None => return false,
-            },
+        let base_data = match self
+            .version_store
+            .resolve_visible_version(pgno, &txn.snapshot)
+        {
+            Some(version) => version.data,
             None => return false,
         };
 
-        let (latest_data, latest_seq) = match self.version_store.chain_head(pgno) {
-            Some(idx) => match self.version_store.get_version(idx) {
-                Some(v) => (v.data.clone(), v.commit_seq),
-                None => return false,
-            },
+        let (latest_data, latest_seq) = match self.version_store.chain_head_version(pgno) {
+            Some(version) => (version.data.clone(), version.commit_seq),
             None => return false,
         };
 
@@ -1435,16 +1430,15 @@ impl TransactionManager {
 
         for pgno in pages {
             if let Some(data) = data_map.remove(&pgno) {
-                // Look up existing chain head for prev pointer.
-                let prev_idx = self.version_store.chain_head(pgno);
-                let prev = prev_idx.map(crate::invariants::idx_to_version_pointer);
-
                 let version = PageVersion {
                     pgno,
                     commit_seq,
                     created_by: TxnToken::new(txn.txn_id, txn.txn_epoch),
                     data,
-                    prev,
+                    // VersionStore::publish() links the new arena entry to the
+                    // live chain head itself, so pre-reading the head here just
+                    // adds an extra lookup on every committed page.
+                    prev: None,
                 };
                 self.version_store.publish(version);
                 self.commit_index.update(pgno, commit_seq);
@@ -1497,10 +1491,8 @@ impl TransactionManager {
     }
 
     fn resolve_visible_commit_seq(&self, txn: &Transaction, pgno: PageNumber) -> Option<CommitSeq> {
-        let idx = self.version_store.resolve(pgno, &txn.snapshot)?;
         self.version_store
-            .get_version(idx)
-            .map(|version| version.commit_seq)
+            .resolve_visible_commit_seq(pgno, &txn.snapshot)
     }
 
     fn ensure_txn_within_max_duration(&self, txn: &mut Transaction) -> Result<(), MvccError> {

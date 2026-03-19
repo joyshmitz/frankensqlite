@@ -639,6 +639,103 @@ impl VersionStore {
         self.resolve_with_trace(page, snapshot).version_idx
     }
 
+    /// Resolve and clone the newest committed version of `page` visible to
+    /// `snapshot` in a single arena walk.
+    ///
+    /// This avoids the hot-path double lookup of `resolve()` followed by
+    /// `get_version()`, which otherwise reacquires the arena lock and clones
+    /// the visible page a second time.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn resolve_visible_version(
+        &self,
+        page: PageNumber,
+        snapshot: &Snapshot,
+    ) -> Option<PageVersion> {
+        'retry: loop {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                return None;
+            };
+
+            let arena = self.arena.read();
+            let mut current_idx = head_idx;
+
+            loop {
+                let Some(version) = arena.get(current_idx) else {
+                    // Race: version GC'd between head read and arena read.
+                    // Retry from the top to pick up the new chain head.
+                    continue 'retry;
+                };
+
+                if visible(version, snapshot) {
+                    return Some(version.clone());
+                }
+
+                let Some(prev_ptr) = version.prev else {
+                    return None;
+                };
+                current_idx = version_pointer_to_idx(prev_ptr);
+            }
+        }
+    }
+
+    /// Resolve the commit sequence of the newest committed version of `page`
+    /// visible to `snapshot` without cloning the full page image.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn resolve_visible_commit_seq(
+        &self,
+        page: PageNumber,
+        snapshot: &Snapshot,
+    ) -> Option<CommitSeq> {
+        'retry: loop {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                return None;
+            };
+
+            let arena = self.arena.read();
+            let mut current_idx = head_idx;
+
+            loop {
+                let Some(version) = arena.get(current_idx) else {
+                    continue 'retry;
+                };
+
+                if visible(version, snapshot) {
+                    return Some(version.commit_seq);
+                }
+
+                let Some(prev_ptr) = version.prev else {
+                    return None;
+                };
+                current_idx = version_pointer_to_idx(prev_ptr);
+            }
+        }
+    }
+
+    /// Read and clone the latest committed chain head for `page`.
+    ///
+    /// This is the newest committed version regardless of snapshot
+    /// visibility. The helper keeps head lookup + arena read in a single
+    /// retrying path so callers avoid a second arena acquisition.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn chain_head_version(&self, page: PageNumber) -> Option<PageVersion> {
+        'retry: loop {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                return None;
+            };
+
+            let arena = self.arena.read();
+            let Some(version) = arena.get(head_idx) else {
+                // Race: head observed before the arena entry was reclaimed.
+                continue 'retry;
+            };
+
+            return Some(version.clone());
+        }
+    }
+
     /// Resolve with traversal diagnostics for snapshot-read instrumentation.
     ///
     /// Fast path: walks the version chain using only the arena RwLock and
@@ -1622,6 +1719,66 @@ mod tests {
 
         let head_trace = store.resolve_with_trace(pgno, &make_snapshot(10));
         assert_eq!(head_trace.versions_traversed, 1);
+    }
+
+    #[test]
+    fn test_resolve_visible_version_returns_first_visible_from_head() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(1).unwrap();
+
+        let v1 = make_version(1, 1, None);
+        let idx1 = store.publish(v1);
+        let v2 = make_version(1, 5, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+        let v3 = make_version(1, 10, Some(idx_to_version_pointer(idx2)));
+        store.publish(v3);
+
+        let visible = store
+            .resolve_visible_version(pgno, &make_snapshot(7))
+            .expect("snapshot should resolve to the first visible version");
+        assert_eq!(visible.commit_seq, CommitSeq::new(5));
+
+        let latest = store
+            .resolve_visible_version(pgno, &make_snapshot(10))
+            .expect("snapshot at chain head should resolve");
+        assert_eq!(latest.commit_seq, CommitSeq::new(10));
+        assert_eq!(
+            store.resolve_visible_commit_seq(pgno, &make_snapshot(7)),
+            Some(CommitSeq::new(5))
+        );
+        assert_eq!(
+            store.resolve_visible_commit_seq(pgno, &make_snapshot(10)),
+            Some(CommitSeq::new(10))
+        );
+
+        assert!(
+            store
+                .resolve_visible_version(pgno, &make_snapshot(0))
+                .is_none(),
+            "snapshot before first commit should not see a version"
+        );
+        assert_eq!(
+            store.resolve_visible_commit_seq(pgno, &make_snapshot(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_chain_head_version_returns_latest_version() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(1).unwrap();
+
+        let v1 = make_version(1, 1, None);
+        let idx1 = store.publish(v1);
+        let v2 = make_version(1, 5, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+        let v3 = make_version(1, 10, Some(idx_to_version_pointer(idx2)));
+        store.publish(v3);
+
+        let head = store
+            .chain_head_version(pgno)
+            .expect("published page should have a latest chain head");
+        assert_eq!(head.commit_seq, CommitSeq::new(10));
     }
 
     #[test]

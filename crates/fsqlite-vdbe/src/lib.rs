@@ -28,6 +28,146 @@ pub mod vectorized_sort;
 #[cfg(test)]
 mod vectorized_prop_tests;
 
+/// Register spans touched by an opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpcodeRegisterSpans {
+    pub(crate) read_start: i32,
+    pub(crate) read_len: i32,
+    pub(crate) write_start: i32,
+    pub(crate) write_len: i32,
+}
+
+impl OpcodeRegisterSpans {
+    pub(crate) const NONE: Self = Self {
+        read_start: -1,
+        read_len: 0,
+        write_start: -1,
+        write_len: 0,
+    };
+
+    pub(crate) fn max_touched_register(self) -> i32 {
+        let read_end = if self.read_start > 0 {
+            self.read_start + self.read_len - 1
+        } else {
+            0
+        };
+        let write_end = if self.write_start > 0 {
+            self.write_start + self.write_len - 1
+        } else {
+            0
+        };
+        read_end.max(write_end)
+    }
+}
+
+fn register_range(start: i32, len: i32) -> (i32, i32) {
+    if start <= 0 {
+        (-1, 0)
+    } else {
+        (start, len.max(1))
+    }
+}
+
+pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
+    let (read_start, read_len, write_start, write_len) = match op.opcode {
+        Opcode::Integer
+        | Opcode::Int64
+        | Opcode::Real
+        | Opcode::String
+        | Opcode::String8
+        | Opcode::Blob
+        | Opcode::Variable => {
+            let (write_start, write_len) = register_range(op.p2, 1);
+            (-1, 0, write_start, write_len)
+        }
+        Opcode::Null => {
+            let write_count = if op.p3 > 0 { op.p3 - op.p2 + 1 } else { 1 };
+            let (write_start, write_len) = register_range(op.p2, write_count);
+            (-1, 0, write_start, write_len)
+        }
+        Opcode::SoftNull
+        | Opcode::Cast
+        | Opcode::RealAffinity
+        | Opcode::AddImm
+        | Opcode::MustBeInt
+        | Opcode::InitCoroutine
+        | Opcode::Yield
+        | Opcode::EndCoroutine => {
+            let (start, len) = register_range(op.p1, 1);
+            (start, len, start, len)
+        }
+        Opcode::Move => {
+            let (read_start, read_len) = register_range(op.p1, op.p3);
+            let (write_start, write_len) = register_range(op.p2, op.p3);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::Copy | Opcode::SCopy | Opcode::IntCopy | Opcode::BitNot | Opcode::Not => {
+            let (read_start, read_len) = register_range(op.p1, 1);
+            let (write_start, write_len) = register_range(op.p2, 1);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::ResultRow => {
+            let (read_start, read_len) = register_range(op.p1, op.p2);
+            (read_start, read_len, -1, 0)
+        }
+        Opcode::Add
+        | Opcode::Subtract
+        | Opcode::Multiply
+        | Opcode::Divide
+        | Opcode::Remainder
+        | Opcode::Concat
+        | Opcode::BitAnd
+        | Opcode::BitOr
+        | Opcode::ShiftLeft
+        | Opcode::ShiftRight
+        | Opcode::And
+        | Opcode::Or => {
+            let (read_start, read_len) = register_range(op.p1, 2);
+            let (write_start, write_len) = register_range(op.p3, 1);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
+            let (read_start, read_len) = register_range(op.p1, 1);
+            let (rhs_start, rhs_len) = register_range(op.p3, 1);
+            let normalized_start = if read_start > 0 && rhs_start > 0 {
+                read_start.min(rhs_start)
+            } else if read_start > 0 {
+                read_start
+            } else {
+                rhs_start
+            };
+            let normalized_len = if read_start > 0 && rhs_start > 0 && read_start != rhs_start {
+                2
+            } else {
+                read_len.max(rhs_len)
+            };
+            (normalized_start, normalized_len, -1, 0)
+        }
+        Opcode::If | Opcode::IfNot | Opcode::IsNull | Opcode::NotNull | Opcode::IsTrue => {
+            let (read_start, read_len) = register_range(op.p1, 1);
+            (read_start, read_len, -1, 0)
+        }
+        Opcode::MakeRecord => {
+            let (read_start, read_len) = register_range(op.p1, op.p2);
+            let (write_start, write_len) = register_range(op.p3, 1);
+            (read_start, read_len, write_start, write_len)
+        }
+        _ => (
+            OpcodeRegisterSpans::NONE.read_start,
+            OpcodeRegisterSpans::NONE.read_len,
+            OpcodeRegisterSpans::NONE.write_start,
+            OpcodeRegisterSpans::NONE.write_len,
+        ),
+    };
+
+    OpcodeRegisterSpans {
+        read_start,
+        read_len,
+        write_start,
+        write_len,
+    }
+}
+
 // ── Label System ────────────────────────────────────────────────────────────
 
 /// An opaque handle representing a forward-reference label.
@@ -426,10 +566,13 @@ impl ProgramBuilder {
             .map(|(table_cursor, indexes)| (table_cursor, indexes.into_boxed_slice()))
             .collect();
 
+        let inferred_register_count = self.ops.iter().fold(0, |max_register, op| {
+            max_register.max(opcode_register_spans(op).max_touched_register())
+        });
         let has_insert = self.ops.iter().any(|op| op.opcode == Opcode::Insert);
         Ok(VdbeProgram {
             ops: self.ops,
-            register_count: self.regs.count(),
+            register_count: self.regs.count().max(inferred_register_count),
             bind_parameter_requirement,
             table_index_meta: Arc::new(table_index_meta),
             has_insert,
@@ -1521,6 +1664,21 @@ mod tests {
         let final_pc = co.end();
         assert!(co.exhausted);
         assert!(final_pc > 0); // valid return PC
+    }
+
+    #[test]
+    fn test_program_builder_infers_register_count_from_manual_opcode_registers() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Integer, 11, 3, 0, P4::None, 0);
+        builder.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = builder.finish().expect("program should build");
+        assert_eq!(
+            program.register_count(),
+            3,
+            "bytecode that writes raw registers must still allocate a large enough register file",
+        );
     }
 
     // ── test_all_opcode_dispatch_coverage ────────────────────────────────

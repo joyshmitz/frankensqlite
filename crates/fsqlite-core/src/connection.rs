@@ -55,6 +55,7 @@ use fsqlite_func::{
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PagerPublishedSnapshot, SimplePager,
+    WalCommitSyncPolicy,
 };
 use fsqlite_parser::Parser;
 use fsqlite_parser::lexer::Lexer;
@@ -240,6 +241,8 @@ static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_SCHEMA_FULL_RELOADS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_READ_SNAPSHOT_REUSES: AtomicU64 = AtomicU64::new(0);
@@ -285,6 +288,8 @@ pub struct HotPathProfileSnapshot {
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
     pub prepared_schema_refreshes: u64,
+    pub prepared_schema_lightweight_refreshes: u64,
+    pub prepared_schema_full_reloads: u64,
     pub pager_publication_refreshes: u64,
     pub memory_autocommit_fast_path_begins: u64,
     pub cached_read_snapshot_reuses: u64,
@@ -338,6 +343,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_SCHEMA_REFRESHES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PAGER_PUBLICATION_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_READ_SNAPSHOT_REUSES.store(0, AtomicOrdering::Relaxed);
@@ -385,6 +392,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         statement_dispatch_background_gates: FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES
             .load(AtomicOrdering::Relaxed),
         prepared_schema_refreshes: FSQLITE_PREPARED_SCHEMA_REFRESHES.load(AtomicOrdering::Relaxed),
+        prepared_schema_lightweight_refreshes: FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
+            .load(AtomicOrdering::Relaxed),
+        prepared_schema_full_reloads: FSQLITE_PREPARED_SCHEMA_FULL_RELOADS
+            .load(AtomicOrdering::Relaxed),
         pager_publication_refreshes: FSQLITE_PAGER_PUBLICATION_REFRESHES
             .load(AtomicOrdering::Relaxed),
         memory_autocommit_fast_path_begins: FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS
@@ -882,6 +893,31 @@ impl PagerBackend {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
+        }
+    }
+
+    fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.set_wal_commit_sync_policy(policy),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.set_wal_commit_sync_policy(policy),
+            #[cfg(unix)]
+            Self::Unix(p) => p.set_wal_commit_sync_policy(policy),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.set_wal_commit_sync_policy(policy),
+        }
+    }
+
+    #[cfg(test)]
+    fn wal_commit_sync_policy(&self) -> WalCommitSyncPolicy {
+        match self {
+            Self::Memory(p) => p.wal_commit_sync_policy(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.wal_commit_sync_policy(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.wal_commit_sync_policy(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.wal_commit_sync_policy(),
         }
     }
 
@@ -1633,6 +1669,12 @@ impl PreparedStatement<'_> {
         self.requires_schema_validation() && !self.conn.pager.is_memory()
     }
 
+    fn can_use_lightweight_external_schema_refresh(&self) -> bool {
+        self.db.is_some()
+            && self.deferred_query_statement.is_none()
+            && self.deferred_dml_statement().is_none()
+    }
+
     fn dispatch_precompiled_program(&self) -> Option<&VdbeProgram> {
         if self.deferred_dml_statement().is_some() && self.db.is_some() {
             Some(self.program.as_ref())
@@ -1656,9 +1698,22 @@ impl PreparedStatement<'_> {
     }
 
     fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
-        if self.requires_external_schema_refresh() {
-            self.conn.refresh_prepared_schema_state(cx)?;
-        }
+        let _ = self.ensure_schema_unchanged_with_prebound_publication(cx)?;
+        Ok(())
+    }
+
+    fn ensure_schema_unchanged_with_prebound_publication(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<BoundPagerPublication>> {
+        let prebound_publication = if self.requires_external_schema_refresh() {
+            self.conn.refresh_prepared_schema_state(
+                cx,
+                self.can_use_lightweight_external_schema_refresh(),
+            )?
+        } else {
+            None
+        };
         if self.requires_schema_validation()
             && (self.conn.schema_cookie() != self.schema_cookie
                 || self.conn.schema_generation() != self.schema_generation)
@@ -1684,7 +1739,7 @@ impl PreparedStatement<'_> {
             );
             return Err(FrankenError::SchemaChanged);
         }
-        Ok(())
+        Ok(prebound_publication)
     }
 
     /// Returns `true` if this prepared statement is a DML statement
@@ -2679,6 +2734,19 @@ struct BoundPagerPublication {
     read_retry_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedSchemaRefreshOutcome {
+    Noop,
+    Lightweight,
+    FullReloadRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedSchemaRefreshResult {
+    outcome: PreparedSchemaRefreshOutcome,
+    publication: BoundPagerPublication,
+}
+
 /// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -3095,6 +3163,7 @@ impl Connection {
         conn.bootstrap_journal_mode_from_storage()?;
         conn.bootstrap_pragma_state_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
+        conn.apply_current_synchronous_to_pager()?;
         let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
         conn.reload_memdb_from_pager_with_mode(&op_cx, false)?;
@@ -3235,6 +3304,7 @@ impl Connection {
         conn.bootstrap_journal_mode_from_storage()?;
         conn.bootstrap_pragma_state_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
+        conn.apply_current_synchronous_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // The pager already opened the database file; we load schema + data from it.
         let op_cx = conn.op_cx()?;
@@ -4832,7 +4902,11 @@ impl Connection {
         }
     }
 
-    fn refresh_prepared_schema_state(&self, cx: &Cx) -> Result<()> {
+    fn refresh_prepared_schema_state(
+        &self,
+        cx: &Cx,
+        allow_lightweight_refresh: bool,
+    ) -> Result<Option<BoundPagerPublication>> {
         if hot_path_profile_enabled() {
             FSQLITE_PREPARED_SCHEMA_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -4841,9 +4915,97 @@ impl Connection {
         // same connection are caught by the schema_generation comparison
         // in ensure_schema_unchanged, not by memdb staleness.
         if !*self.in_transaction.borrow() && !self.pager.is_memory() {
-            self.refresh_memdb_if_stale(cx)?;
+            match self.try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)? {
+                PreparedSchemaRefreshResult {
+                    outcome: PreparedSchemaRefreshOutcome::Noop,
+                    publication,
+                } => return Ok(Some(publication)),
+                PreparedSchemaRefreshResult {
+                    outcome: PreparedSchemaRefreshOutcome::Lightweight,
+                    publication,
+                } => {
+                    if hot_path_profile_enabled() {
+                        FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    return Ok(Some(publication));
+                }
+                PreparedSchemaRefreshResult {
+                    outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                    ..
+                } => {
+                    self.refresh_memdb_if_stale(cx)?;
+                    if hot_path_profile_enabled() {
+                        FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    fn try_refresh_prepared_metadata_if_stale(
+        &self,
+        cx: &Cx,
+        allow_lightweight_refresh: bool,
+    ) -> Result<PreparedSchemaRefreshResult> {
+        let publication = self.bind_pager_publication(cx, "prepared_schema_refresh")?;
+        let bound_visible_commit_seq = publication.snapshot.visible_commit_seq;
+        if bound_visible_commit_seq <= *self.memdb_visible_commit_seq.borrow() {
+            return Ok(PreparedSchemaRefreshResult {
+                outcome: PreparedSchemaRefreshOutcome::Noop,
+                publication,
+            });
+        }
+        if !allow_lightweight_refresh || self.should_eagerly_hydrate_memdb_rows() {
+            return Ok(PreparedSchemaRefreshResult {
+                outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                publication,
+            });
+        }
+
+        let current_schema_cookie = self.schema_cookie();
+        let mut txn =
+            self.begin_pager_txn_with_busy_timeout(&self.pager, cx, TransactionMode::ReadOnly)?;
+        let header = {
+            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            parse_database_header_checked(page1.as_ref())
+        };
+        let header = match header {
+            Ok(header) => header,
+            Err(_) => {
+                let _ = txn.rollback(cx);
+                return Ok(PreparedSchemaRefreshResult {
+                    outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                    publication,
+                });
+            }
+        };
+        if header.schema_cookie != current_schema_cookie {
+            let _ = txn.rollback(cx);
+            return Ok(PreparedSchemaRefreshResult {
+                outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                publication,
+            });
+        }
+
+        if !self.autoincrement_tables.borrow().is_empty() {
+            let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn.as_mut())?;
+            *self.sqlite_sequence_cache.borrow_mut() = cache;
+        }
+
+        {
+            let mut pragma_state = self.pragma_state.borrow_mut();
+            pragma_state.user_version = i64::from(header.user_version);
+            pragma_state.application_id = i64::from(header.application_id);
+        }
+        *self.change_counter.borrow_mut() = header.change_counter;
+        *self.memdb_visible_commit_seq.borrow_mut() = bound_visible_commit_seq;
+        let _ = txn.rollback(cx);
+        Ok(PreparedSchemaRefreshResult {
+            outcome: PreparedSchemaRefreshOutcome::Lightweight,
+            publication,
+        })
     }
 
     /// Bootstrap connection-local journal mode from on-disk artifacts.
@@ -5359,7 +5521,8 @@ impl Connection {
         }
         if let Some(dispatch) = stmt.precompiled_dml() {
             let op_cx = self.op_cx_after_background_status();
-            stmt.ensure_schema_unchanged(&op_cx)?;
+            let prebound_publication =
+                stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
             let p = if params.is_empty() {
                 None
             } else {
@@ -5373,6 +5536,7 @@ impl Connection {
                     dispatch.post_write_action,
                     dispatch.rollback_on_constraint_violation,
                     dispatch.preserve_prior_changes_on_constraint_violation,
+                    prebound_publication,
                     p,
                     false,
                 ),
@@ -5457,6 +5621,7 @@ impl Connection {
         post_write_action: PreparedInsertPostWriteAction,
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
+        prebound_publication: Option<BoundPagerPublication>,
         params: Option<&[SqliteValue]>,
         capture_time_travel_snapshot: bool,
     ) -> Result<usize> {
@@ -5487,6 +5652,7 @@ impl Connection {
                     stmt,
                     table_name,
                     post_write_action,
+                    prebound_publication,
                     rollback_on_constraint_violation,
                     preserve_prior_changes_on_constraint_violation,
                     params,
@@ -5629,12 +5795,14 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         table_name: &str,
         post_write_action: PreparedInsertPostWriteAction,
+        prebound_publication: Option<BoundPagerPublication>,
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
         params: Option<&[SqliteValue]>,
         capture_time_travel_snapshot: bool,
     ) -> Result<usize> {
-        let was_auto = self.ensure_autocommit_txn_with_cx(execution_cx)?;
+        let was_auto =
+            self.ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)?;
         let previous_total_changes = *self.total_changes.borrow();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
@@ -6618,7 +6786,7 @@ impl Connection {
         } else if is_write {
             self.ensure_autocommit_txn_with_cx(&op_cx)?
         } else {
-            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &op_cx)?
+            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &op_cx, None)?
         };
         let previous_total_changes = *self.total_changes.borrow();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
@@ -10738,16 +10906,24 @@ impl Connection {
             TransactionMode::Immediate
         };
         let cx = self.op_cx()?;
-        self.ensure_autocommit_txn_mode_with_cx(mode, &cx)
+        self.ensure_autocommit_txn_mode_with_cx(mode, &cx, None)
     }
 
     fn ensure_autocommit_txn_with_cx(&self, cx: &Cx) -> Result<bool> {
+        self.ensure_autocommit_txn_with_publication_hint(cx, None)
+    }
+
+    fn ensure_autocommit_txn_with_publication_hint(
+        &self,
+        cx: &Cx,
+        prebound_publication: Option<BoundPagerPublication>,
+    ) -> Result<bool> {
         let mode = if *self.concurrent_mode_default.borrow() {
             TransactionMode::Concurrent
         } else {
             TransactionMode::Immediate
         };
-        self.ensure_autocommit_txn_mode_with_cx(mode, cx)
+        self.ensure_autocommit_txn_mode_with_cx(mode, cx, prebound_publication)
     }
 
     /// Ensure a pager transaction is active, using the specified mode.
@@ -10756,10 +10932,15 @@ impl Connection {
     #[cfg_attr(not(test), allow(dead_code))]
     fn ensure_autocommit_txn_mode(&self, mode: TransactionMode) -> Result<bool> {
         let cx = self.op_cx()?;
-        self.ensure_autocommit_txn_mode_with_cx(mode, &cx)
+        self.ensure_autocommit_txn_mode_with_cx(mode, &cx, None)
     }
 
-    fn ensure_autocommit_txn_mode_with_cx(&self, mode: TransactionMode, cx: &Cx) -> Result<bool> {
+    fn ensure_autocommit_txn_mode_with_cx(
+        &self,
+        mode: TransactionMode,
+        cx: &Cx,
+        prebound_publication: Option<BoundPagerPublication>,
+    ) -> Result<bool> {
         if *self.in_transaction.borrow() || self.active_txn.borrow().is_some() {
             return Ok(false);
         }
@@ -10850,14 +11031,15 @@ impl Connection {
             return Ok(true);
         }
 
-        let publication = self.refresh_memdb_if_stale_with_publication(
-            cx,
-            if is_concurrent {
-                "autocommit_begin"
+        let publication = if is_concurrent {
+            if let Some(publication) = prebound_publication {
+                publication
             } else {
-                "memdb_staleness_check"
-            },
-        )?;
+                self.refresh_memdb_if_stale_with_publication(cx, "autocommit_begin")?
+            }
+        } else {
+            self.refresh_memdb_if_stale_with_publication(cx, "memdb_staleness_check")?
+        };
         // Bind the MVCC snapshot to the pager's published visibility plane
         // before opening the pager txn. This is still conservative: if a
         // writer commits between the bind and `pager.begin`, FCW may
@@ -15396,13 +15578,17 @@ impl Connection {
         };
 
         let cx = self.op_cx()?;
-        self.refresh_memdb_if_stale(&cx)?;
+        let prebound_publication = if is_concurrent {
+            Some(self.refresh_memdb_if_stale_with_publication(&cx, "explicit_begin")?)
+        } else {
+            self.refresh_memdb_if_stale(&cx)?;
+            None
+        };
         // Bind the MVCC snapshot to the pager's published visibility plane
         // before opening the pager txn. If a writer commits during begin, this
         // can only make the snapshot older than the pager view (safe
         // over-abort), never newer (unsafe).
-        let concurrent_snapshot = if is_concurrent {
-            let publication = self.bind_pager_publication(&cx, "explicit_begin")?;
+        let concurrent_snapshot = if let Some(publication) = prebound_publication {
             Some(self.concurrent_snapshot_from_publication(publication))
         } else {
             None
@@ -17765,6 +17951,11 @@ impl Connection {
         } else {
             None
         };
+        let maybe_prior_synchronous = if pragma_name == "synchronous" && pragma.value.is_some() {
+            Some(self.pragma_state.borrow().synchronous.clone())
+        } else {
+            None
+        };
 
         // bd-2yqp6.4.3: SQLite silently ignores PRAGMA foreign_keys = X
         // when a transaction is active (sqlite3.c pragma.c).  We must guard
@@ -17787,6 +17978,14 @@ impl Connection {
             if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mode) = pragma_out {
                 if let Err(err) = self.apply_journal_mode_to_pager(mode) {
                     self.pragma_state.borrow_mut().journal_mode = prior_journal_mode;
+                    return Err(err);
+                }
+            }
+        }
+        if let Some(prior_synchronous) = maybe_prior_synchronous {
+            if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref synchronous) = pragma_out {
+                if let Err(err) = self.apply_synchronous_to_pager(synchronous) {
+                    self.pragma_state.borrow_mut().synchronous = prior_synchronous;
                     return Err(err);
                 }
             }
@@ -19270,6 +19469,11 @@ impl Connection {
         self.apply_journal_mode_to_pager(&journal_mode)
     }
 
+    fn apply_current_synchronous_to_pager(&self) -> Result<()> {
+        let synchronous = self.pragma_state.borrow().synchronous.clone();
+        self.apply_synchronous_to_pager(&synchronous)
+    }
+
     fn apply_journal_mode_to_pager(&self, journal_mode: &str) -> Result<()> {
         let cx = self.op_cx()?;
         let requested_mode = if journal_mode.eq_ignore_ascii_case("wal") {
@@ -19294,6 +19498,25 @@ impl Connection {
         } else {
             Ok(())
         }
+    }
+
+    fn apply_synchronous_to_pager(&self, synchronous: &str) -> Result<()> {
+        let policy = if synchronous.eq_ignore_ascii_case("off")
+            || synchronous.eq_ignore_ascii_case("normal")
+        {
+            WalCommitSyncPolicy::Deferred
+        } else if synchronous.eq_ignore_ascii_case("full")
+            || synchronous.eq_ignore_ascii_case("extra")
+        {
+            WalCommitSyncPolicy::PerCommit
+        } else {
+            return Err(FrankenError::TypeMismatch {
+                expected: "OFF|NORMAL|FULL|EXTRA".to_owned(),
+                actual: synchronous.to_owned(),
+            });
+        };
+
+        self.pager.set_wal_commit_sync_policy(policy)
     }
 
     // ── Public MVCC accessors ─────────────────────────────────────────
@@ -53510,6 +53733,38 @@ mod tests {
     }
 
     #[test]
+    fn test_pragma_synchronous_default_updates_pager_sync_policy() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert_eq!(
+            conn.pager.wal_commit_sync_policy(),
+            fsqlite_pager::WalCommitSyncPolicy::Deferred
+        );
+    }
+
+    #[test]
+    fn test_pragma_synchronous_updates_pager_sync_policy() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("PRAGMA synchronous=FULL;").unwrap();
+        assert_eq!(
+            conn.pager.wal_commit_sync_policy(),
+            fsqlite_pager::WalCommitSyncPolicy::PerCommit
+        );
+
+        conn.execute("PRAGMA synchronous=EXTRA;").unwrap();
+        assert_eq!(
+            conn.pager.wal_commit_sync_policy(),
+            fsqlite_pager::WalCommitSyncPolicy::PerCommit
+        );
+
+        conn.execute("PRAGMA synchronous=OFF;").unwrap();
+        assert_eq!(
+            conn.pager.wal_commit_sync_policy(),
+            fsqlite_pager::WalCommitSyncPolicy::Deferred
+        );
+    }
+
+    #[test]
     fn test_pragma_cache_size_default() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA cache_size;").unwrap();
@@ -67919,6 +68174,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_select_rejects_cross_connection_schema_change() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("prepared_schema_cross_select.db");
         let db = db_path.to_string_lossy().into_owned();
@@ -67939,10 +68195,29 @@ mod pager_routing_tests {
             .execute("CREATE TABLE prep_schema_sel_bump (id INTEGER PRIMARY KEY);")
             .unwrap();
 
+        reset_hot_path_profile();
         let err = stmt
             .query()
             .expect_err("cross-connection DDL must invalidate prepared SELECT");
         assert!(matches!(err, FrankenError::SchemaChanged));
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_schema_lightweight_refreshes, 0,
+            "cross-connection DDL must not use the lightweight prepared refresh path: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_schema_full_reloads, 1,
+            "cross-connection DDL must fall back to a full reload before invalidation: {profile:?}"
+        );
+        assert!(
+            profile
+                .record_decode
+                .callsite_breakdown
+                .core_connection
+                .parse_record_calls
+                > 0,
+            "schema reload path should decode sqlite_master rows under the core connection scope: {profile:?}"
+        );
     }
 
     #[test]
@@ -67999,6 +68274,14 @@ mod pager_routing_tests {
             insert_profile.prepared_schema_refreshes, 0,
             "prepared INSERT on :memory: should not pay file-backed schema refresh cost: {insert_profile:?}"
         );
+        assert_eq!(
+            insert_profile.prepared_schema_lightweight_refreshes, 0,
+            "prepared INSERT on :memory: should not report lightweight file-backed refresh work: {insert_profile:?}"
+        );
+        assert_eq!(
+            insert_profile.prepared_schema_full_reloads, 0,
+            "prepared INSERT on :memory: should not report file-backed reload work: {insert_profile:?}"
+        );
 
         reset_hot_path_profile();
         let rows = select_stmt
@@ -68011,6 +68294,190 @@ mod pager_routing_tests {
             select_profile.prepared_schema_refreshes, 0,
             "prepared SELECT on :memory: should not pay file-backed schema refresh cost: {select_profile:?}"
         );
+        assert_eq!(
+            select_profile.prepared_schema_lightweight_refreshes, 0,
+            "prepared SELECT on :memory: should not report lightweight file-backed refresh work: {select_profile:?}"
+        );
+        assert_eq!(
+            select_profile.prepared_schema_full_reloads, 0,
+            "prepared SELECT on :memory: should not report file-backed reload work: {select_profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepared_file_backed_select_uses_lightweight_refresh_for_external_dml() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prepared_lightweight_refresh_select.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn1 = Connection::open(&db).unwrap();
+        conn1.set_reject_mem_fallback(true);
+        conn1.set_strict_mem_fallback_rejection(true);
+        conn1
+            .execute("CREATE TABLE prep_lightweight_sel (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO prep_lightweight_sel VALUES (1, 'alpha');")
+            .unwrap();
+
+        let conn2 = Connection::open(&db).unwrap();
+        conn2.set_reject_mem_fallback(true);
+        conn2.set_strict_mem_fallback_rejection(true);
+        let stmt = conn2
+            .prepare("SELECT val FROM prep_lightweight_sel WHERE id = ?1")
+            .unwrap();
+        let seed = stmt
+            .query_row_with_params(&[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(seed.values()[0], SqliteValue::Text("alpha".into()));
+
+        conn1
+            .execute("INSERT INTO prep_lightweight_sel VALUES (2, 'beta');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let row = stmt
+            .query_row_with_params(&[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Text("beta".into()));
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(profile.prepared_schema_refreshes, 1);
+        assert_eq!(
+            profile.prepared_schema_lightweight_refreshes, 1,
+            "external DML on a file-backed prepared SELECT should use the lightweight refresh path: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_schema_full_reloads, 0,
+            "schema-stable external DML should avoid full sqlite_master reloads: {profile:?}"
+        );
+        assert_eq!(
+            profile
+                .record_decode
+                .callsite_breakdown
+                .core_connection
+                .parse_record_calls,
+            0,
+            "lightweight prepared refresh should not rescan sqlite_master rows: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepared_file_backed_autoincrement_insert_refreshes_sequence_without_full_reload() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("prepared_lightweight_refresh_autoincrement.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn1 = Connection::open(&db).unwrap();
+        conn1.set_reject_mem_fallback(true);
+        conn1.set_strict_mem_fallback_rejection(true);
+        conn1
+            .execute(
+                "CREATE TABLE prep_lightweight_auto (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);",
+            )
+            .unwrap();
+        let stmt = conn1
+            .prepare("INSERT INTO prep_lightweight_auto (val) VALUES (?1)")
+            .unwrap();
+
+        let conn2 = Connection::open(&db).unwrap();
+        conn2.set_reject_mem_fallback(true);
+        conn2.set_strict_mem_fallback_rejection(true);
+        conn2
+            .execute("INSERT INTO prep_lightweight_auto (val) VALUES ('from_conn2');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Text("from_conn1".into())])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn1
+            .query("SELECT id, val FROM prep_lightweight_auto ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("from_conn2".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("from_conn1".into()));
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(profile.prepared_schema_refreshes, 1);
+        assert_eq!(
+            profile.prepared_schema_lightweight_refreshes, 1,
+            "AUTOINCREMENT prepared inserts should still use the lightweight refresh path when the schema is unchanged: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_schema_full_reloads, 0,
+            "AUTOINCREMENT sequence upkeep should not force a full schema reload: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepared_file_backed_insert_reuses_schema_bound_publication_for_autocommit_begin() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prepared_insert_publication_reuse.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn1 = Connection::open(&db).unwrap();
+        conn1.set_reject_mem_fallback(true);
+        conn1.set_strict_mem_fallback_rejection(true);
+        conn1
+            .execute("CREATE TABLE prep_pub_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        let stmt = conn1
+            .prepare("INSERT INTO prep_pub_reuse (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        let conn2 = Connection::open(&db).unwrap();
+        conn2.set_reject_mem_fallback(true);
+        conn2.set_strict_mem_fallback_rejection(true);
+        conn2
+            .execute("INSERT INTO prep_pub_reuse VALUES (1, 'from_conn2');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("from_conn1".into()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(profile.prepared_schema_refreshes, 1);
+        assert_eq!(
+            profile.prepared_schema_lightweight_refreshes, 1,
+            "schema-stable external DML should still use the lightweight prepared refresh path: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_schema_full_reloads, 0,
+            "schema-stable external DML should avoid a full MemDB reload before the prepared insert: {profile:?}"
+        );
+        assert_eq!(
+            profile.pager_publication_refreshes, 1,
+            "prepared insert should reuse the schema-bound publication instead of rebinding during autocommit begin: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_insert_fast_lane_hits, 1,
+            "simple prepared insert should stay on the fast lane while reusing the schema-bound publication: {profile:?}"
+        );
+
+        let rows = conn1
+            .query("SELECT id, val FROM prep_pub_reuse ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("from_conn2".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("from_conn1".into()));
     }
 
     #[test]
@@ -68384,7 +68851,7 @@ mod pager_routing_tests {
         let cx = conn.op_cx().unwrap();
         reset_hot_path_profile();
         assert!(
-            conn.ensure_autocommit_txn_mode_with_cx(TransactionMode::Concurrent, &cx)
+            conn.ensure_autocommit_txn_mode_with_cx(TransactionMode::Concurrent, &cx, None)
                 .unwrap(),
             "test requires autocommit begin to open a new concurrent txn"
         );
@@ -68395,6 +68862,26 @@ mod pager_routing_tests {
         );
         conn.resolve_autocommit_txn_with_capture_and_cx(true, false, false, &cx)
             .unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_explicit_begin_reuses_publication_binding_for_mvcc_snapshot() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("explicit_begin_publication_reuse.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE file_pub_begin (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        reset_hot_path_profile();
+        conn.execute("BEGIN;").unwrap();
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.pager_publication_refreshes, 1,
+            "file-backed concurrent BEGIN should refresh pager publication once: {profile:?}"
+        );
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]

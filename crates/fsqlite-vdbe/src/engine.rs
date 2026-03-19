@@ -50,7 +50,7 @@ use fsqlite_types::record::{
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType, WitnessKey};
 
-use crate::{TableIndexMetaMap, VdbeProgram};
+use crate::{TableIndexMetaMap, VdbeProgram, opcode_register_spans};
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes emitted from
@@ -3953,24 +3953,6 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
     }
 }
 
-/// Register spans touched by an opcode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OpcodeRegisterSpans {
-    read_start: i32,
-    read_len: i32,
-    write_start: i32,
-    write_len: i32,
-}
-
-impl OpcodeRegisterSpans {
-    const NONE: Self = Self {
-        read_start: -1,
-        read_len: 0,
-        write_start: -1,
-        write_len: 0,
-    };
-}
-
 /// Outcome of a single engine execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecOutcome {
@@ -4119,6 +4101,13 @@ pub struct VdbeEngine {
     /// Whether `OP_ResultRow` should materialize and retain result rows.
     /// DML-only execution lanes can disable this to avoid row-buffer work.
     collect_result_rows: bool,
+    /// Whether per-statement execution state is already in a fresh baseline.
+    ///
+    /// `reset_for_reuse()` establishes this for cached engines. The common
+    /// prepared-statement path can then skip a second round of identical clears
+    /// at the top of `execute()`, while plain repeated `execute()` calls on the
+    /// same engine still preserve their existing reset semantics.
+    statement_state_clean: bool,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -4489,6 +4478,7 @@ impl VdbeEngine {
             bloom_filters: HashMap::new(),
             make_record_buf: Vec::new(),
             collect_result_rows: true,
+            statement_state_clean: true,
         }
     }
 
@@ -4551,6 +4541,7 @@ impl VdbeEngine {
         self.bloom_filters.clear();
         self.make_record_buf.clear();
         self.collect_result_rows = true;
+        self.statement_state_clean = true;
     }
 
     /// Returns the number of rows modified (inserted, deleted, or updated).
@@ -5048,26 +5039,29 @@ impl VdbeEngine {
     )]
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
-        self.aggregates.clear();
-        self.results.clear();
+        if !self.statement_state_clean {
+            self.aggregates.clear();
+            self.results.clear();
+            self.last_compare_result = None;
+            self.changes = 0;
+            self.last_insert_rowid = 0;
+            self.last_insert_rowid_valid = false;
+            self.last_insert_cursor_id = None;
+            self.pending_update_restore = None;
+            self.pending_insert_rollback = None;
+            self.conflict_skip_idx = false;
+            self.pending_idx_entries.clear();
+            self.rowsets.clear();
+            self.fk_counter = 0;
+            self.sequence_counters.clear();
+            self.cursor_root_pages.clear();
+            self.vtab_cursors.clear();
+            self.window_contexts.clear();
+            self.register_subtypes.clear();
+            self.bloom_filters.clear();
+        }
+        self.statement_state_clean = false;
         self.table_index_meta = Arc::clone(program.shared_table_index_meta());
-        self.last_compare_result = None;
-        self.changes = 0;
-        self.last_insert_rowid = 0;
-        self.last_insert_rowid_valid = false;
-        self.last_insert_cursor_id = None;
-        self.pending_update_restore = None;
-        self.pending_insert_rollback = None;
-        self.conflict_skip_idx = false;
-        self.pending_idx_entries.clear();
-        self.rowsets.clear();
-        self.fk_counter = 0;
-        self.sequence_counters.clear();
-        self.cursor_root_pages.clear();
-        self.vtab_cursors.clear();
-        self.window_contexts.clear();
-        self.register_subtypes.clear();
-        self.bloom_filters.clear();
 
         let ops = program.ops();
         if ops.is_empty() {
@@ -10874,115 +10868,6 @@ fn opcode_trace_enabled() -> bool {
     env_enabled || cfg!(test)
 }
 
-fn range(start: i32, len: i32) -> (i32, i32) {
-    if start <= 0 {
-        (-1, 0)
-    } else {
-        (start, len.max(1))
-    }
-}
-
-fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
-    let (read_start, read_len, write_start, write_len) = match op.opcode {
-        Opcode::Integer
-        | Opcode::Int64
-        | Opcode::Real
-        | Opcode::String
-        | Opcode::String8
-        | Opcode::Blob
-        | Opcode::Variable => {
-            let (write_start, write_len) = range(op.p2, 1);
-            (-1, 0, write_start, write_len)
-        }
-        Opcode::Null => {
-            // p3 is absolute end register; count = p3 - p2 + 1 (or 1 if p3==0).
-            let write_count = if op.p3 > 0 { op.p3 - op.p2 + 1 } else { 1 };
-            let (write_start, write_len) = range(op.p2, write_count);
-            (-1, 0, write_start, write_len)
-        }
-        Opcode::SoftNull
-        | Opcode::Cast
-        | Opcode::RealAffinity
-        | Opcode::AddImm
-        | Opcode::MustBeInt
-        | Opcode::InitCoroutine
-        | Opcode::Yield
-        | Opcode::EndCoroutine => {
-            let (start, len) = range(op.p1, 1);
-            (start, len, start, len)
-        }
-        Opcode::Move => {
-            let (read_start, read_len) = range(op.p1, op.p3);
-            let (write_start, write_len) = range(op.p2, op.p3);
-            (read_start, read_len, write_start, write_len)
-        }
-        Opcode::Copy | Opcode::SCopy | Opcode::IntCopy | Opcode::BitNot | Opcode::Not => {
-            let (read_start, read_len) = range(op.p1, 1);
-            let (write_start, write_len) = range(op.p2, 1);
-            (read_start, read_len, write_start, write_len)
-        }
-        Opcode::ResultRow => {
-            let (read_start, read_len) = range(op.p1, op.p2);
-            (read_start, read_len, -1, 0)
-        }
-        Opcode::Add
-        | Opcode::Subtract
-        | Opcode::Multiply
-        | Opcode::Divide
-        | Opcode::Remainder
-        | Opcode::Concat
-        | Opcode::BitAnd
-        | Opcode::BitOr
-        | Opcode::ShiftLeft
-        | Opcode::ShiftRight
-        | Opcode::And
-        | Opcode::Or => {
-            let (read_start, read_len) = range(op.p1, 2);
-            let (write_start, write_len) = range(op.p3, 1);
-            (read_start, read_len, write_start, write_len)
-        }
-        Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
-            let (read_start, read_len) = range(op.p1, 1);
-            let (rhs_start, rhs_len) = range(op.p3, 1);
-            let normalized_start = if read_start > 0 && rhs_start > 0 {
-                read_start.min(rhs_start)
-            } else if read_start > 0 {
-                read_start
-            } else {
-                rhs_start
-            };
-            let normalized_len = if read_start > 0 && rhs_start > 0 && read_start != rhs_start {
-                2
-            } else {
-                read_len.max(rhs_len)
-            };
-            (normalized_start, normalized_len, -1, 0)
-        }
-        Opcode::If | Opcode::IfNot | Opcode::IsNull | Opcode::NotNull | Opcode::IsTrue => {
-            let (read_start, read_len) = range(op.p1, 1);
-            (read_start, read_len, -1, 0)
-        }
-        Opcode::MakeRecord => {
-            let (read_start, read_len) = range(op.p1, op.p2);
-            let (write_start, write_len) = range(op.p3, 1);
-            (read_start, read_len, write_start, write_len)
-        }
-        _ => (
-            OpcodeRegisterSpans::NONE.read_start,
-            OpcodeRegisterSpans::NONE.read_len,
-            OpcodeRegisterSpans::NONE.write_start,
-            OpcodeRegisterSpans::NONE.write_len,
-        ),
-    };
-
-    OpcodeRegisterSpans {
-        read_start,
-        read_len,
-        write_start,
-        write_len,
-    }
-}
-
 // ── Arithmetic helpers ──────────────────────────────────────────────────────
 
 /// Mirrors C SQLite `numericType()` (SQLite VDBE:496): returns true if BOTH
@@ -11642,6 +11527,57 @@ mod tests {
         assert!(engine.results().is_empty());
         assert_eq!(engine.changes(), 0);
         assert_eq!(engine.last_insert_rowid(), None);
+    }
+
+    #[test]
+    fn test_reset_for_reuse_keeps_cached_engine_results_clean() {
+        let mut first_builder = ProgramBuilder::new();
+        let first_reg = first_builder.alloc_reg();
+        first_builder.emit_op(Opcode::Integer, 11, first_reg, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::ResultRow, first_reg, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let first_program = first_builder.finish().expect("first program should build");
+
+        let mut second_builder = ProgramBuilder::new();
+        let second_reg = second_builder.alloc_reg();
+        second_builder.emit_op(Opcode::Integer, 22, second_reg, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, second_reg, 1, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let second_program = second_builder
+            .finish()
+            .expect("second program should build");
+
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+        );
+        assert_eq!(
+            engine.execute(&first_program).expect("first execution"),
+            ExecOutcome::Done
+        );
+
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+            &reset_cx,
+            PageSize::DEFAULT,
+        );
+
+        assert_eq!(
+            engine.execute(&second_program).expect("second execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(22)]]
+        );
     }
 
     #[test]

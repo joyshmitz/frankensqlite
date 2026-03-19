@@ -1427,7 +1427,10 @@ mod tests {
 
         let snapshot = record_profile_snapshot();
         assert_eq!(snapshot.parse_record_calls, 1);
-        assert_eq!(snapshot.parse_record_into_calls, 1);
+        // Full-row decode currently delegates to `parse_record_into`, so the
+        // aggregate "into" counter includes both the explicit reuse pass and
+        // the nested call performed by `parse_record`.
+        assert_eq!(snapshot.parse_record_into_calls, 2);
         assert_eq!(snapshot.parse_record_column_calls, 1);
         assert_eq!(
             snapshot
@@ -1441,7 +1444,7 @@ mod tests {
                 .callsite_breakdown
                 .core_connection
                 .parse_record_into_calls,
-            1
+            2
         );
         assert_eq!(
             snapshot

@@ -42,6 +42,19 @@ fn wal_append_gate_for_path(db_path: &Path) -> WalAppendGate {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalCommitSyncPolicy {
+    Deferred,
+    PerCommit,
+}
+
+impl WalCommitSyncPolicy {
+    #[must_use]
+    const fn should_sync_on_commit(self) -> bool {
+        matches!(self, Self::PerCommit)
+    }
+}
+
 /// The inner mutable pager state protected by a mutex.
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
@@ -62,6 +75,8 @@ pub(crate) struct PagerInner<F: VfsFile> {
     freelist: Vec<PageNumber>,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
+    /// WAL commit sync policy derived from `PRAGMA synchronous`.
+    wal_commit_sync_policy: WalCommitSyncPolicy,
     /// Whether this pager has a locally failed rollback-journal commit that
     /// must be repaired before the handle can be reused.
     rollback_journal_recovery_pending: bool,
@@ -982,7 +997,6 @@ where
             let cleanup_cx = cx.clone();
             return Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
-                db_path: self.db_path.clone(),
                 journal_path: Self::journal_path(&self.db_path),
                 wal_append_gate: wal_append_gate_for_path(&self.db_path),
                 inner: Arc::clone(&self.inner),
@@ -1166,7 +1180,6 @@ where
 
         Ok(SimpleTransaction {
             vfs: Arc::clone(&self.vfs),
-            db_path: self.db_path.clone(),
             journal_path: Self::journal_path(&self.db_path),
             wal_append_gate: wal_append_gate_for_path(&self.db_path),
             inner: Arc::clone(&self.inner),
@@ -1284,6 +1297,25 @@ where
     /// Clone the pager's VFS handle for companion-file operations.
     pub fn vfs_handle(&self) -> Arc<V> {
         Arc::clone(&self.vfs)
+    }
+
+    /// Return the current WAL commit sync policy.
+    #[must_use]
+    pub fn wal_commit_sync_policy(&self) -> WalCommitSyncPolicy {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wal_commit_sync_policy
+    }
+
+    /// Configure whether WAL-mode commits sync the WAL file immediately.
+    pub fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        inner.wal_commit_sync_policy = policy;
+        Ok(())
     }
 
     /// Copy the pager's main database file to `target_path` via the active VFS.
@@ -1735,6 +1767,7 @@ where
                 checkpoint_active: false,
                 freelist,
                 journal_mode: JournalMode::Delete,
+                wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 rollback_journal_recovery_pending: false,
                 wal_backend: None,
                 commit_seq: initial_commit_seq,
@@ -1973,7 +2006,6 @@ const PAGE_LEASE_BATCH_SIZE: u32 = 8;
 
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
-    db_path: PathBuf,
     journal_path: PathBuf,
     wal_append_gate: WalAppendGate,
     inner: Arc<Mutex<PagerInner<V::File>>>,
@@ -2437,12 +2469,12 @@ where
                 wal.append_frames(cx, &batch.frames)?;
             }
 
-            // Sync WAL to ensure durability.
-            let wal = inner
-                .wal_backend
-                .as_mut()
-                .ok_or_else(|| FrankenError::internal("WAL backend disappeared during commit"))?;
-            wal.sync(cx)?;
+            if inner.wal_commit_sync_policy.should_sync_on_commit() {
+                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
+                    FrankenError::internal("WAL backend disappeared during commit")
+                })?;
+                wal.sync(cx)?;
+            }
 
             // Update db_size for any new pages.
             inner.db_size = batch.new_db_size;
@@ -6232,6 +6264,7 @@ mod tests {
         frames: SharedFrames,
         begin_calls: SharedCounter,
         batch_calls: SharedCounter,
+        sync_calls: SharedCounter,
     }
 
     impl MockWalBackend {
@@ -6239,11 +6272,13 @@ mod tests {
             let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
             let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             (
                 Self {
                     frames: StdArc::clone(&frames),
                     begin_calls: StdArc::clone(&begin_calls),
                     batch_calls: StdArc::clone(&batch_calls),
+                    sync_calls,
                 },
                 frames,
                 begin_calls,
@@ -6251,14 +6286,41 @@ mod tests {
             )
         }
 
+        fn new_with_sync_tracking() -> (
+            Self,
+            SharedFrames,
+            SharedCounter,
+            SharedCounter,
+            SharedCounter,
+        ) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                    begin_calls: StdArc::clone(&begin_calls),
+                    batch_calls: StdArc::clone(&batch_calls),
+                    sync_calls: StdArc::clone(&sync_calls),
+                },
+                frames,
+                begin_calls,
+                batch_calls,
+                sync_calls,
+            )
+        }
+
         fn with_shared_frames(frames: SharedFrames) -> (Self, SharedCounter, SharedCounter) {
             let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             (
                 Self {
                     frames,
                     begin_calls: StdArc::clone(&begin_calls),
                     batch_calls: StdArc::clone(&batch_calls),
+                    sync_calls,
                 },
                 begin_calls,
                 batch_calls,
@@ -7110,6 +7172,7 @@ mod tests {
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            *self.sync_calls.lock().unwrap() += 1;
             Ok(())
         }
 
@@ -7694,6 +7757,70 @@ mod tests {
             frames[1].0,
             new_page.get(),
             "bead_id=bd-db300.3.2 case=prepared_path_preserves_sorted_commit_frame"
+        );
+    }
+
+    #[test]
+    fn test_wal_commit_sync_policy_deferred_skips_sync() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/wal_deferred_sync_policy.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, frames, _begin_calls, _batch_calls, sync_calls) =
+            MockWalBackend::new_with_sync_tracking();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        pager
+            .set_wal_commit_sync_policy(WalCommitSyncPolicy::Deferred)
+            .unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0x55; PageSize::DEFAULT.as_usize()])
+            .unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            0,
+            "bead_id={BEAD_ID} case=wal_sync_policy_deferred_skips_commit_sync"
+        );
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            2,
+            "bead_id={BEAD_ID} case=wal_sync_policy_deferred_still_appends_wal_frames"
+        );
+    }
+
+    #[test]
+    fn test_wal_commit_sync_policy_per_commit_syncs() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/wal_per_commit_sync_policy.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, frames, _begin_calls, _batch_calls, sync_calls) =
+            MockWalBackend::new_with_sync_tracking();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        pager
+            .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+            .unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0x66; PageSize::DEFAULT.as_usize()])
+            .unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            1,
+            "bead_id={BEAD_ID} case=wal_sync_policy_per_commit_runs_commit_sync"
+        );
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            2,
+            "bead_id={BEAD_ID} case=wal_sync_policy_per_commit_appends_wal_frames"
         );
     }
 
