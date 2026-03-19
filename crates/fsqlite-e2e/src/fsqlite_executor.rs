@@ -2727,15 +2727,24 @@ mod tests {
         let (setup_records, per_worker) = partition_records(&oplog, 2).unwrap();
 
         assert_eq!(
-            setup_records.iter().map(|rec| rec.op_id).collect::<Vec<_>>(),
+            setup_records
+                .iter()
+                .map(|rec| rec.op_id)
+                .collect::<Vec<_>>(),
             vec![0, 4, 5]
         );
         assert_eq!(
-            per_worker[0].iter().map(|rec| rec.op_id).collect::<Vec<_>>(),
+            per_worker[0]
+                .iter()
+                .map(|rec| rec.op_id)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(
-            per_worker[1].iter().map(|rec| rec.op_id).collect::<Vec<_>>(),
+            per_worker[1]
+                .iter()
+                .map(|rec| rec.op_id)
+                .collect::<Vec<_>>(),
             vec![6, 7, 8]
         );
     }
