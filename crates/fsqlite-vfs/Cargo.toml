@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [features]
 default = ["linux-asupersync-uring"]
-native = ["fsqlite-types/native"]
+native = ["fsqlite-types/native", "linux-asupersync-uring"]
 wasm = ["fsqlite-types/wasm"]
 linux-asupersync-uring = ["native", "dep:asupersync", "dep:pollster"]
 # Deprecated compatibility toggle; guarded by compile_error in src/uring.rs.

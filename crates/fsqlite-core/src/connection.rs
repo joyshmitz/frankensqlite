@@ -69,8 +69,8 @@ use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{
-    RecordHotPathProfileSnapshot, parse_record, record_profile_snapshot, reset_record_profile,
-    serialize_record, set_record_profile_enabled,
+    RecordHotPathProfileSnapshot, RecordProfileScope, enter_record_profile_scope, parse_record,
+    record_profile_snapshot, reset_record_profile, serialize_record, set_record_profile_enabled,
 };
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{
@@ -1890,6 +1890,7 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         if self.dml_dispatch.is_some() {
             return Err(FrankenError::Internal(
                 "DML prepared statements must be executed through \
@@ -1930,6 +1931,7 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         if self.dml_dispatch.is_some() {
             return Err(FrankenError::Internal(
                 "DML prepared statements must be executed through \
@@ -2952,6 +2954,152 @@ impl Connection {
     /// are supported.
     pub fn open(path: impl Into<String>) -> Result<Self> {
         Self::open_with_env(path, ConnectionEnv::default())
+    }
+
+    /// Open a connection that loads only the database schema (table
+    /// definitions, indexes, triggers, views) without reading any row data
+    /// into the in-memory `MemDatabase`.
+    ///
+    /// This is dramatically faster for large databases when the caller only
+    /// needs schema metadata or will execute queries through pager-backed
+    /// cursors (the default for file-backed databases).
+    ///
+    /// Row data is still accessible through the pager's B-tree cursor stack;
+    /// only the `MemDatabase` compatibility image is left empty.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let conn = Connection::open_schema_only("large.db")?;
+    /// // Schema is available, queries work through pager-backed cursors.
+    /// let rows = conn.query("SELECT count(*) FROM big_table")?;
+    /// ```
+    pub fn open_schema_only(path: impl Into<String>) -> Result<Self> {
+        Self::open_schema_only_with_env(path, ConnectionEnv::default())
+    }
+
+    /// Open a schema-only connection with an explicit runtime environment.
+    ///
+    /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
+    /// specifying a custom [`ConnectionEnv`].
+    pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
+        let path = path.into();
+        if path.is_empty() {
+            return Err(FrankenError::CannotOpen {
+                path: std::path::PathBuf::from(path),
+            });
+        }
+
+        let bootstrap_cx =
+            env.runtime()
+                .root_cx
+                .create_child()
+                .with_trace_context(next_trace_id(), 0, 0);
+        let pager = PagerBackend::open(&path, &bootstrap_cx)?;
+        let pager_page_size = pager.page_size();
+        let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
+        let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
+        let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
+        if let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started() {
+            let _ = shared_mvcc_state.release_connection(runtime_region, true);
+            return Err(err);
+        }
+        let eprocess_oracle = Arc::new(EProcessOracle::new(
+            EPROCESS_DEFAULT_CONFIG,
+            EPROCESS_PRIORITY_THRESHOLD,
+        ));
+        root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
+
+        let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
+        let conn = Self {
+            path,
+            db: Rc::new(RefCell::new(MemDatabase::new())),
+            pager,
+            active_txn: RefCell::new(None),
+            cached_read_snapshot: RefCell::new(None),
+            cached_read_snapshot_cookie: Cell::new(0),
+            cached_write_txn: RefCell::new(None),
+            cached_write_txn_cookie: Cell::new(0),
+            cached_vdbe_engine: RefCell::new(None),
+            schema: RefCell::new(Vec::new()),
+            views: RefCell::new(Vec::new()),
+            triggers: RefCell::new(Vec::new()),
+            trigger_frame_stack: RefCell::new(Vec::new()),
+            func_registry: RefCell::new(default_function_registry(&collation_registry)),
+            collation_registry,
+            in_transaction: RefCell::new(false),
+            txn_snapshot: RefCell::new(None),
+            savepoints: RefCell::new(Vec::new()),
+            txn_lifecycle_metrics: RefCell::new(TxnLifecycleMetrics::default()),
+            checkpoint_advisor_state: RefCell::new(CheckpointAdvisorState::default()),
+            last_changes: RefCell::new(0),
+            last_insert_rowid: RefCell::new(0),
+            total_changes: RefCell::new(0),
+            last_table_program_error_state: RefCell::new(None),
+            internal_statement_savepoint_depth: Cell::new(0),
+            implicit_txn: RefCell::new(false),
+            concurrent_txn: RefCell::new(false),
+            concurrent_mode_default: RefCell::new(true),
+            pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
+            differential_registry: DifferentialRegistry::default(),
+            rowid_alias_columns: RefCell::new(HashMap::new()),
+            original_ddl_sql: RefCell::new(HashMap::new()),
+            autoincrement_tables: RefCell::new(HashSet::new()),
+            sqlite_sequence_cache: RefCell::new(HashMap::new()),
+            next_master_rowid: RefCell::new(1),
+            schema_cookie: RefCell::new(0),
+            schema_generation: Cell::new(0),
+            change_counter: RefCell::new(0),
+            fk_cascade_depth: Cell::new(0),
+            conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
+            trace_registration: RefCell::new(None),
+            ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
+            concurrent_registry: Arc::clone(&shared_mvcc_state.registry),
+            _shared_mvcc_state: Arc::clone(&shared_mvcc_state),
+            runtime_region,
+            concurrent_session_id: RefCell::new(None),
+            concurrent_lock_table: Arc::clone(&shared_mvcc_state.lock_table),
+            concurrent_commit_index: Arc::clone(&shared_mvcc_state.commit_index),
+            next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
+            memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
+            // Never hydrate rows — this is the whole point of schema-only.
+            memdb_rows_loaded: Cell::new(false),
+            last_local_commit_seq: RefCell::new(None),
+            closed: RefCell::new(false),
+            root_cx,
+            eprocess_oracle,
+            statement_count_since_oracle_refresh: Cell::new(0),
+            version_store: Arc::new(VersionStore::new(pager_page_size)),
+            gc_scheduler: RefCell::new(GcScheduler::new()),
+            gc_todo: RefCell::new(GcTodo::new()),
+            gc_clock_millis: RefCell::new(0),
+            // Schema-only connections always use parity-cert mode (pager-backed
+            // cursors); the MemDatabase is deliberately left empty.
+            reject_mem_fallback: RefCell::new(true),
+            reject_mem_fallback_strict: RefCell::new(false),
+            vtab_modules: RefCell::new(default_vtab_module_registry()),
+            vtab_instances: RefCell::new(HashMap::new()),
+            dropped_vtab_instances: RefCell::new(HashMap::new()),
+            live_vtab_transactions: RefCell::new(HashSet::new()),
+            live_vtab_registry_undo: RefCell::new(Vec::new()),
+            parse_cache: RefCell::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+            parse_cache_cookie: RefCell::new(0),
+            compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
+            prepared_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
+            table_execution_metadata_cache: RefCell::new(None),
+            attached_schemas: RefCell::new(SchemaRegistry::new()),
+            attached_connections: RefCell::new(HashMap::new()),
+            time_travel_snapshots: RefCell::new(Vec::new()),
+            time_travel_active: Cell::new(false),
+        };
+        conn.bootstrap_journal_mode_from_storage()?;
+        conn.bootstrap_pragma_state_from_storage();
+        conn.apply_current_journal_mode_to_pager()?;
+        let op_cx = conn.op_cx()?;
+        // Explicitly load schema only — never hydrate row data.
+        conn.reload_memdb_from_pager_with_mode(&op_cx, false)?;
+        conn.sync_change_tracking_context();
+        Ok(conn)
     }
 
     /// Open a connection with an explicit runtime environment.
@@ -5202,6 +5350,7 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         self.background_status()?;
         if !std::ptr::eq(self, stmt.conn) {
             return Err(FrankenError::internal(
@@ -6336,6 +6485,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
     ) -> Result<Vec<Row>> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         self.clear_table_program_error_state();
         self.sync_change_tracking_context();
         let statement_kind = match &statement {
@@ -15762,6 +15912,41 @@ impl Connection {
         }
     }
 
+    fn finalize_read_only_concurrent_commit(&self) {
+        let Some(session_id) = *self.concurrent_session_id.borrow() else {
+            return;
+        };
+        let commit_card = {
+            let mut registry = lock_unpoisoned(&self.concurrent_registry);
+            let Some(shared_handle) = registry.remove(session_id) else {
+                *self.concurrent_session_id.borrow_mut() = None;
+                return;
+            };
+            let snapshot = {
+                let handle = shared_handle.lock();
+                Self::capture_ssi_snapshot(&handle)
+            };
+            registry.recycle_handle(shared_handle);
+            *self.concurrent_session_id.borrow_mut() = None;
+            Some(
+                Self::build_ssi_decision_draft(
+                    &snapshot,
+                    SsiDecisionType::CommitAllowed,
+                    Vec::new(),
+                    Vec::new(),
+                    format!(
+                        "read_only_commit_snapshot_seq={}",
+                        snapshot.snapshot_seq.get()
+                    ),
+                )
+                .with_commit_seq(self.current_global_commit_seq()),
+            )
+        };
+        if let Some(card) = commit_card {
+            self.ssi_evidence_ledger.record_async(card);
+        }
+    }
+
     /// Handle COMMIT.
     fn execute_commit(&self) -> Result<()> {
         if !*self.in_transaction.borrow() {
@@ -15837,7 +16022,7 @@ impl Connection {
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
         let (commit_result, committed_write) = {
-            let concurrent_commit_plan = if is_concurrent_txn {
+            let concurrent_commit_plan = if is_concurrent_txn && txn_has_pending_writes {
                 self.plan_concurrent_commit(&pending_conflict_pages)?
             } else {
                 None
@@ -15855,6 +16040,8 @@ impl Connection {
                 if let Some(plan) = concurrent_commit_plan {
                     let committed_seq = self.advance_commit_clock();
                     self.finalize_concurrent_commit(plan, committed_seq);
+                } else if is_concurrent_txn {
+                    self.finalize_read_only_concurrent_commit();
                 }
             }
 
@@ -24923,6 +25110,7 @@ impl Connection {
 
     #[allow(clippy::too_many_lines)]
     fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         let bound_publication = self.bind_pager_publication(cx, "memdb_reload")?;
         let bound_visible_commit_seq = bound_publication.snapshot.visible_commit_seq;
 
@@ -62057,6 +62245,388 @@ mod pager_routing_tests {
             final_row.get(0),
             Some(&SqliteValue::Integer(2)),
             "retrying loser should advance the row to 2 after rebinding"
+        );
+    }
+
+    #[test]
+    fn test_disjoint_concurrent_prepared_inserts_keep_distinct_conflict_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("disjoint_concurrent_prepared_inserts.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        let (left_root_page, right_root_page) = {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE left_t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+            conn.execute("CREATE TABLE right_t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+
+            let schema = conn.schema.borrow();
+            let left_root_page = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("left_t"))
+                .map(|table| table.root_page)
+                .expect("left_t root page must exist");
+            let right_root_page = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("right_t"))
+                .map(|table| table.root_page)
+                .expect("right_t root page must exist");
+            (left_root_page, right_root_page)
+        };
+
+        assert_ne!(
+            left_root_page, right_root_page,
+            "disjoint-table proof requires distinct root pages"
+        );
+
+        let left_root_pgno =
+            PageNumber::new(u32::try_from(left_root_page).expect("left root page fits u32"))
+                .expect("left root page valid");
+        let right_root_pgno =
+            PageNumber::new(u32::try_from(right_root_page).expect("right root page fits u32"))
+                .expect("right root page valid");
+
+        let conn1 = Connection::open(&db).unwrap();
+        let conn2 = Connection::open(&db).unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        let insert_left = conn1
+            .prepare("INSERT INTO left_t (id, v) VALUES (?1, ?2)")
+            .unwrap();
+        let insert_right = conn2
+            .prepare("INSERT INTO right_t (id, v) VALUES (?1, ?2)")
+            .unwrap();
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        conn1
+            .execute_prepared_with_params(
+                &insert_left,
+                &[SqliteValue::Integer(1), SqliteValue::Integer(11)],
+            )
+            .unwrap();
+        conn2
+            .execute_prepared_with_params(
+                &insert_right,
+                &[SqliteValue::Integer(1), SqliteValue::Integer(22)],
+            )
+            .unwrap();
+
+        let left_conflict_surface = {
+            let mut txn_guard = conn1.active_txn.borrow_mut();
+            let txn = txn_guard
+                .as_mut()
+                .expect("left concurrent transaction should have active pager handle");
+            txn.pending_conflict_pages().unwrap()
+        };
+        let right_conflict_surface = {
+            let mut txn_guard = conn2.active_txn.borrow_mut();
+            let txn = txn_guard
+                .as_mut()
+                .expect("right concurrent transaction should have active pager handle");
+            txn.pending_conflict_pages().unwrap()
+        };
+
+        assert!(
+            left_conflict_surface.contains(&left_root_pgno),
+            "left insert must track its own table root in the conflict surface: {left_conflict_surface:?}"
+        );
+        assert!(
+            !left_conflict_surface.contains(&right_root_pgno),
+            "left insert must not pull in right_t root page: left={left_conflict_surface:?} right_root={right_root_pgno:?}"
+        );
+        assert!(
+            right_conflict_surface.contains(&right_root_pgno),
+            "right insert must track its own table root in the conflict surface: {right_conflict_surface:?}"
+        );
+        assert!(
+            !right_conflict_surface.contains(&left_root_pgno),
+            "right insert must not pull in left_t root page: right={right_conflict_surface:?} left_root={left_root_pgno:?}"
+        );
+
+        conn1.execute("COMMIT;").unwrap();
+        conn2.execute("COMMIT;").unwrap();
+
+        let rows = conn1
+            .query("SELECT (SELECT COUNT(*) FROM left_t), (SELECT COUNT(*) FROM right_t);")
+            .unwrap();
+        assert_eq!(
+            rows[0].values(),
+            &[SqliteValue::Integer(1), SqliteValue::Integer(1)],
+            "both disjoint concurrent inserts must commit successfully"
+        );
+    }
+
+    #[test]
+    fn test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("disjoint_concurrent_prepared_insert_reuse_rounds.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE left_t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+            conn.execute("CREATE TABLE right_t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+        }
+
+        let conn1 = Connection::open(&db).unwrap();
+        let conn2 = Connection::open(&db).unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        let insert_left = conn1
+            .prepare("INSERT INTO left_t (id, v) VALUES (?1, ?2)")
+            .unwrap();
+        let insert_right = conn2
+            .prepare("INSERT INTO right_t (id, v) VALUES (?1, ?2)")
+            .unwrap();
+
+        let mut left_snapshots = Vec::new();
+        let mut right_snapshots = Vec::new();
+
+        for round in 0_i64..4 {
+            conn1.execute("BEGIN CONCURRENT;").unwrap();
+            conn2.execute("BEGIN CONCURRENT;").unwrap();
+            left_snapshots.push(conn1.current_concurrent_snapshot_seq().unwrap());
+            right_snapshots.push(conn2.current_concurrent_snapshot_seq().unwrap());
+
+            conn1
+                .execute_prepared_with_params(
+                    &insert_left,
+                    &[
+                        SqliteValue::Integer(round + 1),
+                        SqliteValue::Integer(100 + round),
+                    ],
+                )
+                .unwrap();
+            conn2
+                .execute_prepared_with_params(
+                    &insert_right,
+                    &[
+                        SqliteValue::Integer(round + 1),
+                        SqliteValue::Integer(200 + round),
+                    ],
+                )
+                .unwrap();
+
+            conn1.execute("COMMIT;").unwrap();
+            conn2.execute("COMMIT;").unwrap();
+        }
+
+        assert!(
+            left_snapshots.windows(2).all(|pair| pair[1] >= pair[0]),
+            "left connection snapshot_high must refresh monotonically across rounds: {left_snapshots:?}"
+        );
+        assert!(
+            right_snapshots.windows(2).all(|pair| pair[1] >= pair[0]),
+            "right connection snapshot_high must refresh monotonically across rounds: {right_snapshots:?}"
+        );
+
+        let rows = conn1
+            .query("SELECT (SELECT COUNT(*) FROM left_t), (SELECT COUNT(*) FROM right_t);")
+            .unwrap();
+        assert_eq!(
+            rows[0].values(),
+            &[SqliteValue::Integer(4), SqliteValue::Integer(4)],
+            "prepared insert reuse across concurrent rounds must preserve all disjoint commits"
+        );
+    }
+
+    #[test]
+    fn test_reader_rw_hot_select_does_not_track_unrelated_writer_progress_root_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reader_rw_hot_read_set_scope.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        let (rw_hot_root_page, writer_progress_root_page) = {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE rw_hot (id INTEGER PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE writer_progress_0 (round INTEGER PRIMARY KEY, committed INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO rw_hot (id, v) VALUES (0, 0), (1, 0);")
+                .unwrap();
+
+            let schema = conn.schema.borrow();
+            let rw_hot_root_page = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("rw_hot"))
+                .map(|table| table.root_page)
+                .expect("rw_hot root page must exist");
+            let writer_progress_root_page = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("writer_progress_0"))
+                .map(|table| table.root_page)
+                .expect("writer_progress_0 root page must exist");
+            (rw_hot_root_page, writer_progress_root_page)
+        };
+
+        assert_ne!(
+            rw_hot_root_page, writer_progress_root_page,
+            "fixture requires disjoint root pages"
+        );
+
+        let rw_hot_root_pgno =
+            PageNumber::new(u32::try_from(rw_hot_root_page).expect("rw_hot root page fits u32"))
+                .expect("rw_hot root page valid");
+        let writer_progress_root_pgno = PageNumber::new(
+            u32::try_from(writer_progress_root_page).expect("writer_progress root page fits u32"),
+        )
+        .expect("writer_progress root page valid");
+
+        let reader = Connection::open(&db).unwrap();
+        reader.execute("PRAGMA busy_timeout=5000;").unwrap();
+        reader
+            .execute("PRAGMA fsqlite.concurrent_mode=ON;")
+            .unwrap();
+
+        reader.execute("BEGIN CONCURRENT;").unwrap();
+        assert_eq!(
+            reader.query("SELECT SUM(v) FROM rw_hot;").unwrap().len(),
+            1,
+            "reader aggregate should execute successfully"
+        );
+        assert_eq!(
+            reader
+                .query("SELECT v FROM rw_hot WHERE id = 1;")
+                .unwrap()
+                .len(),
+            1,
+            "reader point lookup should execute successfully"
+        );
+
+        let session_id = reader
+            .concurrent_session_id
+            .borrow()
+            .expect("reader BEGIN CONCURRENT should create a session");
+        let read_pages = {
+            let registry = lock_unpoisoned(&reader.concurrent_registry);
+            let handle = registry
+                .get(session_id)
+                .expect("reader concurrent handle should exist");
+            let mut pages = handle.read_set().iter().copied().collect::<Vec<_>>();
+            pages.sort_by_key(|page| page.get());
+            pages
+        };
+
+        assert!(
+            read_pages.contains(&rw_hot_root_pgno),
+            "reader must track rw_hot root page reads: {read_pages:?}"
+        );
+        assert!(
+            !read_pages.contains(&writer_progress_root_pgno),
+            "reader SELECT on rw_hot must not pull in unrelated writer_progress root page: read_pages={read_pages:?} writer_progress_root={writer_progress_root_pgno:?}"
+        );
+
+        reader.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_mixed_reader_and_disjoint_writer_rounds_do_not_self_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mixed_reader_writer_disjoint_rounds.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        let writer_progress_root_pgno = {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE rw_hot (id INTEGER PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE writer_progress_0 (round INTEGER PRIMARY KEY, committed INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO rw_hot (id, v) VALUES (0, 0), (1, 0);")
+                .unwrap();
+            let writer_progress_root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("writer_progress_0"))
+                .map(|table| table.root_page)
+                .expect("writer_progress_0 root page must exist");
+            PageNumber::new(
+                u32::try_from(writer_progress_root_page)
+                    .expect("writer_progress_0 root page fits u32"),
+            )
+            .expect("writer_progress_0 root page valid")
+        };
+
+        let reader = Connection::open(&db).unwrap();
+        let writer = Connection::open(&db).unwrap();
+        for conn in [&reader, &writer] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        for round in 0_i64..8 {
+            reader.execute("BEGIN CONCURRENT;").unwrap();
+            writer.execute("BEGIN CONCURRENT;").unwrap();
+
+            let writer_snapshot = writer
+                .current_concurrent_snapshot_seq()
+                .expect("writer BEGIN CONCURRENT must bind a snapshot");
+            let latest_writer_commit = writer
+                .concurrent_commit_index
+                .latest(writer_progress_root_pgno)
+                .map_or(0, CommitSeq::get);
+            assert!(
+                writer_snapshot >= latest_writer_commit,
+                "writer BEGIN CONCURRENT bound stale snapshot before round {round}: snapshot_high={writer_snapshot} latest_writer_commit={latest_writer_commit}"
+            );
+
+            assert_eq!(reader.query("SELECT SUM(v) FROM rw_hot;").unwrap().len(), 1);
+            assert_eq!(
+                reader
+                    .query("SELECT v FROM rw_hot WHERE id = 1;")
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            writer
+                .execute(&format!(
+                    "INSERT INTO writer_progress_0 (round, committed) VALUES ({round}, 1);"
+                ))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "writer insert in disjoint mixed round {round} failed unexpectedly: {err:?}"
+                    )
+                });
+
+            reader.execute("COMMIT;").unwrap();
+            writer.execute("COMMIT;").unwrap_or_else(|err| {
+                panic!("writer COMMIT in disjoint mixed round {round} failed unexpectedly: {err:?}")
+            });
+        }
+
+        let final_rows = writer
+            .query("SELECT COUNT(*) FROM writer_progress_0;")
+            .unwrap();
+        assert_eq!(
+            final_rows[0].get(0),
+            Some(&SqliteValue::Integer(8)),
+            "all disjoint writer rounds must commit successfully under concurrent readers"
         );
     }
 

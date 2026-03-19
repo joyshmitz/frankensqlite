@@ -59,22 +59,26 @@ impl std::ops::BitOr for OpenFlags {
 
 /// Open a connection with the given flags.
 ///
-/// Currently fsqlite's `Connection::open` doesn't accept flags directly,
-/// so this function validates flags and delegates to `Connection::open`.
-/// Read-only mode emits a warning but still opens read-write (until
-/// fsqlite adds read-only support upstream).
+/// When `SQLITE_OPEN_READ_ONLY` is set, the connection is opened in
+/// schema-only mode: table/index/view/trigger definitions are loaded
+/// but no row data is read into the in-memory `MemDatabase`. Queries
+/// are served through pager-backed B-tree cursors, which read directly
+/// from the on-disk pages. This makes opening even multi-gigabyte
+/// databases near-instantaneous.
 ///
 /// # Examples
 ///
 /// ```ignore
 /// use fsqlite::compat::{OpenFlags, open_with_flags};
 ///
-/// let conn = open_with_flags("my.db", OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+/// let conn = open_with_flags("my.db", OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 /// ```
-pub fn open_with_flags(path: &str, _flags: OpenFlags) -> Result<Connection, FrankenError> {
-    // fsqlite currently opens all connections as read-write.
-    // When upstream adds flag support, wire them through here.
-    Connection::open(path)
+pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
+    if flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Connection::open_schema_only(path)
+    } else {
+        Connection::open(path)
+    }
 }
 
 #[cfg(test)]

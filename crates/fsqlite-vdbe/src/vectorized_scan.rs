@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, PageWriter};
 use fsqlite_error::FrankenError;
-use fsqlite_types::record::parse_record;
+use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{Cx, PageNumber};
 
@@ -245,6 +245,8 @@ where
     /// or batch construction fails.
     #[allow(clippy::too_many_lines)]
     pub fn next_batch(&mut self) -> ScanResult<Option<ScanBatch>> {
+        let _record_profile_scope =
+            enter_record_profile_scope(RecordProfileScope::VdbeVectorizedScan);
         if self.finished {
             return Ok(None);
         }

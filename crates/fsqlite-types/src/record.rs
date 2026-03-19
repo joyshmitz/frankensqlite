@@ -7,6 +7,7 @@
 //!
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
@@ -31,6 +32,65 @@ static FSQLITE_RECORD_VALUE_TEXTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECORD_VALUE_BLOBS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECORD_TEXT_BYTES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECORD_BLOB_BYTES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_PARSE_CALLS_BY_SCOPE: [AtomicU64; RECORD_PROFILE_SCOPE_COUNT] =
+    [const { AtomicU64::new(0) }; RECORD_PROFILE_SCOPE_COUNT];
+static FSQLITE_RECORD_PARSE_INTO_CALLS_BY_SCOPE: [AtomicU64; RECORD_PROFILE_SCOPE_COUNT] =
+    [const { AtomicU64::new(0) }; RECORD_PROFILE_SCOPE_COUNT];
+static FSQLITE_RECORD_PARSE_COLUMN_CALLS_BY_SCOPE: [AtomicU64; RECORD_PROFILE_SCOPE_COUNT] =
+    [const { AtomicU64::new(0) }; RECORD_PROFILE_SCOPE_COUNT];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum RecordProfileScope {
+    Unattributed = 0,
+    CoreConnection = 1,
+    CoreCompatPersist = 2,
+    VdbeEngine = 3,
+    VdbeVectorizedScan = 4,
+    BtreeCursor = 5,
+}
+
+impl RecordProfileScope {
+    #[must_use]
+    const fn as_index(self) -> usize {
+        self as usize
+    }
+}
+
+const RECORD_PROFILE_SCOPE_COUNT: usize = RecordProfileScope::BtreeCursor as usize + 1;
+
+thread_local! {
+    static CURRENT_RECORD_PROFILE_SCOPE: Cell<RecordProfileScope> =
+        const { Cell::new(RecordProfileScope::Unattributed) };
+}
+
+#[derive(Debug)]
+pub struct RecordProfileScopeGuard {
+    previous: Option<RecordProfileScope>,
+}
+
+impl Drop for RecordProfileScopeGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            CURRENT_RECORD_PROFILE_SCOPE.with(|current| current.set(previous));
+        }
+    }
+}
+
+#[must_use]
+pub fn enter_record_profile_scope(scope: RecordProfileScope) -> RecordProfileScopeGuard {
+    if !record_profile_enabled() {
+        return RecordProfileScopeGuard { previous: None };
+    }
+    let previous = CURRENT_RECORD_PROFILE_SCOPE.with(|current| {
+        let previous = current.get();
+        current.set(scope);
+        previous
+    });
+    RecordProfileScopeGuard {
+        previous: Some(previous),
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ValueTypeProfileSnapshot {
@@ -73,6 +133,24 @@ pub struct RecordHotPathProfileSnapshot {
     pub record_vec_capacity_slots: u64,
     pub decode_time_ns: u64,
     pub decoded_values: ValueTypeProfileSnapshot,
+    pub callsite_breakdown: RecordProfileScopeBreakdownSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordProfileScopeCountersSnapshot {
+    pub parse_record_calls: u64,
+    pub parse_record_into_calls: u64,
+    pub parse_record_column_calls: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordProfileScopeBreakdownSnapshot {
+    pub unattributed: RecordProfileScopeCountersSnapshot,
+    pub core_connection: RecordProfileScopeCountersSnapshot,
+    pub core_compat_persist: RecordProfileScopeCountersSnapshot,
+    pub vdbe_engine: RecordProfileScopeCountersSnapshot,
+    pub vdbe_vectorized_scan: RecordProfileScopeCountersSnapshot,
+    pub btree_cursor: RecordProfileScopeCountersSnapshot,
 }
 
 pub fn set_record_profile_enabled(enabled: bool) {
@@ -98,6 +176,15 @@ pub fn reset_record_profile() {
     FSQLITE_RECORD_VALUE_BLOBS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_RECORD_TEXT_BYTES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_RECORD_BLOB_BYTES.store(0, AtomicOrdering::Relaxed);
+    for counter in &FSQLITE_RECORD_PARSE_CALLS_BY_SCOPE {
+        counter.store(0, AtomicOrdering::Relaxed);
+    }
+    for counter in &FSQLITE_RECORD_PARSE_INTO_CALLS_BY_SCOPE {
+        counter.store(0, AtomicOrdering::Relaxed);
+    }
+    for counter in &FSQLITE_RECORD_PARSE_COLUMN_CALLS_BY_SCOPE {
+        counter.store(0, AtomicOrdering::Relaxed);
+    }
 }
 
 #[must_use]
@@ -118,6 +205,60 @@ pub fn record_profile_snapshot() -> RecordHotPathProfileSnapshot {
             text_bytes: FSQLITE_RECORD_TEXT_BYTES.load(AtomicOrdering::Relaxed),
             blob_bytes: FSQLITE_RECORD_BLOB_BYTES.load(AtomicOrdering::Relaxed),
         },
+        callsite_breakdown: RecordProfileScopeBreakdownSnapshot {
+            unattributed: record_profile_scope_snapshot(RecordProfileScope::Unattributed),
+            core_connection: record_profile_scope_snapshot(RecordProfileScope::CoreConnection),
+            core_compat_persist: record_profile_scope_snapshot(
+                RecordProfileScope::CoreCompatPersist,
+            ),
+            vdbe_engine: record_profile_scope_snapshot(RecordProfileScope::VdbeEngine),
+            vdbe_vectorized_scan: record_profile_scope_snapshot(
+                RecordProfileScope::VdbeVectorizedScan,
+            ),
+            btree_cursor: record_profile_scope_snapshot(RecordProfileScope::BtreeCursor),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecordParseKind {
+    Full,
+    Into,
+    Column,
+}
+
+#[must_use]
+fn current_record_profile_scope() -> RecordProfileScope {
+    CURRENT_RECORD_PROFILE_SCOPE.with(Cell::get)
+}
+
+fn note_record_profile_parse_call(kind: RecordParseKind) {
+    let idx = current_record_profile_scope().as_index();
+    match kind {
+        RecordParseKind::Full => {
+            FSQLITE_RECORD_PARSE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_RECORD_PARSE_CALLS_BY_SCOPE[idx].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        RecordParseKind::Into => {
+            FSQLITE_RECORD_PARSE_INTO_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_RECORD_PARSE_INTO_CALLS_BY_SCOPE[idx].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        RecordParseKind::Column => {
+            FSQLITE_RECORD_PARSE_COLUMN_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_RECORD_PARSE_COLUMN_CALLS_BY_SCOPE[idx].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+#[must_use]
+fn record_profile_scope_snapshot(scope: RecordProfileScope) -> RecordProfileScopeCountersSnapshot {
+    let idx = scope.as_index();
+    RecordProfileScopeCountersSnapshot {
+        parse_record_calls: FSQLITE_RECORD_PARSE_CALLS_BY_SCOPE[idx].load(AtomicOrdering::Relaxed),
+        parse_record_into_calls: FSQLITE_RECORD_PARSE_INTO_CALLS_BY_SCOPE[idx]
+            .load(AtomicOrdering::Relaxed),
+        parse_record_column_calls: FSQLITE_RECORD_PARSE_COLUMN_CALLS_BY_SCOPE[idx]
+            .load(AtomicOrdering::Relaxed),
     }
 }
 
@@ -159,7 +300,7 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     // clamped between 4 and 64, to avoid reallocation for the majority of rows.
     let cap = (data.len() / 8).clamp(4, 64);
     if record_profile_enabled() {
-        FSQLITE_RECORD_PARSE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        note_record_profile_parse_call(RecordParseKind::Full);
         FSQLITE_RECORD_VEC_CAPACITY_SLOTS.fetch_add(
             u64::try_from(cap).unwrap_or(u64::MAX),
             AtomicOrdering::Relaxed,
@@ -179,7 +320,7 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
     let profile_enabled = record_profile_enabled();
     let start = profile_enabled.then(Instant::now);
     if profile_enabled {
-        FSQLITE_RECORD_PARSE_INTO_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        note_record_profile_parse_call(RecordParseKind::Into);
         FSQLITE_RECORD_BYTES_SCANNED.fetch_add(
             u64::try_from(data.len()).unwrap_or(u64::MAX),
             AtomicOrdering::Relaxed,
@@ -251,7 +392,7 @@ pub fn parse_record_column(data: &[u8], col_idx: usize) -> Option<SqliteValue> {
     let profile_enabled = record_profile_enabled();
     let start = profile_enabled.then(Instant::now);
     if profile_enabled {
-        FSQLITE_RECORD_PARSE_COLUMN_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        note_record_profile_parse_call(RecordParseKind::Column);
         FSQLITE_RECORD_BYTES_SCANNED.fetch_add(
             u64::try_from(data.len()).unwrap_or(u64::MAX),
             AtomicOrdering::Relaxed,
@@ -1261,6 +1402,60 @@ mod tests {
             (SqliteValue::Blob(x), SqliteValue::Blob(y)) => x == y,
             _ => false,
         }
+    }
+
+    #[test]
+    fn record_profile_scope_breakdown_tracks_and_restores_nested_scopes() {
+        reset_record_profile();
+        set_record_profile_enabled(true);
+
+        let encoded = serialize_record(&[
+            SqliteValue::Integer(7),
+            SqliteValue::Text(Arc::from("alpha")),
+        ]);
+
+        {
+            let _outer = enter_record_profile_scope(RecordProfileScope::CoreConnection);
+            let _ = parse_record(&encoded).expect("core decode should succeed");
+            {
+                let _inner = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+                let _ = parse_record_column(&encoded, 1).expect("column decode should succeed");
+            }
+            let mut scratch = Vec::new();
+            parse_record_into(&encoded, &mut scratch).expect("reused decode should succeed");
+        }
+
+        let snapshot = record_profile_snapshot();
+        assert_eq!(snapshot.parse_record_calls, 1);
+        assert_eq!(snapshot.parse_record_into_calls, 1);
+        assert_eq!(snapshot.parse_record_column_calls, 1);
+        assert_eq!(
+            snapshot
+                .callsite_breakdown
+                .core_connection
+                .parse_record_calls,
+            1
+        );
+        assert_eq!(
+            snapshot
+                .callsite_breakdown
+                .core_connection
+                .parse_record_into_calls,
+            1
+        );
+        assert_eq!(
+            snapshot
+                .callsite_breakdown
+                .vdbe_engine
+                .parse_record_column_calls,
+            1
+        );
+        assert_eq!(
+            snapshot.callsite_breakdown.unattributed.parse_record_calls,
+            0
+        );
+
+        set_record_profile_enabled(false);
     }
 
     proptest::proptest! {

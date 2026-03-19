@@ -29,7 +29,9 @@ use fsqlite_types::StrictColumnType;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::cx::Cx;
 #[cfg(not(target_arch = "wasm32"))]
-use fsqlite_types::record::{parse_record, serialize_record};
+use fsqlite_types::record::{
+    RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
+};
 use fsqlite_types::value::SqliteValue;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::{PageNumber, PageSize};
@@ -220,6 +222,7 @@ pub fn persist_to_sqlite(
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
+    let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreCompatPersist);
     let vfs = PlatformVfs::new();
     let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
     let mut txn = pager.begin(cx, TransactionMode::ReadOnly)?;

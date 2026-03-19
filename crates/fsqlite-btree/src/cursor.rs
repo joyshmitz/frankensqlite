@@ -28,7 +28,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
-use fsqlite_types::record::parse_record;
+use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record};
 use fsqlite_types::serial_type::{read_varint, write_varint};
 use fsqlite_types::{PageData, PageNumber, WitnessKey};
 use std::borrow::Cow;
@@ -1238,6 +1238,7 @@ impl<P: PageReader> BtCursor<P> {
         entry: &StackEntry,
         target: &[u8],
     ) -> Result<BinarySearchResult> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(BinarySearchResult::NotFound(0));
@@ -1270,6 +1271,7 @@ impl<P: PageReader> BtCursor<P> {
         entry: &StackEntry,
         target: &[u8],
     ) -> Result<BinarySearchResult> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(BinarySearchResult::NotFound(0));
@@ -1302,6 +1304,7 @@ impl<P: PageReader> BtCursor<P> {
         rhs_bytes: &[u8],
         parsed_rhs: Option<&[fsqlite_types::SqliteValue]>,
     ) -> std::cmp::Ordering {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         match (parse_record(lhs_bytes), parsed_rhs) {
             (Some(lhs_vals), Some(rhs_vals)) => self
                 .compare_index_key_values(&lhs_vals, rhs_vals)
@@ -2543,6 +2546,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         n_unique_cols: usize,
         columns_label: &str,
     ) -> Result<()> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         // Parse the new key to extract the indexed column values.
         let new_fields = match parse_record(key) {
             Some(f) => f,
@@ -2760,6 +2764,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn rowid(&self, cx: &Cx) -> Result<i64> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }

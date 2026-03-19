@@ -44,7 +44,9 @@ use fsqlite_mvcc::{
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
-use fsqlite_types::record::{parse_record, serialize_record};
+use fsqlite_types::record::{
+    RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
+};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType, WitnessKey};
 
@@ -5045,6 +5047,7 @@ impl VdbeEngine {
         clippy::cast_possible_wrap
     )]
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
         self.aggregates.clear();
         self.results.clear();
         self.table_index_meta = Arc::clone(program.shared_table_index_meta());
