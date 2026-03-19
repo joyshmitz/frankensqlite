@@ -29,6 +29,9 @@ The implication is that the gap will not be closed by micro-tweaks alone. The wo
 - **Track B: Copy more of SQLite’s hot-path shape.** Narrow the prepare/compile/execute lifecycle, exploit direct seek and covering-index fast paths, and keep fallback logic off the common path.
 - **Track C: Rethink MVCC granularity.** Move common-case concurrent updates away from whole-page version-chain work toward logical row/slot visibility structures while preserving SQLite-compatible durable pages.
 
+The granular execution ledger for this program lives in `TODO.md`. Treat this
+document as the strategic brief and `TODO.md` as the live operator checklist.
+
 ## Immediate Execution Track
 
 ### A. Truth-first benchmark cleanup

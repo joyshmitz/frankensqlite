@@ -1,3 +1,10 @@
+//! General end-to-end benchmark suite.
+//!
+//! Benchmark discipline: when the rusqlite side uses prepared statements or
+//! stable parameterized SQL, the FrankenSQLite side must stay on the same
+//! statement-lifecycle mode. Otherwise the benchmark mostly measures avoidable
+//! parse/compile churn rather than engine behavior.
+
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};

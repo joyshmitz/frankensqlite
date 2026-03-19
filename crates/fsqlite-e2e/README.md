@@ -68,6 +68,12 @@ rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile \
 
 This emits structured hot-path artifacts that break execution down by parser, rewrite/compile, VDBE, record decode, retries/conflicts, and other subsystems. Use it before proposing optimization work.
 
+To sanity-check benchmark code changes without waiting on the full workspace, run:
+
+```bash
+rch exec -- cargo check -p fsqlite-e2e --benches
+```
+
 ## Key Modules
 
 - `golden` - Golden copy management and snapshot comparison

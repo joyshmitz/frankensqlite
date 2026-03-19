@@ -6,6 +6,8 @@
 //! concurrently.  C SQLite uses WAL mode with `busy_timeout` for write
 //! serialisation; FrankenSQLite runs the equivalent operations sequentially
 //! (MVCC concurrent writer path is not yet wired to persistence).
+//! Do not cite the FrankenSQLite control in this file as concurrent-writer
+//! evidence; it is only a fairness-normalized same-total-work control.
 //!
 //! Thread counts: 2, 4, 8.  (16 is omitted because in-memory C SQLite
 //! doesn't benefit from higher thread counts — the `WAL_WRITE_LOCK`

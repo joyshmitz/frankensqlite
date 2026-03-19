@@ -319,6 +319,8 @@ pub struct HotPathConnectionCeremonyProfile {
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
     pub prepared_schema_refreshes: u64,
+    pub prepared_schema_lightweight_refreshes: u64,
+    pub prepared_schema_full_reloads: u64,
     pub pager_publication_refreshes: u64,
     pub memory_autocommit_fast_path_begins: u64,
     pub cached_read_snapshot_reuses: u64,
@@ -1051,6 +1053,8 @@ fn build_hot_path_profile_report(
         op_cx_background_gates: snapshot.op_cx_background_gates,
         statement_dispatch_background_gates: snapshot.statement_dispatch_background_gates,
         prepared_schema_refreshes: snapshot.prepared_schema_refreshes,
+        prepared_schema_lightweight_refreshes: snapshot.prepared_schema_lightweight_refreshes,
+        prepared_schema_full_reloads: snapshot.prepared_schema_full_reloads,
         pager_publication_refreshes: snapshot.pager_publication_refreshes,
         memory_autocommit_fast_path_begins: snapshot.memory_autocommit_fast_path_begins,
         cached_read_snapshot_reuses: snapshot.cached_read_snapshot_reuses,
@@ -1401,8 +1405,12 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(
         out,
-        "- Schema/publication refreshes: prepared_schema={} pager_publication={}",
+        "- Schema/publication refreshes: prepared_schema={} lightweight={} full_reload={} pager_publication={}",
         report.connection_ceremony.prepared_schema_refreshes,
+        report
+            .connection_ceremony
+            .prepared_schema_lightweight_refreshes,
+        report.connection_ceremony.prepared_schema_full_reloads,
         report.connection_ceremony.pager_publication_refreshes
     );
     let _ = writeln!(
@@ -3723,6 +3731,8 @@ mod tests {
             op_cx_background_gates: 1,
             statement_dispatch_background_gates: 1,
             prepared_schema_refreshes: 1,
+            prepared_schema_lightweight_refreshes: 1,
+            prepared_schema_full_reloads: 0,
             pager_publication_refreshes: 1,
             memory_autocommit_fast_path_begins: 1,
             cached_read_snapshot_reuses: 1,

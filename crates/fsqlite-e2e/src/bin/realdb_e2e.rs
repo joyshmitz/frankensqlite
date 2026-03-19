@@ -5357,6 +5357,8 @@ mod tests {
                 op_cx_background_gates: 1,
                 statement_dispatch_background_gates: 0,
                 prepared_schema_refreshes: 0,
+                prepared_schema_lightweight_refreshes: 0,
+                prepared_schema_full_reloads: 0,
                 pager_publication_refreshes: 1,
                 memory_autocommit_fast_path_begins: 1,
                 cached_read_snapshot_reuses: 1,
