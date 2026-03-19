@@ -4547,7 +4547,10 @@ impl VdbeEngine {
             self.conflict_skip_idx = false;
             self.pending_idx_entries.clear();
         }
-        if self.statement_cold_state.contains(StatementColdState::ROWSETS) {
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::ROWSETS)
+        {
             self.rowsets.clear();
         }
         if self
@@ -11679,6 +11682,72 @@ mod tests {
                 .map(|row| row.clone().into_vec())
                 .collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(22)]]
+        );
+    }
+
+    #[test]
+    fn test_execute_clears_cold_subtype_state_between_statements() {
+        let mut subtype_builder = ProgramBuilder::new();
+        let subtype_reg = subtype_builder.alloc_reg();
+        let tagged_value_reg = subtype_builder.alloc_reg();
+        subtype_builder.emit_op(Opcode::Integer, 74, subtype_reg, 0, P4::None, 0);
+        subtype_builder.emit_op(
+            Opcode::SetSubtype,
+            subtype_reg,
+            tagged_value_reg,
+            0,
+            P4::None,
+            0,
+        );
+        subtype_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let subtype_program = subtype_builder
+            .finish()
+            .expect("subtype program should build");
+
+        let mut probe_builder = ProgramBuilder::new();
+        let probe_result_reg = probe_builder.alloc_reg();
+        let probe_value_reg = probe_builder.alloc_reg();
+        probe_builder.emit_op(
+            Opcode::GetSubtype,
+            probe_value_reg,
+            probe_result_reg,
+            0,
+            P4::None,
+            0,
+        );
+        probe_builder.emit_op(Opcode::ResultRow, probe_result_reg, 1, 0, P4::None, 0);
+        probe_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let probe_program = probe_builder.finish().expect("probe program should build");
+
+        let mut engine = VdbeEngine::new(
+            subtype_program
+                .register_count()
+                .max(probe_program.register_count()),
+        );
+        assert_eq!(
+            engine.execute(&subtype_program).expect("subtype execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(engine.register_subtypes.get(&tagged_value_reg), Some(&74));
+        assert!(
+            engine
+                .statement_cold_state
+                .contains(StatementColdState::REGISTER_SUBTYPES)
+        );
+
+        assert_eq!(
+            engine.execute(&probe_program).expect("probe execution"),
+            ExecOutcome::Done
+        );
+        assert!(engine.register_subtypes.is_empty());
+        assert!(engine.statement_cold_state.is_empty());
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(0)]]
         );
     }
 
