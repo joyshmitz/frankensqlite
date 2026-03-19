@@ -834,6 +834,43 @@ impl PagerBackend {
         }
     }
 
+    /// Open a database pager in true read-only mode (fast path).
+    ///
+    /// Skips journal recovery and freelist traversal for instant open on
+    /// large databases.
+    fn open_readonly(path: &str, cx: &Cx) -> Result<Self> {
+        if path == ":memory:" {
+            return Self::open(path, cx);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let vfs = IoUringVfs::new();
+            let db_path = PathBuf::from(path);
+            let pager = SimplePager::open_readonly_with_cx(cx, vfs, &db_path, PageSize::DEFAULT)?;
+            Ok(Self::IoUring(Arc::new(pager)))
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let vfs = UnixVfs::new();
+            let db_path = PathBuf::from(path);
+            let pager = SimplePager::open_readonly_with_cx(cx, vfs, &db_path, PageSize::DEFAULT)?;
+            Ok(Self::Unix(Arc::new(pager)))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let vfs = fsqlite_vfs::WindowsVfs::new();
+            let db_path = PathBuf::from(path);
+            let pager = SimplePager::open_readonly_with_cx(cx, vfs, &db_path, PageSize::DEFAULT)?;
+            Ok(Self::Windows(Arc::new(pager)))
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            Err(FrankenError::NotImplemented(
+                "file-backed pager not available on this platform".to_owned(),
+            ))
+        }
+    }
+
     /// Begin a new transaction.
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Box<dyn TransactionHandle>> {
         match self {
@@ -1384,6 +1421,29 @@ fn record_prepared_update_delete_fallback(reason: PreparedUpdateDeleteFallbackRe
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedUpdateDeleteFastPath {
+    kind: PreparedDmlKind,
+    rollback_on_constraint_violation: bool,
+    preserve_prior_changes_on_constraint_violation: bool,
+    static_fallback_reason: Option<PreparedUpdateDeleteFallbackReason>,
+    foreign_key_work: bool,
+}
+
+impl PreparedUpdateDeleteFastPath {
+    fn supports_direct_dispatch_now(&self, conn: &Connection) -> bool {
+        if let Some(reason) = self.static_fallback_reason {
+            record_prepared_update_delete_fallback(reason);
+            return false;
+        }
+        if self.foreign_key_work && conn.fk_cascade_propagation_enabled() {
+            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::ForeignKey);
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedInsertPostWriteAction {
     None,
@@ -1445,6 +1505,7 @@ struct PreparedStatementTemplate {
     schema_cookie: u32,
     schema_generation: u64,
     dml_dispatch: Option<PreparedDmlDispatch>,
+    prepared_update_delete_fast_path: Option<PreparedUpdateDeleteFastPath>,
     deferred_query_statement: Option<Arc<Statement>>,
     deferred_query_column_count: Option<usize>,
     column_names: Vec<String>,
@@ -1462,6 +1523,7 @@ impl PreparedStatementTemplate {
             schema_cookie: stmt.schema_cookie,
             schema_generation: stmt.schema_generation,
             dml_dispatch: stmt.dml_dispatch.clone(),
+            prepared_update_delete_fast_path: stmt.prepared_update_delete_fast_path.clone(),
             deferred_query_statement: stmt.deferred_query_statement.clone(),
             deferred_query_column_count: stmt.deferred_query_column_count,
             column_names: stmt.column_names.clone(),
@@ -1481,6 +1543,7 @@ impl PreparedStatementTemplate {
             schema_cookie: self.schema_cookie,
             schema_generation: self.schema_generation,
             dml_dispatch: self.dml_dispatch.clone(),
+            prepared_update_delete_fast_path: self.prepared_update_delete_fast_path.clone(),
             deferred_query_statement: self.deferred_query_statement.clone(),
             deferred_query_column_count: self.deferred_query_column_count,
             column_names: self.column_names.clone(),
@@ -1524,6 +1587,9 @@ pub struct PreparedStatement<'conn> {
     /// still need the parsed AST at execution time, while others can run from
     /// the cached bytecode plus a small amount of dispatch metadata.
     dml_dispatch: Option<PreparedDmlDispatch>,
+    /// Prepare-time fast-path metadata for UPDATE/DELETE statements that keep
+    /// the AST as a generic fallback but can skip repeated eligibility scans.
+    prepared_update_delete_fast_path: Option<PreparedUpdateDeleteFastPath>,
     /// For SELECT statements that cannot be safely precompiled because they
     /// depend on connection-level fallback routing or parameter-sensitive
     /// subquery rewriting, store the AST and re-dispatch at execution time.
@@ -1695,6 +1761,10 @@ impl PreparedStatement<'_> {
             Some(PreparedDmlDispatch::Precompiled(dispatch)) => Some(dispatch),
             Some(PreparedDmlDispatch::Deferred(_)) | None => None,
         }
+    }
+
+    fn prepared_update_delete_fast_path(&self) -> Option<&PreparedUpdateDeleteFastPath> {
+        self.prepared_update_delete_fast_path.as_ref()
     }
 
     fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
@@ -3063,7 +3133,7 @@ impl Connection {
                 .root_cx
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
-        let pager = PagerBackend::open(&path, &bootstrap_cx)?;
+        let pager = PagerBackend::open_readonly(&path, &bootstrap_cx)?;
         let pager_page_size = pager.page_size();
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
@@ -5559,34 +5629,18 @@ impl Connection {
             } else {
                 Some(params)
             };
-            if stmt.dispatch_precompiled_program().is_some() {
-                match dml {
-                    Statement::Update(update)
-                        if self.prepared_update_supports_direct_dispatch_now(update) =>
-                    {
-                        return self.execute_precompiled_prepared_update_or_delete(
-                            &op_cx,
-                            stmt,
-                            PreparedDmlKind::Update,
-                            statement_rolls_back_transaction_on_constraint(dml),
-                            statement_preserves_prior_changes_on_constraint(dml),
-                            p,
-                        );
-                    }
-                    Statement::Delete(delete)
-                        if self.prepared_delete_supports_direct_dispatch_now(delete) =>
-                    {
-                        return self.execute_precompiled_prepared_update_or_delete(
-                            &op_cx,
-                            stmt,
-                            PreparedDmlKind::Delete,
-                            statement_rolls_back_transaction_on_constraint(dml),
-                            statement_preserves_prior_changes_on_constraint(dml),
-                            p,
-                        );
-                    }
-                    _ => {}
-                }
+            if stmt.dispatch_precompiled_program().is_some()
+                && let Some(fast_path) = stmt.prepared_update_delete_fast_path()
+                && fast_path.supports_direct_dispatch_now(self)
+            {
+                return self.execute_precompiled_prepared_update_or_delete(
+                    &op_cx,
+                    stmt,
+                    fast_path.kind,
+                    fast_path.rollback_on_constraint_violation,
+                    fast_path.preserve_prior_changes_on_constraint_violation,
+                    p,
+                );
             }
             let rows = self.execute_statement_impl_after_background_status(
                 dml,
@@ -8491,6 +8545,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     dml_dispatch: None,
+                    prepared_update_delete_fast_path: None,
                     deferred_query_statement: Some(Arc::new(statement.clone())),
                     deferred_query_column_count: Some(
                         self.prepared_statement_column_count(statement),
@@ -8514,6 +8569,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     dml_dispatch: None,
+                    prepared_update_delete_fast_path: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
                     column_names: prepared_column_names,
@@ -8547,6 +8603,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
                     dml_dispatch: None,
+                    prepared_update_delete_fast_path: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
                     column_names: prepared_column_names,
@@ -8606,6 +8663,7 @@ impl Connection {
                                 PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))
                             },
                         ),
+                        prepared_update_delete_fast_path: None,
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names.clone(),
@@ -8635,6 +8693,7 @@ impl Connection {
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
+                        prepared_update_delete_fast_path: None,
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names.clone(),
@@ -8646,6 +8705,7 @@ impl Connection {
                 if Self::prepared_update_supports_precompiled_program(update)
                     && !self.prepared_update_requires_deferred_dispatch(update)?
                 {
+                    let fast_path = self.prepared_update_fast_path_metadata(update);
                     let sql_key = Self::sql_hash(sql);
                     let program = self.compile_with_cache(sql_key, sql, |conn| {
                         conn.compile_table_update(update)
@@ -8664,6 +8724,7 @@ impl Connection {
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
+                        prepared_update_delete_fast_path: Some(fast_path),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names,
@@ -8690,6 +8751,7 @@ impl Connection {
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
+                        prepared_update_delete_fast_path: None,
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names,
@@ -8701,6 +8763,7 @@ impl Connection {
                 if Self::prepared_delete_supports_precompiled_program(delete)
                     && !self.prepared_delete_requires_deferred_dispatch(delete)?
                 {
+                    let fast_path = self.prepared_delete_fast_path_metadata(delete);
                     let sql_key = Self::sql_hash(sql);
                     let program = self.compile_with_cache(sql_key, sql, |conn| {
                         conn.compile_table_delete(delete)
@@ -8719,6 +8782,7 @@ impl Connection {
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
+                        prepared_update_delete_fast_path: Some(fast_path),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names,
@@ -8745,6 +8809,7 @@ impl Connection {
                         dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
                             statement.clone(),
                         ))),
+                        prepared_update_delete_fast_path: None,
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names,
@@ -8837,6 +8902,86 @@ impl Connection {
                 .is_some_and(expr_contains_rewritable_subquery)
     }
 
+    fn prepared_update_delete_static_fallback_reason(
+        &self,
+        table_name: &str,
+        returning_present: bool,
+        trigger_event: &fsqlite_ast::TriggerEvent,
+    ) -> Option<PreparedUpdateDeleteFallbackReason> {
+        if returning_present {
+            return Some(PreparedUpdateDeleteFallbackReason::Returning);
+        }
+        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
+            return Some(PreparedUpdateDeleteFallbackReason::SqliteSequence);
+        }
+        if self.table_declares_without_rowid(table_name) {
+            return Some(PreparedUpdateDeleteFallbackReason::WithoutRowid);
+        }
+        if self.has_live_vtab_instance(table_name) {
+            return Some(PreparedUpdateDeleteFallbackReason::LiveVtab);
+        }
+        if self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::Before,
+            trigger_event,
+        ) || self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::After,
+            trigger_event,
+        ) {
+            return Some(PreparedUpdateDeleteFallbackReason::Trigger);
+        }
+        None
+    }
+
+    fn prepared_update_fast_path_metadata(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> PreparedUpdateDeleteFastPath {
+        let table_name = update.table.name.name.as_str();
+        let update_cols: Vec<String> = update
+            .assignments
+            .iter()
+            .flat_map(|assignment| match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => vec![column.clone()],
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.clone(),
+            })
+            .collect();
+        let update_event = fsqlite_ast::TriggerEvent::Update(update_cols);
+        PreparedUpdateDeleteFastPath {
+            kind: PreparedDmlKind::Update,
+            rollback_on_constraint_violation: update.or_conflict
+                == Some(fsqlite_ast::ConflictAction::Rollback),
+            preserve_prior_changes_on_constraint_violation: update.or_conflict
+                == Some(fsqlite_ast::ConflictAction::Fail),
+            static_fallback_reason: self.prepared_update_delete_static_fallback_reason(
+                table_name,
+                !update.returning.is_empty(),
+                &update_event,
+            ),
+            foreign_key_work: self.table_has_foreign_key_work(table_name),
+        }
+    }
+
+    fn prepared_delete_fast_path_metadata(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> PreparedUpdateDeleteFastPath {
+        let table_name = delete.table.name.name.as_str();
+        let delete_event = fsqlite_ast::TriggerEvent::Delete;
+        PreparedUpdateDeleteFastPath {
+            kind: PreparedDmlKind::Delete,
+            rollback_on_constraint_violation: false,
+            preserve_prior_changes_on_constraint_violation: false,
+            static_fallback_reason: self.prepared_update_delete_static_fallback_reason(
+                table_name,
+                !delete.returning.is_empty(),
+                &delete_event,
+            ),
+            foreign_key_work: self.table_is_foreign_key_parent(table_name),
+        }
+    }
+
     fn table_is_foreign_key_parent(&self, table_name: &str) -> bool {
         self.schema.borrow().iter().any(|table| {
             table
@@ -8858,110 +9003,6 @@ impl Connection {
                     .iter()
                     .any(|fk| fk.parent_table.eq_ignore_ascii_case(table_name))
             })
-    }
-
-    fn prepared_update_supports_direct_dispatch_now(
-        &self,
-        update: &fsqlite_ast::UpdateStatement,
-    ) -> bool {
-        let table_name = update.table.name.name.as_str();
-        if !update.returning.is_empty() {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Returning);
-            return false;
-        }
-        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
-            record_prepared_update_delete_fallback(
-                PreparedUpdateDeleteFallbackReason::SqliteSequence,
-            );
-            return false;
-        }
-        if self.table_declares_without_rowid(table_name) {
-            record_prepared_update_delete_fallback(
-                PreparedUpdateDeleteFallbackReason::WithoutRowid,
-            );
-            return false;
-        }
-        if self.has_live_vtab_instance(table_name) {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::LiveVtab);
-            return false;
-        }
-
-        let update_cols: Vec<String> = update
-            .assignments
-            .iter()
-            .flat_map(|assignment| match &assignment.target {
-                fsqlite_ast::AssignmentTarget::Column(column) => vec![column.clone()],
-                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.clone(),
-            })
-            .collect();
-        let update_event = fsqlite_ast::TriggerEvent::Update(update_cols);
-        if self.has_matching_triggers(
-            table_name,
-            fsqlite_ast::TriggerTiming::Before,
-            &update_event,
-        ) || self.has_matching_triggers(
-            table_name,
-            fsqlite_ast::TriggerTiming::After,
-            &update_event,
-        ) {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Trigger);
-            return false;
-        }
-
-        if self.fk_cascade_propagation_enabled() && self.table_has_foreign_key_work(table_name) {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::ForeignKey);
-            return false;
-        }
-
-        true
-    }
-
-    fn prepared_delete_supports_direct_dispatch_now(
-        &self,
-        delete: &fsqlite_ast::DeleteStatement,
-    ) -> bool {
-        let table_name = delete.table.name.name.as_str();
-        if !delete.returning.is_empty() {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Returning);
-            return false;
-        }
-        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
-            record_prepared_update_delete_fallback(
-                PreparedUpdateDeleteFallbackReason::SqliteSequence,
-            );
-            return false;
-        }
-        if self.table_declares_without_rowid(table_name) {
-            record_prepared_update_delete_fallback(
-                PreparedUpdateDeleteFallbackReason::WithoutRowid,
-            );
-            return false;
-        }
-        if self.has_live_vtab_instance(table_name) {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::LiveVtab);
-            return false;
-        }
-
-        let delete_event = fsqlite_ast::TriggerEvent::Delete;
-        if self.has_matching_triggers(
-            table_name,
-            fsqlite_ast::TriggerTiming::Before,
-            &delete_event,
-        ) || self.has_matching_triggers(
-            table_name,
-            fsqlite_ast::TriggerTiming::After,
-            &delete_event,
-        ) {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::Trigger);
-            return false;
-        }
-
-        if self.fk_cascade_propagation_enabled() && self.table_is_foreign_key_parent(table_name) {
-            record_prepared_update_delete_fallback(PreparedUpdateDeleteFallbackReason::ForeignKey);
-            return false;
-        }
-
-        true
     }
 
     fn insert_runtime_requirements(
@@ -67356,6 +67397,10 @@ mod pager_routing_tests {
             Some(PreparedDmlDispatch::Deferred(_))
         ));
         assert!(
+            stmt.prepared_update_delete_fast_path.is_some(),
+            "simple UPDATE should cache fast-path metadata at prepare time"
+        );
+        assert!(
             stmt.db.is_some(),
             "simple UPDATE should compile to a reusable program"
         );
@@ -67390,6 +67435,10 @@ mod pager_routing_tests {
             stmt.dml_dispatch.as_ref(),
             Some(PreparedDmlDispatch::Deferred(_))
         ));
+        assert!(
+            stmt.prepared_update_delete_fast_path.is_some(),
+            "simple DELETE should cache fast-path metadata at prepare time"
+        );
         assert!(
             stmt.db.is_some(),
             "simple DELETE should compile to a reusable program"
@@ -68774,6 +68823,73 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(child_rows.len(), 1);
         assert_eq!(child_rows[0].values()[0], SqliteValue::Integer(11));
+    }
+
+    #[test]
+    fn test_prepared_delete_fast_path_rechecks_foreign_key_pragma_dynamically() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("CREATE TABLE prep_fk_toggle_parent (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE prep_fk_toggle_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES prep_fk_toggle_parent(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO prep_fk_toggle_parent VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+        conn.execute("INSERT INTO prep_fk_toggle_child VALUES (10, 1), (11, 2);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("DELETE FROM prep_fk_toggle_parent WHERE id = ?1")
+            .unwrap();
+        assert!(stmt.prepared_update_delete_fast_path.is_some());
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(affected, 1);
+        let fast_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            fast_profile.prepared_update_delete_fast_lane_hits, 1,
+            "foreign_keys=OFF should allow the cached DELETE fast path: {fast_profile:?}"
+        );
+        assert_eq!(
+            fast_profile.prepared_update_delete_fallback_foreign_key, 0,
+            "foreign_keys=OFF should not force the FK fallback: {fast_profile:?}"
+        );
+
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(affected, 1);
+        let fallback_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            fallback_profile.prepared_update_delete_fast_lane_hits, 0,
+            "foreign_keys=ON should disable the cached DELETE fast path: {fallback_profile:?}"
+        );
+        assert_eq!(
+            fallback_profile.prepared_update_delete_fallback_foreign_key, 1,
+            "foreign_keys=ON should still trigger FK fallback even with cached metadata: {fallback_profile:?}"
+        );
+
+        let child_rows = conn
+            .query("SELECT id, parent_id FROM prep_fk_toggle_child ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            child_rows.len(),
+            1,
+            "the foreign_keys=ON execution should still route through generic cascade handling"
+        );
+        assert_eq!(child_rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(child_rows[0].values()[1], SqliteValue::Integer(1));
     }
 
     #[test]

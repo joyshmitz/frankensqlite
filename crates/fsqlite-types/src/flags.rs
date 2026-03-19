@@ -225,6 +225,8 @@ bitflags! {
         const CREATE           = 0x0000_0004;
         /// Open for reading and writing.
         const READWRITE        = 0x0000_0002;
+        /// Open for reading only.
+        const READONLY         = 0x0000_0001;
         /// Delete on close.
         const DELETEONCLOSE    = 0x0000_0008;
     }

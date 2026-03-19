@@ -1783,6 +1783,115 @@ where
         })
     }
 
+    /// Open a database in true read-only mode for fast analytical queries.
+    ///
+    /// Unlike [`open_with_cx`], this:
+    /// - Opens the file with `READONLY` VFS flags (no write lock acquisition)
+    /// - Skips journal recovery (read-only connections cannot replay journals)
+    /// - Skips freelist traversal (not needed for read-only queries)
+    /// - Does NOT create the file if it doesn't exist
+    ///
+    /// This makes opening a 22GB database nearly instant instead of taking
+    /// minutes, because it avoids the expensive freelist scan and journal
+    /// recovery that the read-write path performs.
+    #[allow(clippy::too_many_lines)]
+    pub fn open_readonly_with_cx(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+    ) -> Result<Self> {
+        let vfs = Arc::new(vfs);
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
+
+        let file_size = db_file.file_size(cx)?;
+        if file_size == 0 {
+            return Err(FrankenError::CannotOpen {
+                path: path.to_owned(),
+            });
+        }
+        if file_size < DATABASE_HEADER_SIZE as u64 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
+                ),
+            });
+        }
+
+        let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
+        let header_read = db_file.read(cx, &mut header_bytes, 0)?;
+        if header_read < DATABASE_HEADER_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read fetching database header: got {header_read} of {DATABASE_HEADER_SIZE}"
+                ),
+            });
+        }
+        let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("invalid database header: {error}"),
+            }
+        })?;
+        let page_size = header.page_size;
+
+        let page_size_u64 = page_size.as_usize() as u64;
+        if file_size % page_size_u64 != 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "database file size {file_size} is not aligned to page size {}",
+                    page_size.get()
+                ),
+            });
+        }
+        let db_pages = file_size
+            .checked_div(page_size_u64)
+            .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
+        let db_size = u32::try_from(db_pages).map_err(|_| FrankenError::OutOfRange {
+            what: "database page count".to_owned(),
+            value: db_pages.to_string(),
+        })?;
+        let next_page = if db_size >= 2 {
+            db_size.saturating_add(1)
+        } else {
+            2
+        };
+
+        // Skip freelist traversal for read-only — use empty freelist.
+        let freelist = Vec::new();
+
+        let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
+        let cache = PageCache::new(page_size);
+        let pool = cache.pool().clone();
+        Ok(Self {
+            vfs,
+            db_path: path.to_owned(),
+            inner: Arc::new(Mutex::new(PagerInner {
+                db_file,
+                page_size,
+                db_size,
+                next_page,
+                writer_active: false,
+                active_transactions: 0,
+                checkpoint_active: false,
+                freelist,
+                journal_mode: JournalMode::Delete,
+                wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
+                rollback_journal_recovery_pending: false,
+                wal_backend: None,
+                commit_seq: initial_commit_seq,
+            })),
+            cache: Arc::new(Mutex::new(cache)),
+            pool,
+            published: Arc::new(PublishedPagerState::new(
+                db_size,
+                initial_commit_seq,
+                JournalMode::Delete,
+                0, // freelist_count = 0 for read-only
+            )),
+        })
+    }
+
     /// Open (or create) a database and return a pager using a detached test context.
     #[cfg(test)]
     #[allow(clippy::too_many_lines)]

@@ -867,17 +867,15 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
     fn finalize_prepared_frames(
         &mut self,
-        cx: &Cx,
+        _cx: &Cx,
         prepared: &mut PreparedWalFrameBatch,
     ) -> Result<()> {
         if prepared.frame_count() == 0 {
             return Ok(());
         }
-
-        if self.refresh_before_append {
-            self.synchronize_publication_before_append(cx, "finalize_prepared_pre_lock")?;
-        }
-
+        // Optimistically finalize against the adapter's current WAL state.
+        // The append path still validates against both local and on-disk state
+        // and will refresh/reseed if another writer advanced the append window.
         self.finalize_prepared_batch_against_current_state(prepared)
     }
 

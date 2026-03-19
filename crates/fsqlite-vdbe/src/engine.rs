@@ -60,6 +60,43 @@ const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// this engine, so the UPDATE marker must live above them.
 const OPFLAG_ISUPDATE: u16 = 0x10;
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct StatementColdState(u16);
+
+impl StatementColdState {
+    const AGGREGATES: Self = Self(1 << 0);
+    const CONFLICT_TRACKING: Self = Self(1 << 1);
+    const ROWSETS: Self = Self(1 << 2);
+    const SEQUENCE_COUNTERS: Self = Self(1 << 3);
+    const VTAB_CURSORS: Self = Self(1 << 4);
+    const WINDOW_CONTEXTS: Self = Self(1 << 5);
+    const REGISTER_SUBTYPES: Self = Self(1 << 6);
+    const BLOOM_FILTERS: Self = Self(1 << 7);
+
+    #[must_use]
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    #[must_use]
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
 #[inline]
 fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -4108,6 +4145,9 @@ pub struct VdbeEngine {
     /// at the top of `execute()`, while plain repeated `execute()` calls on the
     /// same engine still preserve their existing reset semantics.
     statement_state_clean: bool,
+    /// Tracks which cold subsystems were actually touched by the last statement
+    /// so common-case reuse can skip blanket clears of unused collections.
+    statement_cold_state: StatementColdState,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -4479,7 +4519,68 @@ impl VdbeEngine {
             make_record_buf: Vec::new(),
             collect_result_rows: true,
             statement_state_clean: true,
+            statement_cold_state: StatementColdState::empty(),
         }
+    }
+
+    #[inline]
+    fn mark_statement_cold_state(&mut self, state: StatementColdState) {
+        self.statement_cold_state.insert(state);
+    }
+
+    fn clear_statement_cold_state(&mut self) {
+        if self.statement_cold_state.is_empty() {
+            return;
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::AGGREGATES)
+        {
+            self.aggregates.clear();
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::CONFLICT_TRACKING)
+        {
+            self.pending_update_restore = None;
+            self.pending_insert_rollback = None;
+            self.conflict_skip_idx = false;
+            self.pending_idx_entries.clear();
+        }
+        if self.statement_cold_state.contains(StatementColdState::ROWSETS) {
+            self.rowsets.clear();
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::SEQUENCE_COUNTERS)
+        {
+            self.sequence_counters.clear();
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::VTAB_CURSORS)
+        {
+            self.vtab_cursors.clear();
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::WINDOW_CONTEXTS)
+        {
+            self.window_contexts.clear();
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::REGISTER_SUBTYPES)
+        {
+            self.register_subtypes.clear();
+        }
+        if self
+            .statement_cold_state
+            .contains(StatementColdState::BLOOM_FILTERS)
+        {
+            self.bloom_filters.clear();
+        }
+        self.statement_cold_state.clear();
     }
 
     /// Reset the engine for reuse, clearing per-statement state but keeping
@@ -4511,24 +4612,17 @@ impl VdbeEngine {
         self.db = None;
         self.func_registry = None;
         // Keep the existing collation_registry Arc — don't allocate a new one.
-        self.aggregates.clear();
+        self.clear_statement_cold_state();
         self.schema_cookie = 0;
         self.last_compare_result = None;
         self.changes = 0;
         self.last_insert_rowid = 0;
         self.last_insert_rowid_valid = false;
         self.last_insert_cursor_id = None;
-        self.pending_update_restore = None;
-        self.pending_insert_rollback = None;
-        self.conflict_skip_idx = false;
-        self.pending_idx_entries.clear();
-        self.rowsets.clear();
         self.fk_counter = 0;
         self.autoincrement_seq_by_root_page.clear();
         // Keep shared Arc refs — they'll be overwritten by set_*() calls.
-        self.sequence_counters.clear();
         self.cursor_root_pages.clear();
-        self.vtab_cursors.clear();
         self.vtab_instances.clear();
         self.time_travel_cursors.clear();
         self.version_store = None;
@@ -4536,9 +4630,6 @@ impl VdbeEngine {
         self.time_travel_gc_horizon = None;
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
-        self.window_contexts.clear();
-        self.register_subtypes.clear();
-        self.bloom_filters.clear();
         self.make_record_buf.clear();
         self.collect_result_rows = true;
         self.statement_state_clean = true;
@@ -4802,6 +4893,7 @@ impl VdbeEngine {
 
     /// Register a type-erased virtual table cursor for opcode execution.
     pub fn register_vtab_cursor(&mut self, cursor_id: i32, cursor: Box<dyn ErasedVtabCursor>) {
+        self.mark_statement_cold_state(StatementColdState::VTAB_CURSORS);
         self.vtab_cursors
             .insert(cursor_id, VtabCursorState { cursor });
     }
@@ -5040,25 +5132,15 @@ impl VdbeEngine {
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
         if !self.statement_state_clean {
-            self.aggregates.clear();
+            self.clear_statement_cold_state();
             self.results.clear();
             self.last_compare_result = None;
             self.changes = 0;
             self.last_insert_rowid = 0;
             self.last_insert_rowid_valid = false;
             self.last_insert_cursor_id = None;
-            self.pending_update_restore = None;
-            self.pending_insert_rollback = None;
-            self.conflict_skip_idx = false;
-            self.pending_idx_entries.clear();
-            self.rowsets.clear();
             self.fk_counter = 0;
-            self.sequence_counters.clear();
             self.cursor_root_pages.clear();
-            self.vtab_cursors.clear();
-            self.window_contexts.clear();
-            self.register_subtypes.clear();
-            self.bloom_filters.clear();
         }
         self.statement_state_clean = false;
         self.table_index_meta = Arc::clone(program.shared_table_index_meta());
