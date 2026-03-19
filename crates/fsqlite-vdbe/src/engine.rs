@@ -7319,6 +7319,7 @@ impl VdbeEngine {
                             self.last_insert_rowid = rowid;
                             self.last_insert_rowid_valid = true;
                         }
+                        self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
                         self.pending_insert_rollback = Some(PendingInsertRollback {
                             cursor_id,
                             rowid,
@@ -7332,6 +7333,7 @@ impl VdbeEngine {
                         // conflict handled internally), tell subsequent
                         // IdxInsert opcodes to skip this row's index entries.
                         if oe_flag == 4 {
+                            self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
                             self.conflict_skip_idx = true;
                         }
                     }
@@ -7403,6 +7405,9 @@ impl VdbeEngine {
                         }
                     }
                     if deleted {
+                        if is_update && update_restore.is_some() {
+                            self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
+                        }
                         self.pending_update_restore = if is_update { update_restore } else { None };
                         // P5 bit 0 = OPFLAG_NCHANGE: only count standalone
                         // DELETE changes. UPDATE's internal Delete uses P5=0
@@ -7460,6 +7465,9 @@ impl VdbeEngine {
                                             self.collect_vdbe_metrics,
                                             DecodeCacheInvalidationReason::WriteMutation,
                                         );
+                                        self.mark_statement_cold_state(
+                                            StatementColdState::CONFLICT_TRACKING,
+                                        );
                                         self.pending_idx_entries
                                             .push((cursor_id, key_bytes.to_vec()));
                                     }
@@ -7471,6 +7479,9 @@ impl VdbeEngine {
                                             4 => {
                                                 self.rollback_pending_insert_after_index_conflict(
                                                 )?;
+                                                self.mark_statement_cold_state(
+                                                    StatementColdState::CONFLICT_TRACKING,
+                                                );
                                                 self.conflict_skip_idx = true;
                                                 pc += 1;
                                                 continue;
@@ -7533,6 +7544,9 @@ impl VdbeEngine {
                                     sc,
                                     self.collect_vdbe_metrics,
                                     DecodeCacheInvalidationReason::WriteMutation,
+                                );
+                                self.mark_statement_cold_state(
+                                    StatementColdState::CONFLICT_TRACKING,
                                 );
                                 self.pending_idx_entries
                                     .push((cursor_id, key_bytes.to_vec()));
@@ -7789,6 +7803,7 @@ impl VdbeEngine {
                 }
 
                 Opcode::Sequence => {
+                    self.mark_statement_cold_state(StatementColdState::SEQUENCE_COUNTERS);
                     let counter = self.sequence_counters.entry(op.p1).or_insert(0);
                     let val = *counter;
                     *counter += 1;
@@ -8409,6 +8424,7 @@ impl VdbeEngine {
 
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
+                    self.mark_statement_cold_state(StatementColdState::AGGREGATES);
                     let ctx = self.aggregates.entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         AggregateContext {
@@ -8529,6 +8545,7 @@ impl VdbeEngine {
                     let args = &self.registers[clamped_start..end_idx.min(limit)];
 
                     let accum_reg = op.p3;
+                    self.mark_statement_cold_state(StatementColdState::WINDOW_CONTEXTS);
                     let ctx = self.window_contexts.entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         WindowContext {
@@ -8704,6 +8721,7 @@ impl VdbeEngine {
                     // Add integer P2 to rowset in register P1.
                     let rowset_reg = op.p1;
                     let val = self.get_reg(op.p2).to_integer();
+                    self.mark_statement_cold_state(StatementColdState::ROWSETS);
                     self.rowsets
                         .entry_or_insert_with(rowset_reg, RowSet::new)
                         .add(val);
@@ -8741,6 +8759,7 @@ impl VdbeEngine {
                     if found {
                         pc = op.p2 as usize;
                     } else {
+                        self.mark_statement_cold_state(StatementColdState::ROWSETS);
                         self.rowsets
                             .entry_or_insert_with(rowset_reg, RowSet::new)
                             .add(val);
@@ -8891,6 +8910,7 @@ impl VdbeEngine {
                     if st == 0 {
                         self.register_subtypes.remove(&op.p2);
                     } else {
+                        self.mark_statement_cold_state(StatementColdState::REGISTER_SUBTYPES);
                         self.register_subtypes.insert(op.p2, st);
                     }
                     pc += 1;
@@ -8904,6 +8924,7 @@ impl VdbeEngine {
                     // Add hash of register P3 to the Bloom filter
                     // identified by P1.
                     let hash = bloom_hash(self.get_reg(op.p3));
+                    self.mark_statement_cold_state(StatementColdState::BLOOM_FILTERS);
                     let filter = self
                         .bloom_filters
                         .entry(op.p1)
@@ -8947,8 +8968,7 @@ impl VdbeEngine {
                         if let Some(vtab) = self.vtab_instances.get(&cursor_id) {
                             match vtab.open_cursor() {
                                 Ok(cursor) => {
-                                    self.vtab_cursors
-                                        .insert(cursor_id, VtabCursorState { cursor });
+                                    self.register_vtab_cursor(cursor_id, cursor);
                                 }
                                 Err(e) => {
                                     break vtab_exec_outcome("VOpen", e)?;

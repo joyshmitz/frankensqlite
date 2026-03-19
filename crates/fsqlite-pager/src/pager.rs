@@ -1799,7 +1799,7 @@ where
         cx: &Cx,
         vfs: V,
         path: &Path,
-        requested_page_size: PageSize,
+        _requested_page_size: PageSize,
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
