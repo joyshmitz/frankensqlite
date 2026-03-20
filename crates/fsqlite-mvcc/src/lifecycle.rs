@@ -715,7 +715,6 @@ impl TransactionManager {
             return Vec::new();
         }
 
-        let fallback_version = txn.snapshot.high;
         let mut visible_pages = Vec::new();
         for raw_page in start_page.get()..=end_page.get() {
             if let Some(page) = PageNumber::new(raw_page) {
@@ -724,7 +723,7 @@ impl TransactionManager {
                     // Empty pages still need page-level predicate coverage so
                     // SSI can reason about the scan footprint without a second
                     // resolve/tracking pass.
-                    txn.record_page_read(page, fallback_version);
+                    txn.record_page_read(page, txn.snapshot.high);
                 }
                 visible_pages.push((page, page_data));
             }
@@ -2146,6 +2145,38 @@ mod tests {
         assert!(scanned.is_empty());
         assert!(reader.read_set_versions.is_empty());
         assert!(reader.read_keys.is_empty());
+    }
+
+    #[test]
+    fn test_read_page_range_deferred_uses_established_snapshot_for_empty_pages() {
+        let m = mgr();
+        let p40 = PageNumber::new(40).unwrap();
+        let p41 = PageNumber::new(41).unwrap();
+
+        let mut reader = m.begin(BeginKind::Deferred).unwrap();
+        let begin_snapshot = reader.snapshot.high;
+        assert!(
+            !reader.snapshot_established,
+            "deferred txn should not establish snapshot at BEGIN"
+        );
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, p40, test_data(0x5A)).unwrap();
+        let committed = m.commit(&mut seed).unwrap();
+        assert!(
+            committed > begin_snapshot,
+            "intervening commit must advance snapshot high for this regression"
+        );
+
+        let scanned = m.read_page_range(&mut reader, p40, p41);
+        assert_eq!(scanned.len(), 2);
+        assert!(reader.snapshot_established);
+        assert_eq!(reader.read_version_for_page(p40), Some(committed));
+        assert_eq!(
+            reader.read_version_for_page(p41),
+            Some(committed),
+            "empty pages in deferred range scans must use the established snapshot high"
+        );
     }
 
     fn read_page_range_without_tracking(
