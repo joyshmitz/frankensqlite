@@ -599,14 +599,18 @@ fn write_canonical_bundle(
     Ok(())
 }
 
+struct CanonicalRewriteContext<'a> {
+    command_args: &'a [String],
+    repo_root: &'a Path,
+    campaign: &'a fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
+    source_revision: &'a str,
+    beads_data_hash: &'a str,
+    run_id: &'a str,
+}
+
 fn rewrite_jsonl_with_canonical_records(
     jsonl_path: &Path,
-    command_args: &[String],
-    repo_root: &Path,
-    campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
-    source_revision: &str,
-    beads_data_hash: &str,
-    run_id: &str,
+    context: &CanonicalRewriteContext<'_>,
     generated_bundles: &mut Vec<serde_json::Value>,
 ) -> Result<String, Box<dyn Error>> {
     let raw = fs::read_to_string(jsonl_path)?;
@@ -614,24 +618,24 @@ fn rewrite_jsonl_with_canonical_records(
         return Ok(String::new());
     }
     let tool_versions = benchmark_tool_versions();
-    let command_line = format_command_line(command_args);
+    let command_line = format_command_line(context.command_args);
     let mut enriched_lines = Vec::new();
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let summary: BenchmarkSummary = serde_json::from_str(line)?;
         let mode = benchmark_mode_from_engine(&summary.engine)?;
         let mode_id = benchmark_mode_id(mode).to_owned();
-        let cell = resolve_canonical_cell(campaign, &summary, mode)?;
+        let cell = resolve_canonical_cell(context.campaign, &summary, mode)?;
         let manifest = build_benchmark_artifact_manifest(
-            repo_root,
-            campaign,
+            context.repo_root,
+            context.campaign,
             &cell,
             BenchmarkArtifactProvenanceCapture {
-                run_id: run_id.to_owned(),
+                run_id: context.run_id.to_owned(),
                 retention_class: BenchmarkArtifactRetentionClass::FullProof,
                 command_entrypoint: "realdb-e2e bench".to_owned(),
-                source_revision: source_revision.to_owned(),
-                beads_data_hash: beads_data_hash.to_owned(),
+                source_revision: context.source_revision.to_owned(),
+                beads_data_hash: context.beads_data_hash.to_owned(),
                 kernel_release: summary.environment.os.clone(),
                 commands: vec![BenchmarkArtifactCommand {
                     tool: "realdb-e2e".to_owned(),
@@ -641,7 +645,7 @@ fn rewrite_jsonl_with_canonical_records(
                 fallback_notes: Vec::new(),
             },
         )?;
-        let hardware_signature = hardware_signature(campaign, &manifest.hardware_class_id)?;
+        let hardware_signature = hardware_signature(context.campaign, &manifest.hardware_class_id)?;
         let artifact_manifest_path = format!(
             "{}/{}",
             manifest.artifact_bundle_relpath, manifest.artifact_names.manifest_json
@@ -656,8 +660,8 @@ fn rewrite_jsonl_with_canonical_records(
             placement_profile_id: manifest.placement_profile_id.clone(),
             hardware_class_id: manifest.hardware_class_id.clone(),
             hardware_signature,
-            source_revision: source_revision.to_owned(),
-            beads_data_hash: beads_data_hash.to_owned(),
+            source_revision: context.source_revision.to_owned(),
+            beads_data_hash: context.beads_data_hash.to_owned(),
             run_id: manifest.run_id.clone(),
             artifact_bundle_key: manifest.artifact_bundle_key.clone(),
             artifact_bundle_name: manifest.artifact_bundle_name.clone(),
@@ -667,7 +671,7 @@ fn rewrite_jsonl_with_canonical_records(
             campaign_manifest_path: manifest.campaign_manifest_path.clone(),
             canonical_artifact_manifest: manifest,
         };
-        write_canonical_bundle(repo_root, &record)?;
+        write_canonical_bundle(context.repo_root, &record)?;
         generated_bundles.push(serde_json::json!({
             "benchmark_id": record.summary.benchmark_id,
             "row_id": record.row_id,
@@ -806,14 +810,17 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         let args = both_command_args
             .as_ref()
             .ok_or("missing canonical both-mode command arguments")?;
+        let rewrite_context = CanonicalRewriteContext {
+            command_args: args,
+            repo_root: &repo_root,
+            campaign: &campaign,
+            source_revision: &source_revision,
+            beads_data_hash: &beads_data_hash,
+            run_id: &run_id,
+        };
         combined.push_str(&rewrite_jsonl_with_canonical_records(
             &both_jsonl,
-            args,
-            &repo_root,
-            &campaign,
-            &source_revision,
-            &beads_data_hash,
-            &run_id,
+            &rewrite_context,
             &mut generated_bundles,
         )?);
     }
@@ -821,14 +828,17 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         let args = single_command_args
             .as_ref()
             .ok_or("missing canonical single-writer command arguments")?;
+        let rewrite_context = CanonicalRewriteContext {
+            command_args: args,
+            repo_root: &repo_root,
+            campaign: &campaign,
+            source_revision: &source_revision,
+            beads_data_hash: &beads_data_hash,
+            run_id: &run_id,
+        };
         combined.push_str(&rewrite_jsonl_with_canonical_records(
             &single_jsonl,
-            args,
-            &repo_root,
-            &campaign,
-            &source_revision,
-            &beads_data_hash,
-            &run_id,
+            &rewrite_context,
             &mut generated_bundles,
         )?);
     }
