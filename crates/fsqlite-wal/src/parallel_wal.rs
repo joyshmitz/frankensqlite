@@ -266,6 +266,157 @@ pub fn delete_segment(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
+// ---------------------------------------------------------------------------
+// Segment Recovery (D1.7)
+// ---------------------------------------------------------------------------
+
+/// Result of recovering segments for a database.
+#[derive(Debug, Clone)]
+pub struct SegmentRecoveryResult {
+    /// Number of segments recovered.
+    pub segments_recovered: usize,
+    /// Number of records applied.
+    pub records_applied: usize,
+    /// Total bytes read from segment files.
+    pub bytes_read: u64,
+    /// Epochs recovered, in order.
+    pub epochs: Vec<u64>,
+    /// Any partial segments that were skipped (truncated/corrupt).
+    pub partial_segments: Vec<PathBuf>,
+}
+
+/// Options for segment recovery.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentRecoveryOptions {
+    /// Delete segment files after successful recovery.
+    pub delete_after_recovery: bool,
+    /// Skip corrupt segments instead of failing.
+    pub skip_corrupt: bool,
+}
+
+/// Recover all segments for a database.
+///
+/// This function:
+/// 1. Finds all segment files for the database.
+/// 2. Sorts them by epoch (ascending).
+/// 3. Reads and returns records from each segment.
+/// 4. Optionally deletes segments after recovery.
+///
+/// The caller is responsible for applying records to the database
+/// (updating page contents based on after_images).
+pub fn recover_segments(
+    db_path: &Path,
+    options: SegmentRecoveryOptions,
+) -> io::Result<(SegmentRecoveryResult, Vec<WalRecord>)> {
+    let segments = list_segments(db_path)?;
+
+    let mut result = SegmentRecoveryResult {
+        segments_recovered: 0,
+        records_applied: 0,
+        bytes_read: 0,
+        epochs: Vec::with_capacity(segments.len()),
+        partial_segments: Vec::new(),
+    };
+
+    let mut all_records = Vec::new();
+
+    for (epoch, path) in &segments {
+        // Get file size for byte tracking
+        let metadata = fs::metadata(path)?;
+        let file_size = metadata.len();
+
+        // Try to read the segment
+        match read_segment(path) {
+            Ok((header, records)) => {
+                result.segments_recovered += 1;
+                result.records_applied += records.len();
+                result.bytes_read += file_size;
+                result.epochs.push(*epoch);
+
+                // Verify header epoch matches file name epoch
+                if header.epoch != *epoch {
+                    eprintln!(
+                        "warning: segment {path:?} has mismatched epoch: header={}, filename={}",
+                        header.epoch, epoch
+                    );
+                }
+
+                all_records.extend(records);
+            }
+            Err(e) => {
+                if options.skip_corrupt {
+                    eprintln!("warning: skipping corrupt segment {path:?}: {e}");
+                    result.partial_segments.push(path.clone());
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Delete segments after successful recovery if requested
+    if options.delete_after_recovery {
+        for (_, path) in &segments {
+            // Skip segments that were partial/corrupt
+            if result.partial_segments.contains(path) {
+                continue;
+            }
+            if let Err(e) = delete_segment(path) {
+                eprintln!("warning: failed to delete segment {path:?}: {e}");
+            }
+        }
+    }
+
+    Ok((result, all_records))
+}
+
+/// Recover segments and apply records to a page cache.
+///
+/// This is a higher-level recovery function that takes a mutable page
+/// map and applies after_images from recovered records. It returns
+/// the recovery result and the final page contents.
+///
+/// The page_contents map is keyed by page number and contains the
+/// current contents of each page. Records are applied in epoch order.
+pub fn recover_and_apply_segments(
+    db_path: &Path,
+    page_contents: &mut HashMap<u32, Vec<u8>>,
+    options: SegmentRecoveryOptions,
+) -> io::Result<SegmentRecoveryResult> {
+    let (result, records) = recover_segments(db_path, options)?;
+
+    // Apply records in order (they're already sorted by epoch)
+    for record in records {
+        let page_id = record.page_id.get();
+        if !record.after_image.is_empty() {
+            page_contents.insert(page_id, record.after_image);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Get the maximum durable epoch from existing segment files.
+///
+/// This can be used to determine the recovery point after a crash.
+/// Returns None if no segment files exist.
+pub fn max_durable_epoch(db_path: &Path) -> io::Result<Option<u64>> {
+    let segments = list_segments(db_path)?;
+    Ok(segments.last().map(|(epoch, _)| *epoch))
+}
+
+/// Clean up all segment files for a database.
+///
+/// This should be called after checkpoint when segments are no longer needed.
+pub fn cleanup_segments(db_path: &Path) -> io::Result<usize> {
+    let segments = list_segments(db_path)?;
+    let count = segments.len();
+    for (_, path) in segments {
+        delete_segment(&path)?;
+    }
+    Ok(count)
+}
+
 /// Serialize a WalRecord to bytes.
 fn serialize_record(record: &WalRecord) -> Vec<u8> {
     // Simple binary format:
@@ -988,5 +1139,175 @@ mod tests {
         for (_, path) in segments {
             delete_segment(&path).expect("delete should succeed");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Segment Recovery Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_recover_segments_basic() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        // Create segments for epochs 1, 2, 3
+        for epoch in 1..=3u64 {
+            let records = vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(epoch).unwrap(),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch,
+                page_id: PageNumber::new(epoch as u32).unwrap(),
+                begin_seq: CommitSeq::new(epoch * 100),
+                end_seq: Some(CommitSeq::new(epoch * 100)),
+                before_image: Vec::new(),
+                after_image: vec![epoch as u8; 32],
+            }];
+            let batch = EpochFlushBatch {
+                epoch,
+                records,
+                records_per_core: vec![1],
+            };
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        }
+
+        // Recover segments
+        let options = SegmentRecoveryOptions::default();
+        let (result, records) =
+            recover_segments(&db_path, options).expect("recovery should succeed");
+
+        assert_eq!(result.segments_recovered, 3);
+        assert_eq!(result.records_applied, 3);
+        assert_eq!(result.epochs, vec![1, 2, 3]);
+        assert!(result.partial_segments.is_empty());
+
+        // Verify records are in epoch order
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].epoch, 1);
+        assert_eq!(records[1].epoch, 2);
+        assert_eq!(records[2].epoch, 3);
+
+        // Cleanup
+        cleanup_segments(&db_path).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn test_recover_and_apply_segments() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        // Create segments that update the same page multiple times
+        let page_id = 1u32;
+        for epoch in 1..=3u64 {
+            let records = vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(epoch).unwrap(),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch,
+                page_id: PageNumber::new(page_id).unwrap(),
+                begin_seq: CommitSeq::new(epoch * 100),
+                end_seq: Some(CommitSeq::new(epoch * 100)),
+                before_image: Vec::new(),
+                after_image: vec![epoch as u8; 32], // Different content each epoch
+            }];
+            let batch = EpochFlushBatch {
+                epoch,
+                records,
+                records_per_core: vec![1],
+            };
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        }
+
+        // Recover and apply to page cache
+        let mut page_contents = HashMap::new();
+        let options = SegmentRecoveryOptions {
+            delete_after_recovery: true,
+            ..Default::default()
+        };
+        let result = recover_and_apply_segments(&db_path, &mut page_contents, options)
+            .expect("should succeed");
+
+        assert_eq!(result.segments_recovered, 3);
+
+        // Page should have the final epoch's contents (epoch 3)
+        let page = page_contents.get(&page_id).expect("page should exist");
+        assert_eq!(page.len(), 32);
+        assert!(page.iter().all(|&b| b == 3), "should have epoch 3 content");
+
+        // Segments should be deleted
+        let remaining = list_segments(&db_path).expect("list should succeed");
+        assert!(
+            remaining.is_empty(),
+            "segments should be deleted after recovery"
+        );
+    }
+
+    #[test]
+    fn test_max_durable_epoch() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        // Initially no segments
+        let max = max_durable_epoch(&db_path).expect("should succeed");
+        assert_eq!(max, None);
+
+        // Create segments
+        for epoch in [5u64, 10, 3] {
+            let batch = EpochFlushBatch {
+                epoch,
+                records: Vec::new(),
+                records_per_core: Vec::new(),
+            };
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        }
+
+        // Max should be 10
+        let max = max_durable_epoch(&db_path).expect("should succeed");
+        assert_eq!(max, Some(10));
+
+        // Cleanup
+        cleanup_segments(&db_path).expect("cleanup should succeed");
+
+        // Now max should be None again
+        let max = max_durable_epoch(&db_path).expect("should succeed");
+        assert_eq!(max, None);
+    }
+
+    #[test]
+    fn test_cleanup_segments() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        // Create segments
+        for epoch in 1..=5u64 {
+            let batch = EpochFlushBatch {
+                epoch,
+                records: Vec::new(),
+                records_per_core: Vec::new(),
+            };
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        }
+
+        // Verify segments exist
+        let segments = list_segments(&db_path).expect("list should succeed");
+        assert_eq!(segments.len(), 5);
+
+        // Cleanup
+        let count = cleanup_segments(&db_path).expect("cleanup should succeed");
+        assert_eq!(count, 5);
+
+        // Verify segments are gone
+        let segments = list_segments(&db_path).expect("list should succeed");
+        assert!(segments.is_empty());
     }
 }
