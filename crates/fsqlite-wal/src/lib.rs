@@ -62,8 +62,9 @@ pub use metrics::{
     WalRecoveryCounters, WalRecoveryCountersSnapshot,
 };
 pub use parallel_wal::{
-    ParallelWalBatch, ParallelWalConfig, ParallelWalCoordinator, ParallelWalFrame,
-    parallel_wal_coordinator_for_path, remove_parallel_wal_coordinator,
+    FsyncPolicy, ParallelWalBatch, ParallelWalConfig, ParallelWalCoordinator, ParallelWalFrame,
+    SegmentHeader, delete_segment, list_segments, parallel_wal_coordinator_for_path, read_segment,
+    remove_parallel_wal_coordinator, segment_path, write_segment,
 };
 pub use per_core_buffer::{
     AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,

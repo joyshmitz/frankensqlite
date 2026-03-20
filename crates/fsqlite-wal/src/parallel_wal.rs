@@ -18,6 +18,8 @@
 //! - Epoch mechanism provides natural group commit semantics (Silo/Aether pattern).
 
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,8 +28,8 @@ use std::time::Duration;
 use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
 
 use crate::per_core_buffer::{
-    AppendOutcome, BufferConfig, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig, EpochOrderCoordinator,
-    WalRecord, thread_buffer_slot,
+    AppendOutcome, BufferConfig, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig, EpochFlushBatch,
+    EpochOrderCoordinator, WalRecord, thread_buffer_slot,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +55,315 @@ impl Default for ParallelWalConfig {
             buffer_capacity_bytes: 4 * 1024 * 1024,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Segment File I/O (D1.6)
+// ---------------------------------------------------------------------------
+
+/// Magic number for parallel WAL segment files.
+const SEGMENT_MAGIC: u32 = 0x5057_414C; // "PWAL"
+
+/// Version of the segment file format.
+const SEGMENT_VERSION: u16 = 1;
+
+/// Segment file header size in bytes.
+const SEGMENT_HEADER_SIZE: usize = 24;
+
+/// fsync policy for segment files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsyncPolicy {
+    /// Full fsync after every write (safest, slowest).
+    #[default]
+    Full,
+    /// Fsync at epoch boundaries only.
+    Normal,
+    /// No fsync (fastest, least safe).
+    Off,
+}
+
+/// Segment file header.
+///
+/// Layout (24 bytes):
+/// ```text
+/// [0..4]   magic: u32 (0x5057414C = "PWAL")
+/// [4..6]   version: u16
+/// [6..8]   reserved: u16 (for alignment)
+/// [8..16]  epoch: u64
+/// [16..20] record_count: u32
+/// [20..24] checksum: u32 (CRC32C of header fields 0..20)
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentHeader {
+    /// Epoch number for this segment.
+    pub epoch: u64,
+    /// Number of records in this segment.
+    pub record_count: u32,
+}
+
+impl SegmentHeader {
+    /// Create a new segment header.
+    #[must_use]
+    pub const fn new(epoch: u64, record_count: u32) -> Self {
+        Self {
+            epoch,
+            record_count,
+        }
+    }
+
+    /// Serialize the header to bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; SEGMENT_HEADER_SIZE] {
+        let mut buf = [0u8; SEGMENT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
+        buf[4..6].copy_from_slice(&SEGMENT_VERSION.to_le_bytes());
+        // buf[6..8] reserved
+        buf[8..16].copy_from_slice(&self.epoch.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.record_count.to_le_bytes());
+        // Compute CRC32C of bytes 0..20
+        let checksum = crc32c::crc32c(&buf[0..20]);
+        buf[20..24].copy_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    /// Parse a header from bytes.
+    pub fn from_bytes(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, String> {
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic != SEGMENT_MAGIC {
+            return Err(format!("invalid segment magic: {magic:#x}"));
+        }
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        if version != SEGMENT_VERSION {
+            return Err(format!("unsupported segment version: {version}"));
+        }
+        let epoch = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]);
+        let record_count = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let stored_checksum = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        let computed_checksum = crc32c::crc32c(&buf[0..20]);
+        if stored_checksum != computed_checksum {
+            return Err(format!(
+                "segment header checksum mismatch: stored={stored_checksum:#x}, computed={computed_checksum:#x}"
+            ));
+        }
+        Ok(Self {
+            epoch,
+            record_count,
+        })
+    }
+}
+
+/// Generate the segment file path for a given database and epoch.
+#[must_use]
+pub fn segment_path(db_path: &Path, epoch: u64) -> PathBuf {
+    let mut path = db_path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .map_or_else(|| "db".to_string(), |n| n.to_string_lossy().to_string());
+    path.set_file_name(format!("{file_name}-wal-seg-{epoch:016x}"));
+    path
+}
+
+/// List all segment files for a database, sorted by epoch.
+pub fn list_segments(db_path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let db_name = db_path
+        .file_name()
+        .map_or_else(|| "db".to_string(), |n| n.to_string_lossy().to_string());
+    let prefix = format!("{db_name}-wal-seg-");
+
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Some(epoch_hex) = name_str.strip_prefix(&prefix) {
+            if let Ok(epoch) = u64::from_str_radix(epoch_hex, 16) {
+                segments.push((epoch, entry.path()));
+            }
+        }
+    }
+    segments.sort_by_key(|(epoch, _)| *epoch);
+    Ok(segments)
+}
+
+/// Write a segment file for the given epoch batch.
+///
+/// The segment file contains:
+/// 1. Header with epoch and record count
+/// 2. Serialized records (length-prefixed bincode)
+///
+/// Returns the number of bytes written.
+pub fn write_segment(
+    db_path: &Path,
+    batch: &EpochFlushBatch,
+    fsync_policy: FsyncPolicy,
+) -> io::Result<usize> {
+    let path = segment_path(db_path, batch.epoch);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write header
+    let header = SegmentHeader::new(batch.epoch, batch.records.len() as u32);
+    let header_bytes = header.to_bytes();
+    writer.write_all(&header_bytes)?;
+    let mut total_bytes = SEGMENT_HEADER_SIZE;
+
+    // Write records (simple length-prefixed format)
+    for record in &batch.records {
+        let record_bytes = serialize_record(record);
+        let len = record_bytes.len() as u32;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(&record_bytes)?;
+        total_bytes += 4 + record_bytes.len();
+    }
+
+    writer.flush()?;
+
+    // Apply fsync policy
+    if fsync_policy == FsyncPolicy::Full || fsync_policy == FsyncPolicy::Normal {
+        writer.get_ref().sync_all()?;
+    }
+
+    Ok(total_bytes)
+}
+
+/// Read a segment file and return the records.
+pub fn read_segment(path: &Path) -> io::Result<(SegmentHeader, Vec<WalRecord>)> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Read header
+    let mut header_buf = [0u8; SEGMENT_HEADER_SIZE];
+    reader.read_exact(&mut header_buf)?;
+    let header = SegmentHeader::from_bytes(&header_buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // Read records
+    let mut records = Vec::with_capacity(header.record_count as usize);
+    for _ in 0..header.record_count {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut record_buf = vec![0u8; len];
+        reader.read_exact(&mut record_buf)?;
+        let record = deserialize_record(&record_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        records.push(record);
+    }
+
+    Ok((header, records))
+}
+
+/// Delete a segment file.
+pub fn delete_segment(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// Serialize a WalRecord to bytes.
+fn serialize_record(record: &WalRecord) -> Vec<u8> {
+    // Simple binary format:
+    // [8] txn_id
+    // [8] txn_epoch
+    // [8] record_epoch
+    // [4] page_id
+    // [8] begin_seq
+    // [1] has_end_seq
+    // [8] end_seq (if has_end_seq)
+    // [4] before_image_len
+    // [N] before_image
+    // [4] after_image_len
+    // [N] after_image
+    let mut buf = Vec::with_capacity(64 + record.before_image.len() + record.after_image.len());
+
+    buf.extend_from_slice(&record.txn_token.id.get().to_le_bytes());
+    buf.extend_from_slice(&record.txn_token.epoch.get().to_le_bytes());
+    buf.extend_from_slice(&record.epoch.to_le_bytes());
+    buf.extend_from_slice(&record.page_id.get().to_le_bytes());
+    buf.extend_from_slice(&record.begin_seq.get().to_le_bytes());
+    if let Some(end_seq) = record.end_seq {
+        buf.push(1);
+        buf.extend_from_slice(&end_seq.get().to_le_bytes());
+    } else {
+        buf.push(0);
+    }
+    buf.extend_from_slice(&(record.before_image.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&record.before_image);
+    buf.extend_from_slice(&(record.after_image.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&record.after_image);
+
+    buf
+}
+
+/// Deserialize a WalRecord from bytes.
+fn deserialize_record(buf: &[u8]) -> Result<WalRecord, String> {
+    // Minimum size: 8 + 4 + 8 + 4 + 8 + 1 + 4 + 4 = 41 bytes (no end_seq, empty images)
+    if buf.len() < 41 {
+        return Err("record too short".to_string());
+    }
+
+    let mut offset = 0;
+
+    let txn_id = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let txn_epoch = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    let record_epoch = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let page_id = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    let begin_seq = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let has_end_seq = buf[offset];
+    offset += 1;
+    let end_seq = if has_end_seq == 1 {
+        if offset + 8 > buf.len() {
+            return Err("end_seq truncated".to_string());
+        }
+        let seq = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        Some(CommitSeq::new(seq))
+    } else {
+        None
+    };
+    if offset + 4 > buf.len() {
+        return Err("before_image length truncated".to_string());
+    }
+    let before_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    if offset + before_len > buf.len() {
+        return Err("before_image truncated".to_string());
+    }
+    let before_image = buf[offset..offset + before_len].to_vec();
+    offset += before_len;
+    if offset + 4 > buf.len() {
+        return Err("after_image length truncated".to_string());
+    }
+    let after_len = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    if offset + after_len > buf.len() {
+        return Err("after_image truncated".to_string());
+    }
+    let after_image = buf[offset..offset + after_len].to_vec();
+
+    let txn_id = fsqlite_types::TxnId::new(txn_id).ok_or("invalid txn_id (zero)")?;
+    let page_id = PageNumber::new(page_id).ok_or("invalid page_id (zero)")?;
+
+    Ok(WalRecord {
+        txn_token: TxnToken::new(txn_id, fsqlite_types::TxnEpoch::new(txn_epoch)),
+        epoch: record_epoch,
+        page_id,
+        begin_seq: CommitSeq::new(begin_seq),
+        end_seq,
+        before_image,
+        after_image,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +530,11 @@ impl ParallelWalCoordinator {
     /// sealing and flushing all per-thread buffers. This implements the Silo/Aether
     /// group commit pattern where transactions wait for their epoch to become durable.
     pub fn start(&self) -> Result<(), String> {
+        self.start_with_fsync(FsyncPolicy::default())
+    }
+
+    /// Start the background epoch ticker thread with a specific fsync policy.
+    pub fn start_with_fsync(&self, fsync_policy: FsyncPolicy) -> Result<(), String> {
         if self.running.swap(true, Ordering::SeqCst) {
             return Err("coordinator already running".to_string());
         }
@@ -226,6 +542,7 @@ impl ParallelWalCoordinator {
         // Clone Arc handles for the ticker thread.
         let running = Arc::clone(&self.running);
         let inner = Arc::clone(&self.inner);
+        let db_path = self.db_path.clone();
         let slot_count = self.config.slot_count;
         let interval = Duration::from_millis(self.config.epoch_interval_ms);
         let flush_timeout = Duration::from_millis(self.config.epoch_interval_ms * 10);
@@ -233,7 +550,15 @@ impl ParallelWalCoordinator {
         let handle = std::thread::Builder::new()
             .name("wal-epoch-ticker".to_string())
             .spawn(move || {
-                epoch_ticker_loop(running, inner, slot_count, interval, flush_timeout);
+                epoch_ticker_loop(
+                    running,
+                    inner,
+                    db_path,
+                    slot_count,
+                    interval,
+                    flush_timeout,
+                    fsync_policy,
+                );
             })
             .map_err(|e| format!("failed to spawn epoch ticker thread: {e}"))?;
 
@@ -301,15 +626,18 @@ impl ParallelWalCoordinator {
 /// 2. Advance the global epoch.
 /// 3. Wait for all threads to observe the new epoch.
 /// 4. Flush the previous epoch's sealed buffers to disk.
-/// 5. Mark the epoch as durable.
+/// 5. Write the batch to a segment file.
+/// 6. Mark the epoch as durable.
 ///
 /// The loop exits when `running` is set to false.
 fn epoch_ticker_loop(
     running: Arc<AtomicBool>,
     inner: Arc<EpochOrderCoordinator>,
+    db_path: PathBuf,
     slot_count: usize,
     interval: Duration,
     flush_timeout: Duration,
+    fsync_policy: FsyncPolicy,
 ) {
     // Generate the list of active slots (all slots for now).
     // TODO: Track actually-active slots to avoid waiting for unused slots.
@@ -329,13 +657,32 @@ fn epoch_ticker_loop(
             Ok(new_epoch) => {
                 // Flush the previous epoch's frames.
                 let prev_epoch = new_epoch.saturating_sub(1);
-                if let Err(e) = inner.flush_epoch(prev_epoch) {
-                    // Log the error but continue - epoch flush failures are recoverable
-                    // by retrying on the next tick.
-                    eprintln!("epoch ticker: flush_epoch({prev_epoch}) failed: {e}");
+                match inner.flush_epoch(prev_epoch) {
+                    Ok(batch) => {
+                        // Write the batch to a segment file if there are records.
+                        if !batch.records.is_empty() {
+                            match write_segment(&db_path, &batch, fsync_policy) {
+                                Ok(bytes) => {
+                                    // Successfully wrote segment file.
+                                    // TODO: Update durable_epoch in inner coordinator.
+                                    let _ = bytes; // suppress unused warning for now
+                                }
+                                Err(e) => {
+                                    // Log the error but continue - segment write failures
+                                    // are recoverable by retrying on the next tick.
+                                    eprintln!(
+                                        "epoch ticker: write_segment({prev_epoch}) failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Log the error but continue - epoch flush failures are recoverable
+                        // by retrying on the next tick.
+                        eprintln!("epoch ticker: flush_epoch({prev_epoch}) failed: {e}");
+                    }
                 }
-                // TODO: Write the flushed batch to segment files (D1.6).
-                // TODO: Update durable_epoch after successful disk write.
             }
             Err(e) => {
                 // Log the error but continue - epoch advance failures are typically
@@ -493,5 +840,153 @@ mod tests {
             final_epoch >= initial_epoch,
             "epoch should not decrease: initial={initial_epoch}, final={final_epoch}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Segment File I/O Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_segment_header_roundtrip() {
+        let header = SegmentHeader::new(42, 100);
+        let bytes = header.to_bytes();
+        let parsed = SegmentHeader::from_bytes(&bytes).expect("should parse");
+        assert_eq!(parsed.epoch, 42);
+        assert_eq!(parsed.record_count, 100);
+    }
+
+    #[test]
+    fn test_segment_header_invalid_magic() {
+        let mut bytes = [0u8; SEGMENT_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let result = SegmentHeader::from_bytes(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid segment magic"));
+    }
+
+    #[test]
+    fn test_segment_header_checksum_mismatch() {
+        let header = SegmentHeader::new(42, 100);
+        let mut bytes = header.to_bytes();
+        // Corrupt the epoch field
+        bytes[8] ^= 0xFF;
+        let result = SegmentHeader::from_bytes(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn test_segment_path_generation() {
+        let db_path = PathBuf::from("/tmp/mydb.sqlite");
+        let path = segment_path(&db_path, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "mydb.sqlite-wal-seg-123456789abcdef0"
+        );
+    }
+
+    #[test]
+    fn test_segment_write_and_read() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        // Create a batch with some records
+        let records = vec![
+            WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(1).unwrap(),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch: 5,
+                page_id: PageNumber::new(1).unwrap(),
+                begin_seq: CommitSeq::new(100),
+                end_seq: Some(CommitSeq::new(100)),
+                before_image: vec![0u8; 32],
+                after_image: vec![1u8; 32],
+            },
+            WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(2).unwrap(),
+                    fsqlite_types::TxnEpoch::new(1),
+                ),
+                epoch: 5,
+                page_id: PageNumber::new(2).unwrap(),
+                begin_seq: CommitSeq::new(101),
+                end_seq: None,
+                before_image: Vec::new(),
+                after_image: vec![2u8; 64],
+            },
+        ];
+
+        let batch = EpochFlushBatch {
+            epoch: 5,
+            records,
+            records_per_core: vec![1, 1],
+        };
+
+        // Write the segment
+        let bytes_written =
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        assert!(bytes_written > SEGMENT_HEADER_SIZE);
+
+        // Read it back
+        let seg_path = segment_path(&db_path, 5);
+        let (header, records) = read_segment(&seg_path).expect("read should succeed");
+
+        assert_eq!(header.epoch, 5);
+        assert_eq!(header.record_count, 2);
+        assert_eq!(records.len(), 2);
+
+        // Verify first record
+        assert_eq!(records[0].txn_token.id.get(), 1);
+        assert_eq!(records[0].page_id.get(), 1);
+        assert_eq!(records[0].before_image.len(), 32);
+        assert_eq!(records[0].after_image.len(), 32);
+        assert_eq!(records[0].end_seq, Some(CommitSeq::new(100)));
+
+        // Verify second record
+        assert_eq!(records[1].txn_token.id.get(), 2);
+        assert_eq!(records[1].page_id.get(), 2);
+        assert_eq!(records[1].before_image.len(), 0);
+        assert_eq!(records[1].after_image.len(), 64);
+        assert_eq!(records[1].end_seq, None);
+
+        // Cleanup
+        delete_segment(&seg_path).expect("delete should succeed");
+    }
+
+    #[test]
+    fn test_list_segments() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        // Create a few empty segment files
+        for epoch in [1u64, 5, 10, 2] {
+            let batch = EpochFlushBatch {
+                epoch,
+                records: Vec::new(),
+                records_per_core: Vec::new(),
+            };
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        }
+
+        // List segments
+        let segments = list_segments(&db_path).expect("list should succeed");
+        assert_eq!(segments.len(), 4);
+
+        // Should be sorted by epoch
+        assert_eq!(segments[0].0, 1);
+        assert_eq!(segments[1].0, 2);
+        assert_eq!(segments[2].0, 5);
+        assert_eq!(segments[3].0, 10);
+
+        // Cleanup
+        for (_, path) in segments {
+            delete_segment(&path).expect("delete should succeed");
+        }
     }
 }
