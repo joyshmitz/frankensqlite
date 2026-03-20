@@ -362,16 +362,7 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
         SqliteValue::Text(text) => {
             Ok(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()))
         }
-        SqliteValue::Blob(b) => {
-            use std::fmt::Write;
-            let mut hex = String::with_capacity(b.len() * 2 + 2);
-            hex.push('"');
-            for byte in b.iter() {
-                let _ = write!(&mut hex, "{byte:02X}");
-            }
-            hex.push('"');
-            Ok(hex)
-        }
+        SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
     }
 }
 
