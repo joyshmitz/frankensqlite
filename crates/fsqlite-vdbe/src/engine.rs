@@ -9976,26 +9976,52 @@ impl VdbeEngine {
         // The only acceptable writable "bootstrap" case is a truly
         // zero-initialized root page that we can initialize in-place.
         let txn_cx = self.derive_execution_cx();
-        if let Some(ref mut page_io) = self.txn_page_io {
-            // If the pager read itself fails, fail cursor open instead of
-            // treating it as an uninitialized page.
-            let page_data = match page_io.read_page(&txn_cx, root_pgno) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    tracing::warn!(
-                        cursor_id,
-                        page_id = root_page,
-                        writable,
-                        has_txn,
-                        mode,
-                        backend_kind = "txn",
-                        decision_reason = "pager_read_failed",
-                        error = %err,
-                        "open_storage_cursor: failed to read root page from pager"
-                    );
-                    return false;
-                }
-            };
+        // Use a labeled block so we can break out to the MemDatabase fallback path
+        // when the pager read fails but MemDatabase has the table.
+        'pager_block: {
+            if let Some(ref mut page_io) = self.txn_page_io {
+                // If the pager read itself fails, check if MemDatabase can serve
+                // this table before failing. This handles view materialization where
+                // MemDatabase allocates root pages beyond the pager's db_size.
+                let page_data = match page_io.read_page(&txn_cx, root_pgno) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        // Check if MemDatabase can serve this table.
+                        let has_mem_table = self
+                            .db
+                            .as_ref()
+                            .is_some_and(|db| db.get_table(root_page).is_some());
+                        if has_mem_table && !self.reject_mem_fallback {
+                            tracing::debug!(
+                                cursor_id,
+                                page_id = root_page,
+                                writable,
+                                has_txn,
+                                mode,
+                                backend_kind = "mem",
+                                decision_reason = "pager_read_failed_mem_fallback",
+                                error = %err,
+                                "open_storage_cursor: pager read failed, falling through to MemDatabase"
+                            );
+                            // Break out of pager_block to fall through to MemDatabase path.
+                            break 'pager_block;
+                        }
+                        tracing::warn!(
+                            cursor_id,
+                            page_id = root_page,
+                            writable,
+                            has_txn,
+                            mode,
+                            backend_kind = "txn",
+                            decision_reason = "pager_read_failed",
+                            error = %err,
+                            has_mem_table,
+                            reject_mem_fallback = self.reject_mem_fallback,
+                            "open_storage_cursor: failed to read root page from pager"
+                        );
+                        return false;
+                    }
+                };
             let hdr_offset = header_offset_for_page(root_pgno);
             let parsed_header = BtreePageHeader::parse(&page_data, hdr_offset).ok();
             // A page is a valid B-tree if the header parses successfully.
@@ -10194,6 +10220,7 @@ impl VdbeEngine {
                 "open_storage_cursor: pager page invalid, falling through to MemDatabase"
             );
         }
+        } // end 'pager_block
 
         // bd-2ttd8.1: Parity-certification mode — reject MemPageStore fallback.
         if self.reject_mem_fallback {
