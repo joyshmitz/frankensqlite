@@ -1160,6 +1160,19 @@ fn evaluate_expr_for_columns(
     evaluate_expr_impl(index, expr, columns, None)
 }
 
+fn evaluate_query_string(
+    index: &InvertedIndex,
+    columns: &[String],
+    query: &str,
+) -> std::result::Result<(Vec<i64>, Vec<String>), Fts5QueryError> {
+    let tokens = parse_fts5_query(query)?;
+    let expr = build_expr(&tokens)?;
+    validate_column_filters(&expr, columns)?;
+    let matching_docs = evaluate_expr_for_columns(index, &expr, columns);
+    let query_terms = extract_query_terms(&expr);
+    Ok((matching_docs, query_terms))
+}
+
 fn evaluate_expr_impl(
     index: &InvertedIndex,
     expr: &Fts5Expr,
@@ -1600,13 +1613,8 @@ impl Fts5Table {
     /// Search the FTS5 table with a query, returning matching rowids ranked
     /// by BM25.
     pub fn search(&self, query: &str) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        let tokens = parse_fts5_query(query)?;
-        let expr = build_expr(&tokens)?;
-        validate_column_filters(&expr, &self.columns)?;
-        let matching_docs = evaluate_expr_for_columns(&self.index, &expr, &self.columns);
-
-        // Extract query terms for BM25 scoring.
-        let query_terms = extract_query_terms(&expr);
+        let (matching_docs, query_terms) =
+            evaluate_query_string(&self.index, &self.columns, query)?;
         let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
 
         let mut results: Vec<(i64, f64)> = matching_docs
@@ -1782,11 +1790,13 @@ impl VirtualTable for Fts5Table {
     fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
         // Check if there's a MATCH constraint.
         let mut has_match = false;
+        let mut next_argv_index = 1;
         for (i, constraint) in info.constraints.iter().enumerate() {
             if constraint.op == fsqlite_func::vtab::ConstraintOp::Match && constraint.usable {
-                info.constraint_usage[i].argv_index = 1;
+                info.constraint_usage[i].argv_index = next_argv_index;
                 info.constraint_usage[i].omit = true;
                 has_match = true;
+                next_argv_index += 1;
             }
         }
 
@@ -1933,23 +1943,25 @@ impl VirtualTableCursor for Fts5Cursor {
         self.position = 0;
 
         if idx_num == 1 {
-            // MATCH query: args[0] is the query string.
-            if let Some(query_val) = args.first() {
-                let query = query_val.to_text();
+            // MATCH query: every filter arg is an additional MATCH expression
+            // on the same table, combined with AND like SQLite does.
+            if !args.is_empty() {
+                let mut combined_docs: Option<Vec<i64>> = None;
+                let mut query_terms = Vec::new();
+                for query_val in args {
+                    let query = query_val.to_text();
+                    let (matching_docs, match_terms) =
+                        evaluate_query_string(&self.index, &self.columns, &query).map_err(|e| {
+                            FrankenError::function_error(format!("fts5 query error: {e}"))
+                        })?;
+                    query_terms.extend(match_terms);
+                    combined_docs = Some(match combined_docs {
+                        Some(existing) => intersect_sorted(&existing, &matching_docs),
+                        None => matching_docs,
+                    });
+                }
 
-                // Parse the query into tokens, build an expression tree,
-                // evaluate against the inverted index, and score with BM25.
-                let tokens = parse_fts5_query(&query)
-                    .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
-                let expr = build_expr(&tokens)
-                    .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
-                validate_column_filters(&expr, &self.columns)
-                    .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
-
-                let matching_docs = evaluate_expr_for_columns(&self.index, &expr, &self.columns);
-
-                // Extract query terms for BM25 scoring.
-                let query_terms = extract_query_terms(&expr);
+                let matching_docs = combined_docs.unwrap_or_default();
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
 
                 self.results = matching_docs
@@ -3859,5 +3871,57 @@ mod tests {
         vtab.best_index(&mut info).unwrap();
         assert_eq!(info.idx_num, 0); // full scan
         assert!(info.estimated_cost > 100_000.0);
+    }
+
+    #[test]
+    fn test_fts5_vtab_best_index_assigns_distinct_match_argv_slots() {
+        let cx = Cx::new();
+        let vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+        let mut info = IndexInfo::new(
+            vec![
+                fsqlite_func::vtab::IndexConstraint {
+                    column: 0,
+                    op: fsqlite_func::vtab::ConstraintOp::Match,
+                    usable: true,
+                },
+                fsqlite_func::vtab::IndexConstraint {
+                    column: 0,
+                    op: fsqlite_func::vtab::ConstraintOp::Match,
+                    usable: true,
+                },
+            ],
+            vec![],
+        );
+        vtab.best_index(&mut info).unwrap();
+        assert_eq!(info.idx_num, 1);
+        assert_eq!(info.constraint_usage[0].argv_index, 1);
+        assert_eq!(info.constraint_usage[1].argv_index, 2);
+        assert!(info.constraint_usage.iter().all(|usage| usage.omit));
+    }
+
+    #[test]
+    fn test_fts5_cursor_filter_intersects_multiple_match_args() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        table.insert_document(2, &["hello rust".to_owned()]);
+        table.insert_document(3, &["world only".to_owned()]);
+
+        let mut cursor = table.open().unwrap();
+        cursor
+            .filter(
+                &cx,
+                1,
+                None,
+                &[
+                    SqliteValue::Text(Arc::from("hello")),
+                    SqliteValue::Text(Arc::from("world")),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(cursor.rowid().unwrap(), 1);
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
     }
 }
