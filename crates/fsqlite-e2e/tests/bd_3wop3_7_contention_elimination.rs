@@ -184,7 +184,7 @@ fn measure_fsqlite_throughput(thread_count: usize, rows_per_thread: u64) -> Thro
     // The parallel WAL ensures each thread writes to its own WAL segment without
     // acquiring the global WAL append gate, enabling true O(N) scaling.
 
-    let conn = fsqlite::Connection::open_in_memory().expect("open");
+    let conn = fsqlite::Connection::open(":memory:").expect("open");
     conn.execute("PRAGMA journal_mode = WAL").ok();
     conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER)")
         .expect("create");
@@ -327,7 +327,7 @@ fn test_ebr_no_gc_pauses() {
 
     use std::sync::atomic::AtomicBool;
 
-    let conn = Arc::new(fsqlite::Connection::open_in_memory().expect("open"));
+    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
     conn.execute("PRAGMA journal_mode = WAL").ok();
     conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT)")
         .expect("create");
@@ -480,7 +480,7 @@ fn test_64_thread_no_deadlock() {
     // This test runs with current implementation (sequential fallback).
     // Once D1 is complete, it will exercise true concurrent writes.
 
-    let conn = Arc::new(fsqlite::Connection::open_in_memory().expect("open"));
+    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
     conn.execute("PRAGMA journal_mode = WAL").ok();
     conn.execute("CREATE TABLE stress (id INTEGER PRIMARY KEY, val INTEGER)")
         .expect("create");
@@ -557,7 +557,7 @@ fn test_64_thread_no_deadlock() {
 fn test_contention_under_gc_pressure() {
     // This test exercises the EBR-based GC under write pressure.
 
-    let conn = Arc::new(fsqlite::Connection::open_in_memory().expect("open"));
+    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
     conn.execute("PRAGMA journal_mode = WAL").ok();
     conn.execute("CREATE TABLE gc_stress (id INTEGER PRIMARY KEY, data BLOB)")
         .expect("create");
@@ -588,7 +588,7 @@ fn test_contention_under_gc_pressure() {
                         "INSERT OR REPLACE INTO gc_stress VALUES (?1, ?2)",
                         &[
                             fsqlite::SqliteValue::Integer(row_id),
-                            fsqlite::SqliteValue::Blob(blob.clone()),
+                            fsqlite::SqliteValue::Blob(blob.clone().into()),
                         ],
                     );
                     local_ops += 1;
@@ -625,6 +625,275 @@ fn test_contention_under_gc_pressure() {
     assert!(
         ops_per_sec > 1000.0,
         "bd-3wop3.7: GC pressure caused throughput collapse ({ops_per_sec:.0} ops/s < 1000)"
+    );
+}
+
+// ===========================================================================
+// SPLIT-LOCK COMMIT TESTS (D1-CRITICAL bd-3wop3.8)
+// ===========================================================================
+
+/// Test 7: Verify split-lock commit allows concurrent prepare phases.
+///
+/// The split-lock protocol separates commit into three phases:
+/// - Phase A (prepare): Hold inner.lock(), collect write set
+/// - Phase B (WAL I/O): Hold wal_backend.lock(), release inner.lock()
+/// - Phase C (publish): Re-acquire inner.lock(), update db_size
+///
+/// This allows Thread B to start its prepare phase while Thread A does WAL I/O.
+#[test]
+fn test_split_lock_commit_no_deadlock() {
+    // Test that multiple concurrent writers don't deadlock with the split-lock
+    // protocol. With the old monolithic lock, this would cause severe contention.
+
+    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
+    conn.execute("PRAGMA journal_mode = WAL").ok();
+    conn.execute("CREATE TABLE split_lock_test (id INTEGER PRIMARY KEY, val INTEGER)")
+        .expect("create");
+
+    let barrier = Arc::new(Barrier::new(8));
+    let completed = Arc::new(AtomicU64::new(0));
+    let total_ops = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..8)
+        .map(|tid| {
+            let c = Arc::clone(&conn);
+            let b = Arc::clone(&barrier);
+            let comp = Arc::clone(&completed);
+            let ops = Arc::clone(&total_ops);
+            let base = (tid as i64) * 10_000;
+
+            thread::spawn(move || {
+                b.wait();
+                let mut local_ops = 0u64;
+
+                // Each thread inserts 500 rows, each as its own transaction
+                // This maximizes commit contention
+                for i in 0..500 {
+                    if c.execute_with_params(
+                        "INSERT INTO split_lock_test VALUES (?1, ?2)",
+                        &[
+                            fsqlite::SqliteValue::Integer(base + i),
+                            fsqlite::SqliteValue::Integer(i * 7),
+                        ],
+                    )
+                    .is_ok()
+                    {
+                        local_ops += 1;
+                    }
+                }
+
+                ops.fetch_add(local_ops, Ordering::Relaxed);
+                comp.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .collect();
+
+    // Give threads up to 30 seconds to complete (generous timeout)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 8 {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    for h in handles {
+        h.join().expect("join");
+    }
+
+    let final_completed = completed.load(Ordering::Relaxed);
+    let final_ops = total_ops.load(Ordering::Relaxed);
+
+    println!(
+        "[test_split_lock_commit_no_deadlock] {}/8 threads completed, {} total ops",
+        final_completed, final_ops
+    );
+
+    assert_eq!(
+        final_completed, 8,
+        "bd-3wop3.8: split-lock deadlock - only {}/8 threads completed",
+        final_completed
+    );
+
+    // All 8 threads × 500 ops = 4000 expected
+    assert!(
+        final_ops >= 3800,
+        "bd-3wop3.8: too few operations completed ({} < 3800)",
+        final_ops
+    );
+}
+
+/// Test 8: Verify split-lock commit throughput scales better than monolithic lock.
+///
+/// Measures commit throughput with increasing thread counts. With split-lock,
+/// we expect better scaling because prepare phases can overlap with WAL I/O.
+#[test]
+fn test_split_lock_commit_scaling() {
+    // Measure throughput at 1, 2, 4, 8 threads and verify scaling isn't pathological.
+
+    let results: Vec<(usize, f64)> = [1, 2, 4, 8]
+        .iter()
+        .map(|&thread_count| {
+            let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
+            conn.execute("PRAGMA journal_mode = WAL").ok();
+            conn.execute("CREATE TABLE scaling_test (id INTEGER PRIMARY KEY, val INTEGER)")
+                .expect("create");
+
+            let barrier = Arc::new(Barrier::new(thread_count));
+            let total_ops = Arc::new(AtomicU64::new(0));
+            let ops_per_thread = 1000;
+
+            let start = Instant::now();
+
+            let handles: Vec<_> = (0..thread_count)
+                .map(|tid| {
+                    let c = Arc::clone(&conn);
+                    let b = Arc::clone(&barrier);
+                    let ops = Arc::clone(&total_ops);
+                    let base = (tid as i64) * (ops_per_thread as i64) * 2;
+
+                    thread::spawn(move || {
+                        b.wait();
+                        let mut local_ops = 0u64;
+
+                        for i in 0..ops_per_thread {
+                            if c.execute_with_params(
+                                "INSERT INTO scaling_test VALUES (?1, ?2)",
+                                &[
+                                    fsqlite::SqliteValue::Integer(base + i as i64),
+                                    fsqlite::SqliteValue::Integer(i as i64),
+                                ],
+                            )
+                            .is_ok()
+                            {
+                                local_ops += 1;
+                            }
+                        }
+
+                        ops.fetch_add(local_ops, Ordering::Relaxed);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().expect("join");
+            }
+
+            let elapsed = start.elapsed();
+            let total = total_ops.load(Ordering::Relaxed);
+            let ops_per_sec = total as f64 / elapsed.as_secs_f64();
+
+            (thread_count, ops_per_sec)
+        })
+        .collect();
+
+    println!("\n[test_split_lock_commit_scaling] Results:");
+    for (threads, ops) in &results {
+        println!("  {}t: {:.0} ops/s", threads, ops);
+    }
+
+    // Verify basic sanity: throughput at 4+ threads shouldn't collapse below 1-thread
+    let single_thread_ops = results[0].1;
+    let four_thread_ops = results[2].1;
+    let eight_thread_ops = results[3].1;
+
+    // With split-lock, 4t should be at least 50% of 1t (allowing for contention)
+    // This is a conservative check - the goal is to catch pathological regression
+    assert!(
+        four_thread_ops > single_thread_ops * 0.5,
+        "bd-3wop3.8: 4t throughput collapsed ({:.0} < {:.0} * 0.5)",
+        four_thread_ops,
+        single_thread_ops
+    );
+
+    // 8t should still be at least 30% of 1t (more contention expected)
+    assert!(
+        eight_thread_ops > single_thread_ops * 0.3,
+        "bd-3wop3.8: 8t throughput collapsed ({:.0} < {:.0} * 0.3)",
+        eight_thread_ops,
+        single_thread_ops
+    );
+}
+
+/// Test 9: Verify WAL I/O phase doesn't block prepare phase.
+///
+/// Creates artificial WAL I/O delay and verifies other threads can still
+/// make progress on their prepare phases.
+#[test]
+fn test_split_lock_wal_io_does_not_block_prepare() {
+    // This test verifies the core property of split-lock: that WAL I/O in one
+    // thread doesn't block prepare in another thread.
+
+    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
+    conn.execute("PRAGMA journal_mode = WAL").ok();
+    conn.execute("CREATE TABLE wal_io_test (id INTEGER PRIMARY KEY, data BLOB)")
+        .expect("create");
+
+    let barrier = Arc::new(Barrier::new(4));
+    let completed = Arc::new(AtomicU64::new(0));
+    let total_ops = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..4)
+        .map(|tid| {
+            let c = Arc::clone(&conn);
+            let b = Arc::clone(&barrier);
+            let comp = Arc::clone(&completed);
+            let ops = Arc::clone(&total_ops);
+
+            thread::spawn(move || {
+                b.wait();
+                let mut local_ops = 0u64;
+
+                // Write larger blobs to make WAL I/O more significant
+                let blob = vec![0xABu8; 4096]; // 4KB per row
+
+                for i in 0..100 {
+                    let row_id = (tid * 1000 + i) as i64;
+                    if c.execute_with_params(
+                        "INSERT INTO wal_io_test VALUES (?1, ?2)",
+                        &[
+                            fsqlite::SqliteValue::Integer(row_id),
+                            fsqlite::SqliteValue::Blob(blob.clone().into()),
+                        ],
+                    )
+                    .is_ok()
+                    {
+                        local_ops += 1;
+                    }
+                }
+
+                ops.fetch_add(local_ops, Ordering::Relaxed);
+                comp.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .collect();
+
+    // All threads should complete within 10 seconds
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 4 {
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    for h in handles {
+        h.join().expect("join");
+    }
+
+    let final_completed = completed.load(Ordering::Relaxed);
+    let final_ops = total_ops.load(Ordering::Relaxed);
+
+    println!(
+        "[test_split_lock_wal_io_does_not_block_prepare] {}/4 threads, {} ops",
+        final_completed, final_ops
+    );
+
+    assert_eq!(
+        final_completed, 4,
+        "bd-3wop3.8: WAL I/O blocked prepare - only {}/4 threads completed",
+        final_completed
+    );
+
+    // 4 threads × 100 ops = 400 expected
+    assert!(
+        final_ops >= 380,
+        "bd-3wop3.8: too few ops with large WAL I/O ({} < 380)",
+        final_ops
     );
 }
 

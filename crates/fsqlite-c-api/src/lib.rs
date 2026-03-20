@@ -18,7 +18,6 @@
 )]
 
 use std::ffi::{CStr, CString};
-use std::fmt::Write as _;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -372,13 +371,10 @@ unsafe fn emit_exec_callback_rows(
             c_names.push(cname.as_ptr().cast_mut());
             owned_names.push(cname);
 
-            match v {
-                SqliteValue::Null => {
-                    c_values.push(std::ptr::null_mut());
-                    owned_vals.push(None);
-                    continue;
-                }
-                _ => {}
+            if matches!(v, SqliteValue::Null) {
+                c_values.push(std::ptr::null_mut());
+                owned_vals.push(None);
+                continue;
             }
             let mut text = sqlite_value_to_callback_bytes(v);
             c_values.push(text.as_mut_ptr().cast());
@@ -410,13 +406,7 @@ fn sqlite_value_to_text_bytes(value: &SqliteValue) -> Vec<u8> {
         SqliteValue::Integer(number) => number.to_string().into_bytes(),
         value @ SqliteValue::Float(_) => value.to_text().into_bytes(),
         SqliteValue::Text(text) => text.as_bytes().to_vec(),
-        SqliteValue::Blob(bytes) => {
-            let mut hex = String::with_capacity(bytes.len() * 2);
-            for byte in bytes.iter() {
-                let _ = write!(hex, "{byte:02X}");
-            }
-            hex.into_bytes()
-        }
+        SqliteValue::Blob(bytes) => bytes.to_vec(),
     }
 }
 
@@ -2208,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_column_bytes_matches_text_coercion_for_blob() {
+    fn test_column_text_exposes_raw_blob_bytes() {
         unsafe {
             let db = open_memory();
 
@@ -2219,11 +2209,51 @@ mod tests {
 
             let text = sqlite3_column_text(stmt, 0);
             assert!(!text.is_null());
-            assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "CAFE");
-            assert_eq!(sqlite3_column_bytes(stmt, 0), 4);
+            let bytes = std::slice::from_raw_parts(
+                text.cast::<u8>(),
+                sqlite3_column_bytes(stmt, 0) as usize + 1,
+            );
+            assert_eq!(bytes, &[0xCA, 0xFE, 0x00]);
+            assert_eq!(sqlite3_column_bytes(stmt, 0), 2);
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_exec_callback_exposes_raw_blob_bytes() {
+        unsafe {
+            unsafe extern "C" fn capture_blob_cb(
+                parg: *mut c_void,
+                _ncols: c_int,
+                values: *mut *mut c_char,
+                _names: *mut *mut c_char,
+            ) -> c_int {
+                let out = &mut *parg.cast::<Vec<u8>>();
+                let value_ptr = *values;
+                let bytes = std::slice::from_raw_parts(value_ptr.cast::<u8>(), 3);
+                out.extend_from_slice(bytes);
+                SQLITE_OK
+            }
+
+            let conn = Connection::open(":memory:").unwrap();
+            let rows = conn.query("SELECT X'CAFE'").unwrap();
+            let handle = Sqlite3::new(conn);
+            let mut captured: Vec<u8> = Vec::new();
+
+            assert_eq!(
+                emit_exec_callback_rows(
+                    &handle,
+                    "SELECT X'CAFE'",
+                    &rows,
+                    capture_blob_cb,
+                    std::ptr::from_mut(&mut captured).cast(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(captured, [0xCA, 0xFE, 0x00]);
         }
     }
 
