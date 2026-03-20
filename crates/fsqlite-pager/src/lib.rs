@@ -18,7 +18,7 @@ pub use journal::{
     lock_byte_page,
 };
 pub use page_buf::{PageBuf, PageBufPool};
-pub use page_cache::{PageCache, PageCacheMetricsSnapshot};
+pub use page_cache::{PageCache, PageCacheMetricsSnapshot, ShardedPageCache};
 pub use pager::{
     PagerPublishedSnapshot, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
     WalCommitSyncPolicy,
