@@ -1495,7 +1495,8 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         "count" => Some(FunctionArity::Range(0, 1)),
         "group_concat" | "trim" | "ltrim" | "rtrim" | "round" => Some(FunctionArity::Range(1, 2)),
         "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
-        "coalesce" | "json_extract" | "json_remove" => Some(FunctionArity::VariadicMin(2)),
+        "coalesce" | "json_extract" => Some(FunctionArity::VariadicMin(2)),
+        "json_remove" => Some(FunctionArity::VariadicMin(1)),
         "json_insert" | "json_replace" | "json_set" => Some(FunctionArity::VariadicMin(3)),
         // Variadic: aggregates, scalars, date/time, and JSON functions
         "min" | "max" | "printf" | "format" | "strftime" | "json" | "json_type" | "json_valid" => {
