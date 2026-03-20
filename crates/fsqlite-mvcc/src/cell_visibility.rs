@@ -827,19 +827,41 @@ impl CellVisibilityLog {
 
     /// Find pages with the highest number of deltas.
     fn find_high_delta_pages(&self, max_pages: usize) -> Vec<(PageNumber, Vec<CellKey>)> {
-        let mut page_counts: HashMap<PageNumber, Vec<CellKey>> = HashMap::new();
+        let mut page_counts = HashMap::new();
+        let mut page_cells: HashMap<PageNumber, Vec<CellKey>> = HashMap::new();
 
         for shard in self.shards.iter() {
+            let counts = shard.page_delta_counts.read();
+            for (&pgno, &count) in counts.iter() {
+                if count > 0 {
+                    page_counts.insert(pgno, count);
+                }
+            }
+            drop(counts);
+
             let heads = shard.heads.read();
             for ((pgno, _), entry) in heads.iter() {
-                page_counts.entry(*pgno).or_default().push(entry.cell_key);
+                page_cells.entry(*pgno).or_default().push(entry.cell_key);
             }
         }
 
-        let mut pages: Vec<_> = page_counts.into_iter().collect();
-        pages.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
+        let mut pages: Vec<_> = page_cells
+            .into_iter()
+            .map(|(pgno, cell_keys)| {
+                let delta_count = page_counts.get(&pgno).copied().unwrap_or(cell_keys.len());
+                (pgno, delta_count, cell_keys)
+            })
+            .collect();
+        pages.sort_by(|lhs, rhs| {
+            rhs.1
+                .cmp(&lhs.1)
+                .then_with(|| rhs.2.len().cmp(&lhs.2.len()))
+        });
         pages.truncate(max_pages);
         pages
+            .into_iter()
+            .map(|(pgno, _delta_count, cell_keys)| (pgno, cell_keys))
+            .collect()
     }
 
     /// Commit a delta (assign a commit sequence).
@@ -2146,6 +2168,43 @@ mod tests {
 
         let captured = seen_cells.lock().unwrap();
         assert_eq!(captured.as_slice(), &[cell_key]);
+    }
+
+    #[test]
+    fn test_find_high_delta_pages_ranks_by_total_delta_count() {
+        let log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let hot_page = PageNumber::new(42).unwrap();
+        let wide_page = PageNumber::new(43).unwrap();
+
+        let hot_key = CellKey::table_row(btree, 7);
+        let hot_insert = log
+            .record_insert(hot_key, hot_page, vec![1; 32], txn_token_n(1))
+            .expect("hot insert should succeed");
+        log.commit_delta(hot_insert, CommitSeq::new(1));
+
+        let hot_update_1 = log
+            .record_update(hot_key, hot_page, vec![2; 32], txn_token_n(2))
+            .expect("first hot update should succeed");
+        log.commit_delta(hot_update_1, CommitSeq::new(2));
+
+        let hot_update_2 = log
+            .record_update(hot_key, hot_page, vec![3; 32], txn_token_n(3))
+            .expect("second hot update should succeed");
+        log.commit_delta(hot_update_2, CommitSeq::new(3));
+
+        for (rowid, txn_id) in [(100_i64, 4_u32), (101_i64, 5_u32)] {
+            let cell_key = CellKey::table_row(btree, rowid);
+            let idx = log
+                .record_insert(cell_key, wide_page, vec![9; 32], txn_token_n(txn_id))
+                .expect("wide-page insert should succeed");
+            log.commit_delta(idx, CommitSeq::new(u64::from(txn_id)));
+        }
+
+        let pages = log.find_high_delta_pages(1);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].0, hot_page);
+        assert_eq!(pages[0].1.as_slice(), &[hot_key]);
     }
 
     // -------------------------------------------------------------------------
