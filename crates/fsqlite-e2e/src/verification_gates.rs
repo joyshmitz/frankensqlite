@@ -2,9 +2,9 @@
 //!
 //! Enforces code quality gates that must pass before any harness changes land:
 //!
-//! - `cargo fmt --check` — formatting consistency
-//! - `cargo check --all-targets` — compilation without warnings
-//! - `cargo clippy --all-targets -- -D warnings` — pedantic lint enforcement
+//! - `rch exec -- cargo fmt --check` — formatting consistency
+//! - `rch exec -- cargo check --all-targets` — compilation without warnings
+//! - `rch exec -- cargo clippy --all-targets -- -D warnings` — pedantic lint enforcement
 //! - `ubs <changed-files>` — scan staged changes for common bugs
 //! - No references to `master` branch (must be `main`)
 //!
@@ -15,6 +15,19 @@
 use std::fmt::Write;
 use std::path::Path;
 use std::process::{Command, Output};
+
+const E2E_PACKAGE_NAME: &str = "fsqlite-e2e";
+const FMT_GATE_ARGS: &[&str] = &["fmt", "-p", E2E_PACKAGE_NAME, "--", "--check"];
+const CHECK_GATE_ARGS: &[&str] = &["check", "-p", E2E_PACKAGE_NAME, "--all-targets"];
+const CLIPPY_GATE_ARGS: &[&str] = &[
+    "clippy",
+    "-p",
+    E2E_PACKAGE_NAME,
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings",
+];
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -145,7 +158,7 @@ fn run_fmt_gate(config: &GateConfig) -> GateResult {
     run_cargo_gate(
         "cargo-fmt",
         &config.workspace_root,
-        &["fmt", "--all", "--", "--check"],
+        FMT_GATE_ARGS,
         config.max_snippet_len,
     )
 }
@@ -154,7 +167,7 @@ fn run_check_gate(config: &GateConfig) -> GateResult {
     run_cargo_gate(
         "cargo-check",
         &config.workspace_root,
-        &["check", "--all-targets"],
+        CHECK_GATE_ARGS,
         config.max_snippet_len,
     )
 }
@@ -163,7 +176,7 @@ fn run_clippy_gate(config: &GateConfig) -> GateResult {
     run_cargo_gate(
         "cargo-clippy",
         &config.workspace_root,
-        &["clippy", "--all-targets", "--", "-D", "warnings"],
+        CLIPPY_GATE_ARGS,
         config.max_snippet_len,
     )
 }
@@ -273,8 +286,8 @@ fn run_cargo_gate(
 ) -> GateResult {
     let start = std::time::Instant::now();
 
-    let result = Command::new("cargo")
-        .args(args)
+    let result = Command::new("rch")
+        .args(rch_cargo_gate_args(args))
         .current_dir(workspace_root)
         .output();
 
@@ -291,6 +304,13 @@ fn run_cargo_gate(
             elapsed_ms,
         },
     }
+}
+
+fn rch_cargo_gate_args(args: &[&str]) -> Vec<String> {
+    let mut command = Vec::with_capacity(args.len() + 3);
+    command.extend(["exec", "--", "cargo"].into_iter().map(str::to_owned));
+    command.extend(args.iter().map(|arg| (*arg).to_owned()));
+    command
 }
 
 fn gate_result_from_output(
@@ -519,6 +539,44 @@ mod tests {
         let result = truncate_string(&long, 50);
         assert!(result.len() < 100);
         assert!(result.contains("(truncated)"));
+    }
+
+    #[test]
+    fn rch_cargo_gate_args_prefixes_cargo_with_rch_exec() {
+        assert_eq!(
+            rch_cargo_gate_args(&["clippy", "--all-targets", "--", "-D", "warnings"]),
+            vec![
+                "exec".to_owned(),
+                "--".to_owned(),
+                "cargo".to_owned(),
+                "clippy".to_owned(),
+                "--all-targets".to_owned(),
+                "--".to_owned(),
+                "-D".to_owned(),
+                "warnings".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_gate_args_stay_scoped_to_fsqlite_e2e() {
+        assert_eq!(FMT_GATE_ARGS, ["fmt", "-p", "fsqlite-e2e", "--", "--check"]);
+        assert_eq!(
+            CHECK_GATE_ARGS,
+            ["check", "-p", "fsqlite-e2e", "--all-targets"]
+        );
+        assert_eq!(
+            CLIPPY_GATE_ARGS,
+            [
+                "clippy",
+                "-p",
+                "fsqlite-e2e",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ]
+        );
     }
 
     #[test]

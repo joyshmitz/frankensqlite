@@ -223,6 +223,21 @@ fn canonical_bench_defaults_from_campaign(
     })
 }
 
+fn resolve_path_from_base(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn resolve_path_from_current_dir(path: PathBuf) -> PathBuf {
+    match std::env::current_dir() {
+        Ok(current_dir) => resolve_path_from_base(&current_dir, &path),
+        Err(_) => path,
+    }
+}
+
 fn shell_escape(raw: &str) -> String {
     if raw
         .bytes()
@@ -3834,6 +3849,9 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         return 2;
     }
 
+    golden_dir = resolve_path_from_current_dir(golden_dir);
+    working_base = resolve_path_from_current_dir(working_base);
+
     let workspace_config = WorkspaceConfig {
         golden_dir: golden_dir.clone(),
         working_base: working_base.clone(),
@@ -3851,12 +3869,12 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         return 1;
     };
 
-    let output_dir = output_dir.unwrap_or_else(|| {
+    let output_dir = resolve_path_from_current_dir(output_dir.unwrap_or_else(|| {
         PathBuf::from("artifacts")
             .join("bd-db300.4.1")
             .join(&workload)
             .join(format!("{db}_c{concurrency}_s{seed}"))
-    });
+    }));
     let replay_command = HotProfileReplayCommand {
         db: &db,
         workload: &workload,
@@ -5755,6 +5773,22 @@ mod tests {
         let options = RunModeOptions::from_flags(true, false, false);
         assert!(!options.run_integrity_check);
         assert!(!options.capture_environment_metadata);
+    }
+
+    #[test]
+    fn resolve_path_from_base_anchors_relative_paths() {
+        assert_eq!(
+            resolve_path_from_base(Path::new("/workspace"), Path::new("artifacts/out")),
+            PathBuf::from("/workspace/artifacts/out")
+        );
+    }
+
+    #[test]
+    fn resolve_path_from_base_preserves_absolute_paths() {
+        assert_eq!(
+            resolve_path_from_base(Path::new("/workspace"), Path::new("/tmp/out")),
+            PathBuf::from("/tmp/out")
+        );
     }
 
     #[test]

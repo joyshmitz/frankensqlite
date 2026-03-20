@@ -100,6 +100,10 @@ harness = false
 name = "operation_baseline_bench"
 harness = false
 
+[[bench]]
+name = "concurrent_write_persistent_bench"
+harness = false
+
 [[bin]]
 name = "comprehensive-bench"
 path = "src/bin/comprehensive_bench.rs"
