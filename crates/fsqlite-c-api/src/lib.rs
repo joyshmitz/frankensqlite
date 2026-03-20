@@ -221,9 +221,9 @@ pub struct Sqlite3Stmt {
     last_step_code: c_int,
     /// Column count from the most recent result set.
     column_count: c_int,
-    /// Cached NUL-terminated text buffers for text accessors (kept alive until
-    /// next step or finalize to satisfy C lifetime expectations, including
-    /// values that contain embedded NUL bytes).
+    /// Cached NUL-terminated buffers for coerced text/blob accessors (kept
+    /// alive until next step or finalize to satisfy C lifetime expectations,
+    /// including values that contain embedded NUL bytes).
     text_cache: Vec<Option<Vec<u8>>>,
 }
 
@@ -398,6 +398,27 @@ fn sqlite_value_to_callback_bytes(value: &SqliteValue) -> Vec<u8> {
     let mut bytes = sqlite_value_to_text_bytes(value);
     bytes.push(0);
     bytes
+}
+
+unsafe fn cache_stmt_text_bytes(stmt: *mut Sqlite3Stmt, i_col: c_int, text: Vec<u8>) -> *const u8 {
+    let s = &mut *stmt;
+    let mut cached = text;
+    cached.push(0);
+
+    if (i_col as usize) < s.text_cache.len() {
+        s.text_cache[i_col as usize] = Some(cached);
+        return s.text_cache[i_col as usize]
+            .as_ref()
+            .map_or(std::ptr::null(), Vec::as_ptr);
+    }
+
+    while s.text_cache.len() <= i_col as usize {
+        s.text_cache.push(None);
+    }
+    s.text_cache[i_col as usize] = Some(cached);
+    s.text_cache[i_col as usize]
+        .as_ref()
+        .map_or(std::ptr::null(), Vec::as_ptr)
 }
 
 fn sqlite_value_to_text_bytes(value: &SqliteValue) -> Vec<u8> {
@@ -1097,26 +1118,10 @@ pub unsafe extern "C" fn sqlite3_column_text(
 
     let text = match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Null) | None => return std::ptr::null(),
-        Some(value) => sqlite_value_to_callback_bytes(value),
+        Some(value) => sqlite_value_to_text_bytes(value),
     };
 
-    let s = &mut *stmt;
-    // Cache the NUL-terminated bytes so the pointer stays valid.
-    if (i_col as usize) < s.text_cache.len() {
-        s.text_cache[i_col as usize] = Some(text);
-        // Re-read the pointer from the cached location.
-        return s.text_cache[i_col as usize]
-            .as_ref()
-            .map_or(std::ptr::null(), |bytes| bytes.as_ptr().cast());
-    }
-    // Fallback: extend cache.
-    while s.text_cache.len() <= i_col as usize {
-        s.text_cache.push(None);
-    }
-    s.text_cache[i_col as usize] = Some(text);
-    s.text_cache[i_col as usize]
-        .as_ref()
-        .map_or(std::ptr::null(), |bytes| bytes.as_ptr().cast())
+    cache_stmt_text_bytes(stmt, i_col, text).cast()
 }
 
 /// Get a blob pointer from column `i_col`.
@@ -1151,6 +1156,9 @@ pub unsafe extern "C" fn sqlite3_column_blob(
             } else {
                 s.as_ptr().cast()
             }
+        }
+        Some(value @ (SqliteValue::Integer(_) | SqliteValue::Float(_))) => {
+            cache_stmt_text_bytes(stmt, i_col, sqlite_value_to_text_bytes(value)).cast()
         }
         _ => std::ptr::null(),
     }
@@ -1488,6 +1496,38 @@ mod tests {
             // Int → text.
             let text = sqlite3_column_text(stmt, 0);
             assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "42");
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_column_blob_coerces_numeric_values_to_text_bytes() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT 42, 3.5;").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            let int_blob = sqlite3_column_blob(stmt, 0);
+            assert!(!int_blob.is_null());
+            let int_len = sqlite3_column_bytes(stmt, 0) as usize;
+            assert_eq!(
+                std::slice::from_raw_parts(int_blob.cast::<u8>(), int_len),
+                b"42"
+            );
+
+            let float_blob = sqlite3_column_blob(stmt, 1);
+            assert!(!float_blob.is_null());
+            let float_len = sqlite3_column_bytes(stmt, 1) as usize;
+            assert_eq!(
+                std::slice::from_raw_parts(float_blob.cast::<u8>(), float_len),
+                b"3.5"
+            );
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);
