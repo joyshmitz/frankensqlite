@@ -116,13 +116,23 @@ impl VirtualTableCursor for GenerateSeriesCursor {
         if self.done {
             return Ok(());
         }
-        // Saturating add to prevent overflow
-        self.current = self.current.saturating_add(self.step);
-        self.done = if self.step > 0 {
-            self.current > self.stop
-        } else {
-            self.current < self.stop
-        };
+        // Use checked_add to detect overflow and terminate gracefully.
+        // saturating_add would cause an infinite loop when current hits i64::MAX/MIN
+        // because `current > stop` would remain false while current stays saturated.
+        match self.current.checked_add(self.step) {
+            Some(next_val) => {
+                self.current = next_val;
+                self.done = if self.step > 0 {
+                    self.current > self.stop
+                } else {
+                    self.current < self.stop
+                };
+            }
+            None => {
+                // Overflow — we've exhausted the range, terminate iteration
+                self.done = true;
+            }
+        }
         Ok(())
     }
 
@@ -1357,6 +1367,56 @@ mod tests {
         table.best_index(&mut info).unwrap();
         assert!(info.estimated_cost > 0.0);
         assert!(info.estimated_rows > 0);
+    }
+
+    #[test]
+    fn test_generate_series_overflow_terminates() {
+        // Regression test: saturating_add caused infinite loop when current hit i64::MAX.
+        // With checked_add fix, overflow should terminate iteration gracefully.
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        // Start near i64::MAX with a step that causes overflow
+        cursor.init(i64::MAX - 2, i64::MAX, 10).unwrap();
+
+        let mut values = Vec::new();
+        let mut iterations = 0;
+        while !cursor.eof() && iterations < 100 {
+            values.push(cursor.current);
+            cursor.next(&Cx::default()).unwrap();
+            iterations += 1;
+        }
+        // Should terminate within a few iterations, not loop forever
+        assert!(
+            iterations < 10,
+            "generate_series should terminate on overflow, got {} iterations",
+            iterations
+        );
+        // Should yield at least the start value
+        assert!(!values.is_empty(), "should yield at least the start value");
+        assert_eq!(values[0], i64::MAX - 2);
+    }
+
+    #[test]
+    fn test_generate_series_negative_overflow_terminates() {
+        // Same test but for underflow with negative step
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor.init(i64::MIN + 2, i64::MIN, -10).unwrap();
+
+        let mut values = Vec::new();
+        let mut iterations = 0;
+        while !cursor.eof() && iterations < 100 {
+            values.push(cursor.current);
+            cursor.next(&Cx::default()).unwrap();
+            iterations += 1;
+        }
+        assert!(
+            iterations < 10,
+            "generate_series should terminate on underflow, got {} iterations",
+            iterations
+        );
+        assert!(!values.is_empty());
+        assert_eq!(values[0], i64::MIN + 2);
     }
 
     // ── Decimal: normalization edge cases ─────────────────────────────────
