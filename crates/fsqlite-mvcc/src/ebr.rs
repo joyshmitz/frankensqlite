@@ -648,7 +648,9 @@ impl EbrRetireQueue {
         }
         drop(pending);
         self.total_retired.fetch_add(count, Ordering::Relaxed);
-        GLOBAL_EBR_METRICS.record_retirement_deferred();
+        for _ in 0..count {
+            GLOBAL_EBR_METRICS.record_retirement_deferred();
+        }
     }
 
     /// Drain all pending retirements if it's safe to recycle them.
@@ -664,21 +666,24 @@ impl EbrRetireQueue {
     ///   (typically 2 to ensure all readers have advanced)
     #[must_use]
     pub fn drain_if_safe(&self, current_epoch: u64, min_epoch_gap: u64) -> Vec<VersionIdx> {
-        // Check if there are any pending retirements by looking at the queue.
-        // We can't use oldest_retire_epoch as a sentinel since epoch 0 is valid.
-        let pending = self.pending.lock();
+        // Single lock acquisition for both emptiness check and drain.
+        // We check oldest_retire_epoch first (cheap atomic load) to avoid
+        // acquiring the mutex when the epoch gap is insufficient.
+        let oldest = self.oldest_retire_epoch.load(Ordering::Relaxed);
+
+        // Acquire mutex once for both emptiness check and potential drain.
+        let mut pending = self.pending.lock();
         if pending.is_empty() {
             return Vec::new();
         }
-        drop(pending);
 
-        let oldest = self.oldest_retire_epoch.load(Ordering::Relaxed);
+        // Now that we know there are pending items, check the epoch gap.
+        // We recheck oldest after confirming non-empty since epoch 0 is valid.
         if current_epoch.saturating_sub(oldest) < min_epoch_gap {
             // Not enough epochs have passed
             return Vec::new();
         }
 
-        let mut pending = self.pending.lock();
         let drained = std::mem::take(&mut *pending);
         drop(pending);
 
