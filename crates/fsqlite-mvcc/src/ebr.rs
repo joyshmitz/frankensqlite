@@ -1130,4 +1130,112 @@ mod tests {
             "stale warnings should have been recorded"
         );
     }
+
+    // ===================================================================
+    // D5: EbrRetireQueue tests
+    // ===================================================================
+
+    use super::{EbrRetireQueue, VersionIdx};
+
+    #[test]
+    fn ebr_retire_queue_retire_and_drain() {
+        let queue = EbrRetireQueue::new();
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.total_retired(), 0);
+        assert_eq!(queue.total_recycled(), 0);
+
+        // Retire 3 slots at epoch 0.
+        let idx1 = VersionIdx::new(0, 1, 0);
+        let idx2 = VersionIdx::new(0, 2, 0);
+        let idx3 = VersionIdx::new(0, 3, 0);
+        queue.retire(idx1, 0);
+        queue.retire(idx2, 0);
+        queue.retire(idx3, 0);
+
+        assert_eq!(queue.pending_count(), 3);
+        assert_eq!(queue.total_retired(), 3);
+
+        // Epoch 1: not enough gap (min 2).
+        let drained = queue.drain_if_safe(1, 2);
+        assert!(drained.is_empty(), "should not drain at epoch 1");
+        assert_eq!(queue.pending_count(), 3);
+
+        // Epoch 2: sufficient gap.
+        let drained = queue.drain_if_safe(2, 2);
+        assert_eq!(drained.len(), 3);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.total_recycled(), 3);
+
+        // Subsequent drain returns empty.
+        let drained = queue.drain_if_safe(10, 2);
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn ebr_retire_queue_batch_retire() {
+        let queue = EbrRetireQueue::new();
+
+        let indices: Vec<VersionIdx> = (0..10).map(|i| VersionIdx::new(0, i, 0)).collect();
+        queue.retire_batch(indices.iter().copied(), 5);
+
+        assert_eq!(queue.pending_count(), 10);
+        assert_eq!(queue.total_retired(), 10);
+
+        // Epoch 7: sufficient gap from epoch 5.
+        let drained = queue.drain_if_safe(7, 2);
+        assert_eq!(drained.len(), 10);
+        assert_eq!(queue.total_recycled(), 10);
+    }
+
+    #[test]
+    fn ebr_retire_queue_force_drain() {
+        let queue = EbrRetireQueue::new();
+
+        let idx = VersionIdx::new(1, 5, 99);
+        queue.retire(idx, 0);
+        assert_eq!(queue.pending_count(), 1);
+
+        // Force drain ignores epoch.
+        let drained = queue.force_drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0], idx);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.total_recycled(), 1);
+    }
+
+    #[test]
+    fn ebr_retire_queue_multiple_epochs() {
+        let queue = EbrRetireQueue::new();
+
+        // Retire at epoch 0.
+        queue.retire(VersionIdx::new(0, 0, 0), 0);
+        queue.retire(VersionIdx::new(0, 1, 0), 0);
+
+        // Retire more at epoch 3 (oldest epoch stays at 0).
+        queue.retire(VersionIdx::new(0, 2, 0), 3);
+
+        assert_eq!(queue.pending_count(), 3);
+
+        // Epoch 2: not enough gap from oldest (epoch 0).
+        let drained = queue.drain_if_safe(2, 2);
+        assert!(drained.is_empty());
+
+        // Epoch 5: sufficient gap from oldest (epoch 0).
+        // All pending slots are drained together.
+        let drained = queue.drain_if_safe(5, 2);
+        assert_eq!(drained.len(), 3);
+    }
+
+    #[test]
+    fn ebr_retire_queue_empty_drain() {
+        let queue = EbrRetireQueue::new();
+
+        // Draining empty queue returns empty vec.
+        let drained = queue.drain_if_safe(100, 2);
+        assert!(drained.is_empty());
+
+        // Force drain on empty also returns empty.
+        let drained = queue.force_drain();
+        assert!(drained.is_empty());
+    }
 }
