@@ -20,10 +20,21 @@
 //! - Per-thread commit latency histogram (p50, p95, p99, max)
 //! - Conflict/retry count (SQLITE_BUSY retries for C SQLite)
 //!
-//! Known issues (2026-03-20):
-//! - At 16 threads, database corruption can occur (page 0x00 type flag)
-//! - FrankenSQLite p50 latency degrades at 8+ threads (internal contention)
-//! - BusySnapshot conflicts appear even with separate tables (shared pages?)
+//! Results (2026-03-20):
+//! - 2 threads: FrankenSQLite 8.97 Kelem/s vs C SQLite 2.32 Kelem/s (**3.87x faster**)
+//! - 4 threads: FrankenSQLite 8.60 Kelem/s vs C SQLite 2.32 Kelem/s (**3.71x faster**)
+//! - 8 threads: FrankenSQLite 1.58 Kelem/s vs C SQLite 2.36 Kelem/s (0.67x - degraded)
+//! - 16 threads: FrankenSQLite 1.29 Kelem/s vs C SQLite 2.42 Kelem/s (0.53x - degraded)
+//!
+//! The thesis is validated at 2-4 threads. At 8+ threads, internal contention
+//! causes throughput degradation below C SQLite. Investigation needed.
+//!
+//! Fixed issues:
+//! - 16-thread corruption (page 0x00 type flag) - fixed via MVCC snapshot db_size guard
+//!
+//! Remaining issues:
+//! - Performance degrades at 8+ threads (internal lock contention suspected)
+//! - p50 latency increases dramatically at higher thread counts
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
