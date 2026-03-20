@@ -23,7 +23,7 @@ use fsqlite_types::{
 
 use crate::cache_aligned::CacheAligned;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
-use crate::ebr::VersionGuardRegistry;
+use crate::ebr::{EbrRetireQueue, VersionGuardRegistry};
 use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
 use crate::observability::record_cas_attempt;
 
@@ -526,6 +526,18 @@ pub struct VersionStore {
     visibility_ranges: RwLock<HashMap<VersionIdx, VersionVisibilityRange>>,
     page_size: PageSize,
     guard_registry: Arc<VersionGuardRegistry>,
+    /// Queue of retired slots pending recycling after epoch advancement (D5: EBR).
+    ///
+    /// When `gc_tick` prunes versions, it uses `take_for_retirement()` which
+    /// extracts the version without adding to free_list. The slot indices are
+    /// added here. After epoch advancement, `try_recycle_retired_slots()` drains
+    /// this queue and batch-adds slots back to the arena free_list.
+    retire_queue: EbrRetireQueue,
+    /// Monotonic epoch counter for EBR slot recycling.
+    ///
+    /// Incremented each gc_tick. Used by `retire_queue` to determine when it's
+    /// safe to recycle slots (after sufficient epoch advancement).
+    gc_epoch: AtomicU64,
 }
 
 impl VersionStore {
@@ -547,6 +559,8 @@ impl VersionStore {
             visibility_ranges: RwLock::new(HashMap::new()),
             page_size,
             guard_registry,
+            retire_queue: EbrRetireQueue::new(),
+            gc_epoch: AtomicU64::new(0),
         }
     }
 
@@ -893,6 +907,15 @@ impl VersionStore {
     /// This method acquires write locks on the arena and chain heads, then delegates
     /// to [`crate::gc::gc_tick`] for the actual pruning work.
     ///
+    /// # EBR Two-Phase Retirement (D5)
+    ///
+    /// The pruning phase uses `take_for_retirement()` which extracts versions from
+    /// the arena WITHOUT adding slots back to the free_list. This reduces the time
+    /// the arena write lock is held. The pruned slot indices are added to an
+    /// `EbrRetireQueue`. After sufficient epoch advancement (min 2 gc_ticks to
+    /// ensure all readers have advanced), `try_recycle_retired_slots()` drains
+    /// the queue and batch-adds slots back to the free_list.
+    ///
     /// # Arguments
     ///
     /// * `todo` — The per-process GC todo queue with pages to prune.
@@ -904,6 +927,15 @@ impl VersionStore {
     /// A [`GcTickResult`] summarizing what was pruned and whether budgets were exhausted.
     #[allow(clippy::significant_drop_tightening)]
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
+        // Increment epoch BEFORE pruning so retire_batch records the pre-prune epoch.
+        let current_epoch = self.gc_epoch.fetch_add(1, Ordering::Relaxed);
+
+        // Try to recycle slots from previous epochs (at least 2 epochs must pass).
+        // This is done BEFORE the new prune to reduce lock contention.
+        self.try_recycle_retired_slots(current_epoch);
+
+        // Phase 1: Prune chains (arena write lock held).
+        // Uses take_for_retirement() which does NOT add slots to free_list.
         let mut arena = self.arena.write();
         let result = gc_tick_with_registry(
             todo,
@@ -913,11 +945,84 @@ impl VersionStore {
             self.guard_registry(),
         );
         drop(arena);
+
+        // Phase 2: Clean up visibility ranges (separate lock).
         let mut ranges = self.visibility_ranges.write();
         for idx in &result.pruned_indices {
             ranges.remove(idx);
         }
+        drop(ranges);
+
+        // Phase 3: Queue pruned slots for deferred recycling (EBR).
+        // These will be recycled after epoch advances by at least 2.
+        if !result.pruned_indices.is_empty() {
+            self.retire_queue
+                .retire_batch(result.pruned_indices.iter().copied(), current_epoch);
+        }
+
         result
+    }
+
+    /// Try to recycle retired slots from previous epochs.
+    ///
+    /// Slots retired at epoch E are safe to recycle when current_epoch >= E + 2,
+    /// ensuring all readers that may have observed the slots have advanced.
+    ///
+    /// This method is called automatically by `gc_tick()`, but can also be called
+    /// manually to reclaim memory without running a full GC pass.
+    ///
+    /// # Returns
+    ///
+    /// Number of slots recycled.
+    pub fn try_recycle_retired_slots(&self, current_epoch: u64) -> usize {
+        // Minimum epoch gap of 2 ensures all readers have advanced past the
+        // retirement point (standard EBR grace period).
+        const MIN_EPOCH_GAP: u64 = 2;
+
+        let drained = self
+            .retire_queue
+            .drain_if_safe(current_epoch, MIN_EPOCH_GAP);
+        if drained.is_empty() {
+            return 0;
+        }
+
+        let count = drained.len();
+        let mut arena = self.arena.write();
+        arena.recycle_slots(drained);
+        drop(arena);
+
+        tracing::debug!(
+            target: "fsqlite_mvcc::gc",
+            recycled = count,
+            current_epoch,
+            "recycled retired arena slots"
+        );
+
+        count
+    }
+
+    /// Force-recycle all retired slots regardless of epoch.
+    ///
+    /// Use only during shutdown or when epoch safety is guaranteed externally
+    /// (e.g., no active readers).
+    pub fn force_recycle_all_retired_slots(&self) -> usize {
+        let drained = self.retire_queue.force_drain();
+        if drained.is_empty() {
+            return 0;
+        }
+
+        let count = drained.len();
+        let mut arena = self.arena.write();
+        arena.recycle_slots(drained);
+        drop(arena);
+
+        count
+    }
+
+    /// Number of slots currently pending recycling.
+    #[must_use]
+    pub fn pending_recycle_count(&self) -> usize {
+        self.retire_queue.pending_count()
     }
 
     /// Compute the average version chain length for GC pressure estimation.

@@ -308,14 +308,19 @@ pub fn prune_page_chain_with_registry(
         version.prev = None;
     }
 
-    // Free everything from tail_idx onward, collecting pruned keys for ARC.
+    // Retire everything from tail_idx onward, collecting pruned keys for ARC.
+    // Uses take_for_retirement() which extracts the version and bumps the slot
+    // generation, but does NOT add to the free_list yet. The pruned_indices are
+    // returned so the caller can add them to an EbrRetireQueue. After epoch
+    // advancement (all readers have unpinned), recycle_slots() batch-adds them
+    // back to the free_list. This reduces write-lock contention on the arena.
     let retire_guard = VersionGuard::pin(Arc::clone(guard_registry));
     let mut freed = 0_u32;
     let mut pruned_keys = Vec::new();
     let mut pruned_indices = Vec::new();
     let mut current = tail_idx;
     while let Some(idx) = current {
-        let retired = arena.take(idx);
+        let retired = arena.take_for_retirement(idx);
         let next = retired.prev.map(ptr_to_idx);
         pruned_keys.push((pgno, retired.commit_seq));
         pruned_indices.push(idx);

@@ -562,6 +562,177 @@ impl Drop for VersionGuardTicket {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EbrRetireQueue (D5: Epoch-Based Reclamation for version chain GC)
+// ---------------------------------------------------------------------------
+
+use crate::core_types::VersionIdx;
+
+/// Queue of version slots pending reclamation after epoch advancement.
+///
+/// When GC retires a version via `VersionArena::take_for_retirement()`, the
+/// slot index is added to this queue. After sufficient epoch advancement
+/// (all readers have unpinned since the retirement), the indices are passed
+/// to `VersionArena::recycle_slots()` to make them available for reallocation.
+///
+/// # Thread Safety
+///
+/// The queue uses internal locking for thread-safe append and drain operations.
+/// This is acceptable because:
+/// 1. Append is O(1) and the lock is held very briefly
+/// 2. Drain happens infrequently (after epoch advancement)
+/// 3. The contention is much lower than holding the arena write lock during
+///    the entire GC pass
+///
+/// # Memory Bounds
+///
+/// The queue grows proportionally to:
+/// - Thread count (more concurrent GC = more pending retirements)
+/// - Epoch interval (longer intervals = more accumulation before drain)
+///
+/// Under normal operation with ~1ms epochs and 8-16 threads, the queue should
+/// contain at most a few thousand entries.
+#[derive(Debug)]
+pub struct EbrRetireQueue {
+    /// Pending slot indices to recycle.
+    pending: Mutex<Vec<VersionIdx>>,
+    /// Epoch when the oldest pending retirement was added.
+    oldest_retire_epoch: AtomicU64,
+    /// Counter for total slots retired through this queue.
+    total_retired: AtomicU64,
+    /// Counter for total slots recycled (drained and returned to arena).
+    total_recycled: AtomicU64,
+}
+
+impl EbrRetireQueue {
+    /// Create an empty retire queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+            oldest_retire_epoch: AtomicU64::new(0),
+            total_retired: AtomicU64::new(0),
+            total_recycled: AtomicU64::new(0),
+        }
+    }
+
+    /// Add a slot index to the retire queue.
+    ///
+    /// Call this after `VersionArena::take_for_retirement()` to track the slot
+    /// for later recycling. The slot will be recycled when `drain_if_safe()`
+    /// is called after epoch advancement.
+    pub fn retire(&self, idx: VersionIdx, current_epoch: u64) {
+        let mut pending = self.pending.lock();
+        if pending.is_empty() {
+            self.oldest_retire_epoch
+                .store(current_epoch, Ordering::Relaxed);
+        }
+        pending.push(idx);
+        drop(pending);
+        self.total_retired.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_EBR_METRICS.record_retirement_deferred();
+    }
+
+    /// Batch-retire multiple slot indices.
+    pub fn retire_batch(&self, indices: impl IntoIterator<Item = VersionIdx>, current_epoch: u64) {
+        let mut pending = self.pending.lock();
+        let was_empty = pending.is_empty();
+        let mut count = 0_u64;
+        for idx in indices {
+            pending.push(idx);
+            count += 1;
+        }
+        if was_empty && count > 0 {
+            self.oldest_retire_epoch
+                .store(current_epoch, Ordering::Relaxed);
+        }
+        drop(pending);
+        self.total_retired.fetch_add(count, Ordering::Relaxed);
+        GLOBAL_EBR_METRICS.record_retirement_deferred();
+    }
+
+    /// Drain all pending retirements if it's safe to recycle them.
+    ///
+    /// Returns the drained indices if the current epoch has advanced past the
+    /// oldest retirement epoch (indicating all readers have moved on).
+    /// Returns an empty Vec if not safe yet or if the queue is empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_epoch` - The current global epoch (from `crossbeam_epoch`)
+    /// * `min_epoch_gap` - Minimum epochs that must pass before recycling
+    ///   (typically 2 to ensure all readers have advanced)
+    #[must_use]
+    pub fn drain_if_safe(&self, current_epoch: u64, min_epoch_gap: u64) -> Vec<VersionIdx> {
+        let oldest = self.oldest_retire_epoch.load(Ordering::Relaxed);
+        if oldest == 0 {
+            // No pending retirements
+            return Vec::new();
+        }
+
+        if current_epoch.saturating_sub(oldest) < min_epoch_gap {
+            // Not enough epochs have passed
+            return Vec::new();
+        }
+
+        let mut pending = self.pending.lock();
+        let drained = std::mem::take(&mut *pending);
+        drop(pending);
+
+        let count = drained.len() as u64;
+        if count > 0 {
+            self.oldest_retire_epoch.store(0, Ordering::Relaxed);
+            self.total_recycled.fetch_add(count, Ordering::Relaxed);
+            GLOBAL_EBR_METRICS.record_gc_freed(count);
+        }
+
+        drained
+    }
+
+    /// Force-drain all pending retirements regardless of epoch.
+    ///
+    /// Use only during shutdown or when epoch safety is guaranteed externally.
+    #[must_use]
+    pub fn force_drain(&self) -> Vec<VersionIdx> {
+        let mut pending = self.pending.lock();
+        let drained = std::mem::take(&mut *pending);
+        drop(pending);
+
+        let count = drained.len() as u64;
+        if count > 0 {
+            self.oldest_retire_epoch.store(0, Ordering::Relaxed);
+            self.total_recycled.fetch_add(count, Ordering::Relaxed);
+            GLOBAL_EBR_METRICS.record_gc_freed(count);
+        }
+
+        drained
+    }
+
+    /// Number of slots currently pending recycle.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().len()
+    }
+
+    /// Total slots retired through this queue (lifetime counter).
+    #[must_use]
+    pub fn total_retired(&self) -> u64 {
+        self.total_retired.load(Ordering::Relaxed)
+    }
+
+    /// Total slots recycled through this queue (lifetime counter).
+    #[must_use]
+    pub fn total_recycled(&self) -> u64 {
+        self.total_recycled.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for EbrRetireQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

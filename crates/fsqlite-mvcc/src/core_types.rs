@@ -94,6 +94,18 @@ impl ArenaSlot {
 ///
 /// Includes generation counting to detect use-after-free/ABA bugs during
 /// concurrent reader traversal.
+///
+/// # Epoch-Based Reclamation (D5)
+///
+/// For reduced GC contention, the arena supports a two-phase retirement:
+/// 1. `take_for_retirement()` - extracts version and bumps generation, but
+///    does NOT add to free_list. The slot is marked empty but not yet reusable.
+/// 2. `recycle_slots()` - batch-adds previously retired slots to free_list.
+///    Called after epoch advancement when all readers have moved past the
+///    retirement point.
+///
+/// This allows GC to hold the write lock only briefly for extraction, while
+/// the free_list update is deferred and batched.
 pub struct VersionArena {
     chunks: Vec<Vec<ArenaSlot>>,
     free_list: Vec<VersionIdx>,
@@ -174,6 +186,88 @@ impl VersionArena {
     /// Asserts that the slot is currently occupied (catches double-free).
     pub fn free(&mut self, idx: VersionIdx) {
         drop(self.take(idx));
+    }
+
+    // -------------------------------------------------------------------------
+    // Epoch-Based Reclamation (EBR) methods for D5 contention reduction
+    // -------------------------------------------------------------------------
+
+    /// Extract a version for deferred retirement (EBR phase 1).
+    ///
+    /// Unlike [`take`], this does NOT add the slot to the free list. The slot
+    /// is marked empty (version extracted, generation bumped) but remains
+    /// unavailable for allocation until [`recycle_slots`] is called.
+    ///
+    /// Use this when retiring versions via EBR: call `take_for_retirement`,
+    /// defer the version drop via `crossbeam_epoch::Guard::defer()`, collect
+    /// the idx in an `EbrRetireQueue`, then batch-call `recycle_slots` after
+    /// epoch advancement.
+    ///
+    /// # Panics
+    ///
+    /// Asserts that the slot is currently occupied and generation matches.
+    pub fn take_for_retirement(&mut self, idx: VersionIdx) -> PageVersion {
+        let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
+        assert!(
+            slot.generation == idx.generation,
+            "VersionArena::take_for_retirement: generation mismatch for {idx:?} (slot generation {})",
+            slot.generation
+        );
+        let version = slot
+            .version
+            .take()
+            .unwrap_or_else(|| panic!("VersionArena::take_for_retirement: double-free of {idx:?}"));
+
+        // Bump generation to invalidate stale pointers, but do NOT add to free_list.
+        let mut next_gen = slot.generation.wrapping_add(1);
+        if next_gen == u32::MAX {
+            next_gen = 0;
+        }
+        slot.generation = next_gen;
+
+        // Note: free_list.push() is intentionally skipped — the slot will be
+        // recycled via recycle_slots() after epoch advancement.
+        version
+    }
+
+    /// Batch-recycle slots that were previously retired via EBR (EBR phase 2).
+    ///
+    /// This adds the given indices to the free list, making them available for
+    /// future allocations. Call this after epoch advancement confirms that all
+    /// readers have moved past the point where these versions were visible.
+    ///
+    /// # Safety Invariant
+    ///
+    /// The caller MUST ensure that:
+    /// 1. Each idx was previously passed to `take_for_retirement`
+    /// 2. Sufficient epoch advancement has occurred (all concurrent readers
+    ///    have unpinned since the retirement)
+    ///
+    /// Violating this invariant can cause use-after-free if a reader still
+    /// holds a stale VersionIdx.
+    pub fn recycle_slots(&mut self, indices: impl IntoIterator<Item = VersionIdx>) {
+        // Note: We don't verify generation here because take_for_retirement
+        // already bumped it. The idx stored in the retire queue has the OLD
+        // generation, but that's fine — we just need the (chunk, offset) to
+        // identify the slot.
+        for idx in indices {
+            // Create a fresh idx with the CURRENT generation (post-retirement bump).
+            // This is what alloc() will return when this slot is reused.
+            let slot = &self.chunks[idx.chunk as usize][idx.offset as usize];
+            let recycled_idx = VersionIdx::new(idx.chunk, idx.offset, slot.generation);
+            self.free_list.push(recycled_idx);
+        }
+    }
+
+    /// Number of slots pending recycle (for diagnostics).
+    ///
+    /// Note: This returns 0 because the arena doesn't track pending retirements
+    /// internally — that's the responsibility of the `EbrRetireQueue`. This
+    /// method exists for API symmetry with `free_count`.
+    #[must_use]
+    pub const fn pending_recycle_count(&self) -> usize {
+        // The arena doesn't track this — see EbrRetireQueue
+        0
     }
 
     /// Look up a version by index.
