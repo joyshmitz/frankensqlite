@@ -834,7 +834,12 @@ mod tests {
 
     #[test]
     fn test_prune_frees_arena_slots() {
-        // bead_id=bd-zcdn: Freed versions return to the arena free list.
+        // bead_id=bd-zcdn: Freed versions are retired via EBR two-phase reclamation.
+        //
+        // D5 change: prune_page_chain now uses take_for_retirement() which extracts
+        // versions WITHOUT adding to free_list. The pruned_indices are returned so
+        // the caller can add them to an EbrRetireQueue. After epoch advancement,
+        // recycle_slots() batch-adds them back to the free_list.
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(10).unwrap();
 
@@ -843,15 +848,33 @@ mod tests {
 
         let free_before = arena.free_count();
 
-        // Horizon at 5: versions 1-4 freed (4 slots).
+        // Horizon at 5: versions 1-4 retired (4 slots).
         let result = prune_page_chain(pgno, CommitSeq::new(5), &mut arena, &chain_heads);
         assert_eq!(result.freed, 4);
 
-        let free_after = arena.free_count();
+        // D5: Slots are NOT immediately on free_list after take_for_retirement.
+        // They're pending in pruned_indices for deferred recycling.
+        let free_after_prune = arena.free_count();
         assert_eq!(
-            free_after - free_before,
+            free_after_prune, free_before,
+            "bead_id={BEAD_ZCDN} slots should NOT be on free_list immediately (D5 EBR)"
+        );
+
+        // Verify pruned_indices contains the retired slots.
+        assert_eq!(
+            result.pruned_indices.len(),
             4,
-            "bead_id={BEAD_ZCDN} freed versions should be on the arena free list"
+            "bead_id={BEAD_ZCDN} pruned_indices should contain 4 retired slots"
+        );
+
+        // After recycle_slots (simulating epoch advancement), slots return to free_list.
+        arena.recycle_slots(result.pruned_indices);
+
+        let free_after_recycle = arena.free_count();
+        assert_eq!(
+            free_after_recycle - free_before,
+            4,
+            "bead_id={BEAD_ZCDN} after recycle_slots, 4 slots should be on free_list"
         );
     }
 
