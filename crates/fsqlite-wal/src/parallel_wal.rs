@@ -8,7 +8,8 @@
 //!
 //! 1. Each writer thread appends WAL frames to its own buffer with NO global lock.
 //! 2. A background epoch ticker advances the global epoch every ~10ms.
-//! 3. On epoch advance, all thread buffers are sealed and flushed.
+//! 3. On epoch advance, slot-local buffer locks make sealing wait for any
+//!    in-flight batch append to complete, then the previous epoch is flushed.
 //! 4. Commit durability: transaction waits until its epoch is durable.
 //!
 //! # Key Benefits
@@ -17,8 +18,9 @@
 //! - WAL writes are now embarrassingly parallel.
 //! - Epoch mechanism provides natural group commit semantics (Silo/Aether pattern).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::hash::BuildHasher;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -167,7 +169,7 @@ pub fn segment_path(db_path: &Path, epoch: u64) -> PathBuf {
 
 /// List all segment files for a database, sorted by epoch.
 pub fn list_segments(db_path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
-    let dir = db_path.parent().unwrap_or(Path::new("."));
+    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let db_name = db_path
         .file_name()
         .map_or_else(|| "db".to_string(), |n| n.to_string_lossy().to_string());
@@ -336,8 +338,10 @@ pub fn recover_segments(
                 // Verify header epoch matches file name epoch
                 if header.epoch != *epoch {
                     eprintln!(
-                        "warning: segment {path:?} has mismatched epoch: header={}, filename={}",
-                        header.epoch, epoch
+                        "warning: segment {} has mismatched epoch: header={}, filename={}",
+                        path.display(),
+                        header.epoch,
+                        epoch
                     );
                 }
 
@@ -345,7 +349,7 @@ pub fn recover_segments(
             }
             Err(e) => {
                 if options.skip_corrupt {
-                    eprintln!("warning: skipping corrupt segment {path:?}: {e}");
+                    eprintln!("warning: skipping corrupt segment {}: {e}", path.display());
                     result.partial_segments.push(path.clone());
                 } else {
                     return Err(e);
@@ -362,7 +366,7 @@ pub fn recover_segments(
                 continue;
             }
             if let Err(e) = delete_segment(path) {
-                eprintln!("warning: failed to delete segment {path:?}: {e}");
+                eprintln!("warning: failed to delete segment {}: {e}", path.display());
             }
         }
     }
@@ -380,7 +384,7 @@ pub fn recover_segments(
 /// current contents of each page. Records are applied in epoch order.
 pub fn recover_and_apply_segments(
     db_path: &Path,
-    page_contents: &mut HashMap<u32, Vec<u8>>,
+    page_contents: &mut HashMap<u32, Vec<u8>, impl BuildHasher>,
     options: SegmentRecoveryOptions,
 ) -> io::Result<SegmentRecoveryResult> {
     let (result, records) = recover_segments(db_path, options)?;
@@ -572,6 +576,8 @@ pub struct ParallelWalCoordinator {
     config: ParallelWalConfig,
     /// Whether the coordinator is running (Arc for ticker thread sharing).
     running: Arc<AtomicBool>,
+    /// Epoch batches drained from memory but not yet durably written.
+    pending_batches: Arc<Mutex<VecDeque<EpochFlushBatch>>>,
     /// Epoch ticker handle (spawned on start).
     ticker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -607,6 +613,7 @@ impl ParallelWalCoordinator {
             db_path: db_path.to_path_buf(),
             config,
             running: Arc::new(AtomicBool::new(false)),
+            pending_batches: Arc::new(Mutex::new(VecDeque::new())),
             ticker_handle: Mutex::new(None),
         }
     }
@@ -638,13 +645,10 @@ impl ParallelWalCoordinator {
     pub fn submit_batch(&self, batch: ParallelWalBatch) -> Result<u64, String> {
         let slot = self.thread_slot();
         let epoch = self.inner.current_epoch();
-
-        // Observe the current epoch to establish our fence point.
-        self.inner.observe_epoch(slot)?;
-
-        // Convert each frame to a WalRecord and append to the buffer.
-        for frame in batch.frames {
-            let _record = WalRecord {
+        let records = batch
+            .frames
+            .into_iter()
+            .map(|frame| WalRecord {
                 txn_token: batch.txn_token,
                 epoch,
                 page_id: frame.page_number,
@@ -652,16 +656,12 @@ impl ParallelWalCoordinator {
                 end_seq: Some(batch.commit_seq),
                 before_image: Vec::new(), // WAL frames don't have before images
                 after_image: frame.page_data,
-            };
+            })
+            .collect();
 
-            // TODO: Actually append the record to the buffer. Currently the
-            // append_to_core method creates its own record internally, which
-            // doesn't match our WAL frame format. This needs to be refactored
-            // to accept our WalRecord directly.
-            let outcome = self.inner.append_to_core(slot, batch.commit_seq.get(), 0)?;
-            if matches!(outcome, AppendOutcome::Blocked) {
-                return Err("buffer blocked, fallback to serialized path".to_string());
-            }
+        let outcome = self.inner.append_records_to_core(slot, records)?;
+        if matches!(outcome, AppendOutcome::Blocked) {
+            return Err("buffer blocked, fallback to serialized path".to_string());
         }
 
         Ok(epoch)
@@ -694,7 +694,7 @@ impl ParallelWalCoordinator {
         let running = Arc::clone(&self.running);
         let inner = Arc::clone(&self.inner);
         let db_path = self.db_path.clone();
-        let slot_count = self.config.slot_count;
+        let pending_batches = Arc::clone(&self.pending_batches);
         let interval = Duration::from_millis(self.config.epoch_interval_ms);
         let flush_timeout = Duration::from_millis(self.config.epoch_interval_ms * 10);
 
@@ -705,7 +705,7 @@ impl ParallelWalCoordinator {
                     running,
                     inner,
                     db_path,
-                    slot_count,
+                    pending_batches,
                     interval,
                     flush_timeout,
                     fsync_policy,
@@ -750,19 +750,73 @@ impl ParallelWalCoordinator {
     ///
     /// This is used for testing or when no background ticker is running.
     pub fn advance_and_flush(&self, timeout: Duration) -> Result<u64, String> {
-        // Get list of active slots (simplified: assume all slots are active).
-        let active_slots: Vec<usize> = (0..self.config.slot_count).collect();
+        flush_pending_batches(
+            &self.pending_batches,
+            &self.inner,
+            &self.db_path,
+            FsyncPolicy::default(),
+        )?;
 
-        // Advance epoch and wait for all threads to observe.
-        let new_epoch = self.inner.advance_epoch_and_wait(&active_slots, timeout)?;
+        // Slot-level buffer locks serialize a batch append against sealing, so
+        // the top-level coordinator can advance without waiting on inactive slots.
+        let new_epoch = self.inner.advance_epoch_and_wait(&[], timeout)?;
 
-        // Flush the previous epoch's frames.
         let prev_epoch = new_epoch.saturating_sub(1);
-        let _batch = self.inner.flush_epoch(prev_epoch)?;
-
-        // In a full implementation, we would write the batch to segment files here.
+        let batch = self.inner.flush_epoch(prev_epoch)?;
+        if batch.records.is_empty() {
+            self.inner.mark_epoch_durable(prev_epoch);
+        } else {
+            enqueue_flush_batch(&self.pending_batches, batch);
+            flush_pending_batches(
+                &self.pending_batches,
+                &self.inner,
+                &self.db_path,
+                FsyncPolicy::default(),
+            )?;
+        }
 
         Ok(new_epoch)
+    }
+}
+
+fn enqueue_flush_batch(
+    pending_batches: &Arc<Mutex<VecDeque<EpochFlushBatch>>>,
+    batch: EpochFlushBatch,
+) {
+    let mut pending = pending_batches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.push_back(batch);
+}
+
+fn flush_pending_batches(
+    pending_batches: &Arc<Mutex<VecDeque<EpochFlushBatch>>>,
+    inner: &EpochOrderCoordinator,
+    db_path: &Path,
+    fsync_policy: FsyncPolicy,
+) -> Result<(), String> {
+    loop {
+        let next_batch = {
+            let mut pending = pending_batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.pop_front()
+        };
+
+        let Some(batch) = next_batch else {
+            return Ok(());
+        };
+
+        if let Err(error) = write_segment(db_path, &batch, fsync_policy) {
+            let epoch = batch.epoch;
+            let mut pending = pending_batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.push_front(batch);
+            return Err(format!("write_segment({epoch}) failed: {error}"));
+        }
+
+        inner.mark_epoch_durable(batch.epoch);
     }
 }
 
@@ -772,11 +826,11 @@ impl ParallelWalCoordinator {
 
 /// Background thread loop that advances epochs and flushes WAL buffers.
 ///
-/// This implements the Silo/Aether epoch-based group commit pattern:
+/// This implements an epoch-based group commit pattern:
 /// 1. Sleep for the configured interval (default 10ms).
 /// 2. Advance the global epoch.
-/// 3. Wait for all threads to observe the new epoch.
-/// 4. Flush the previous epoch's sealed buffers to disk.
+/// 3. Flush any prior pending segment writes.
+/// 4. Seal and drain the previous epoch's buffers.
 /// 5. Write the batch to a segment file.
 /// 6. Mark the epoch as durable.
 ///
@@ -785,15 +839,11 @@ fn epoch_ticker_loop(
     running: Arc<AtomicBool>,
     inner: Arc<EpochOrderCoordinator>,
     db_path: PathBuf,
-    slot_count: usize,
+    pending_batches: Arc<Mutex<VecDeque<EpochFlushBatch>>>,
     interval: Duration,
     flush_timeout: Duration,
     fsync_policy: FsyncPolicy,
 ) {
-    // Generate the list of active slots (all slots for now).
-    // TODO: Track actually-active slots to avoid waiting for unused slots.
-    let active_slots: Vec<usize> = (0..slot_count).collect();
-
     while running.load(Ordering::Acquire) {
         // Sleep for the epoch interval.
         std::thread::sleep(interval);
@@ -803,42 +853,40 @@ fn epoch_ticker_loop(
             break;
         }
 
-        // Advance the epoch and wait for all threads to observe.
-        match inner.advance_epoch_and_wait(&active_slots, flush_timeout) {
+        if let Err(error) = flush_pending_batches(&pending_batches, &inner, &db_path, fsync_policy)
+        {
+            eprintln!("epoch ticker: {error}");
+            continue;
+        }
+
+        // Slot-level buffer locking makes batch submission atomic relative to sealing,
+        // so we can advance without stalling on globally inactive slots.
+        match inner.advance_epoch_and_wait(&[], flush_timeout) {
             Ok(new_epoch) => {
-                // Flush the previous epoch's frames.
                 let prev_epoch = new_epoch.saturating_sub(1);
                 match inner.flush_epoch(prev_epoch) {
                     Ok(batch) => {
-                        // Write the batch to a segment file if there are records.
-                        if !batch.records.is_empty() {
-                            match write_segment(&db_path, &batch, fsync_policy) {
-                                Ok(bytes) => {
-                                    // Successfully wrote segment file.
-                                    // TODO: Update durable_epoch in inner coordinator.
-                                    let _ = bytes; // suppress unused warning for now
-                                }
-                                Err(e) => {
-                                    // Log the error but continue - segment write failures
-                                    // are recoverable by retrying on the next tick.
-                                    eprintln!(
-                                        "epoch ticker: write_segment({prev_epoch}) failed: {e}"
-                                    );
-                                }
+                        if batch.records.is_empty() {
+                            inner.mark_epoch_durable(prev_epoch);
+                        } else {
+                            enqueue_flush_batch(&pending_batches, batch);
+                            if let Err(error) = flush_pending_batches(
+                                &pending_batches,
+                                &inner,
+                                &db_path,
+                                fsync_policy,
+                            ) {
+                                eprintln!("epoch ticker: {error}");
                             }
                         }
                     }
-                    Err(e) => {
-                        // Log the error but continue - epoch flush failures are recoverable
-                        // by retrying on the next tick.
-                        eprintln!("epoch ticker: flush_epoch({prev_epoch}) failed: {e}");
+                    Err(error) => {
+                        eprintln!("epoch ticker: flush_epoch({prev_epoch}) failed: {error}");
                     }
                 }
             }
-            Err(e) => {
-                // Log the error but continue - epoch advance failures are typically
-                // due to threads not observing in time, which is transient.
-                eprintln!("epoch ticker: advance_epoch_and_wait failed: {e}");
+            Err(error) => {
+                eprintln!("epoch ticker: advance_epoch_and_wait failed: {error}");
             }
         }
     }
@@ -892,6 +940,28 @@ pub fn remove_parallel_wal_coordinator(db_path: &Path) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn sample_batch(txn_id: u64, commit_seq: u64) -> ParallelWalBatch {
+        ParallelWalBatch::new(
+            TxnToken::new(
+                fsqlite_types::TxnId::new(txn_id).expect("txn id should be non-zero"),
+                fsqlite_types::TxnEpoch::new(0),
+            ),
+            CommitSeq::new(commit_seq),
+            vec![
+                ParallelWalFrame {
+                    page_number: PageNumber::new(7).expect("page should be non-zero"),
+                    page_data: vec![0xAA; 16],
+                    db_size_if_commit: 0,
+                },
+                ParallelWalFrame {
+                    page_number: PageNumber::new(9).expect("page should be non-zero"),
+                    page_data: vec![0xBB; 24],
+                    db_size_if_commit: 12,
+                },
+            ],
+        )
+    }
 
     #[test]
     fn test_parallel_wal_coordinator_creation() {
@@ -985,11 +1055,78 @@ mod tests {
 
         let final_epoch = coordinator.current_epoch();
 
-        // Epoch should have advanced at least once.
-        // Note: Due to timing variations, we allow for some slack.
         assert!(
-            final_epoch >= initial_epoch,
-            "epoch should not decrease: initial={initial_epoch}, final={final_epoch}"
+            final_epoch > initial_epoch,
+            "epoch ticker should advance without stalling on inactive slots: initial={initial_epoch}, final={final_epoch}"
+        );
+    }
+
+    #[test]
+    fn test_submit_batch_persists_actual_frame_payloads() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("submit_batch.db");
+        let config = ParallelWalConfig {
+            slot_count: 1,
+            ..ParallelWalConfig::default()
+        };
+        let coordinator = ParallelWalCoordinator::new(&db_path, config);
+
+        let epoch = coordinator
+            .submit_batch(sample_batch(11, 77))
+            .expect("submit should succeed");
+        assert_eq!(epoch, 0);
+
+        coordinator
+            .advance_and_flush(Duration::from_millis(50))
+            .expect("flush should succeed");
+        assert_eq!(coordinator.durable_epoch(), Some(0));
+
+        let seg_path = segment_path(&db_path, 0);
+        let (_, records) = read_segment(&seg_path).expect("segment should read back");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].txn_token.id.get(), 11);
+        assert_eq!(records[0].begin_seq, CommitSeq::new(77));
+        assert_eq!(records[0].page_id.get(), 7);
+        assert_eq!(records[0].after_image, vec![0xAA; 16]);
+        assert_eq!(records[1].page_id.get(), 9);
+        assert_eq!(records[1].after_image, vec![0xBB; 24]);
+    }
+
+    #[test]
+    fn test_advance_and_flush_does_not_mark_epoch_durable_on_segment_write_failure() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("missing").join("write_failure.db");
+        let config = ParallelWalConfig {
+            slot_count: 1,
+            ..ParallelWalConfig::default()
+        };
+        let coordinator = ParallelWalCoordinator::new(&db_path, config);
+
+        coordinator
+            .submit_batch(sample_batch(21, 99))
+            .expect("submit should succeed");
+
+        let error = coordinator
+            .advance_and_flush(Duration::from_millis(50))
+            .expect_err("flush should fail when the segment directory is missing");
+        assert!(
+            error.contains("write_segment(0) failed"),
+            "error should preserve the failing epoch: {error}"
+        );
+        assert_eq!(
+            coordinator.durable_epoch(),
+            None,
+            "failed segment writes must not be reported as durable"
+        );
+        assert!(
+            coordinator
+                .wait_for_epoch_durable(0, Duration::from_millis(10))
+                .is_err(),
+            "durability wait must keep blocking after a failed segment write"
         );
     }
 

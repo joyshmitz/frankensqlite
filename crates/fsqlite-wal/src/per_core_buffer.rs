@@ -188,6 +188,43 @@ impl PerCoreWalBuffer {
         }
     }
 
+    pub fn append_batch(&mut self, records: Vec<WalRecord>) -> AppendOutcome {
+        if self.active.state != BufferState::Writable {
+            return AppendOutcome::Blocked;
+        }
+
+        let mut total_needed = 0usize;
+        for record in &records {
+            let needed = record.encoded_len();
+            if needed > self.config.capacity_bytes {
+                self.fallback_latched = true;
+                return AppendOutcome::Blocked;
+            }
+            total_needed = total_needed.saturating_add(needed);
+        }
+
+        if self.config.overflow_policy == OverflowPolicy::BlockWriter
+            && self.active.bytes_used.saturating_add(total_needed) > self.config.capacity_bytes
+        {
+            return AppendOutcome::Blocked;
+        }
+
+        let mut queued_overflow = false;
+        for record in records {
+            match self.append(record) {
+                AppendOutcome::Appended => {}
+                AppendOutcome::QueuedOverflow => queued_overflow = true,
+                AppendOutcome::Blocked => return AppendOutcome::Blocked,
+            }
+        }
+
+        if queued_overflow {
+            AppendOutcome::QueuedOverflow
+        } else {
+            AppendOutcome::Appended
+        }
+    }
+
     pub fn seal_active(&mut self, epoch: u64) -> Result<(), &'static str> {
         if self.active.state != BufferState::Writable {
             return Err("active lane is not writable");
@@ -333,6 +370,24 @@ impl BufferCell {
         }
     }
 
+    fn append_batch(&self, records: Vec<WalRecord>) -> AppendOutcome {
+        match self.inner.try_lock() {
+            Ok(mut guard) => guard.append_batch(records),
+            Err(TryLockError::WouldBlock) => {
+                self.contention_events.fetch_add(1, Ordering::Relaxed);
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.append_batch(records)
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                guard.append_batch(records)
+            }
+        }
+    }
+
     fn contention_events(&self) -> u64 {
         self.contention_events.load(Ordering::Relaxed)
     }
@@ -365,6 +420,20 @@ impl PerCoreWalBufferPool {
             ));
         };
         Ok(cell.append(record))
+    }
+
+    pub fn append_batch_to_core(
+        &self,
+        core_id: usize,
+        records: Vec<WalRecord>,
+    ) -> Result<AppendOutcome, String> {
+        let Some(cell) = self.cells.get(core_id) else {
+            return Err(format!(
+                "invalid core_id={core_id}; available cores={}",
+                self.cells.len()
+            ));
+        };
+        Ok(cell.append_batch(records))
     }
 
     pub fn contention_events_total(&self) -> u64 {
@@ -578,6 +647,14 @@ impl EpochOrderCoordinator {
         self.pool.append_to_core(core_id, record)
     }
 
+    pub fn append_records_to_core(
+        &self,
+        core_id: usize,
+        records: Vec<WalRecord>,
+    ) -> Result<AppendOutcome, String> {
+        self.pool.append_batch_to_core(core_id, records)
+    }
+
     pub fn advance_epoch_and_wait(
         &self,
         active_cores: &[usize],
@@ -635,6 +712,14 @@ impl EpochOrderCoordinator {
 
     pub fn flush_epoch(&self, epoch: u64) -> Result<EpochFlushBatch, String> {
         let (records, records_per_core) = self.pool.flush_epoch_batches(epoch)?;
+        Ok(EpochFlushBatch {
+            epoch,
+            records,
+            records_per_core,
+        })
+    }
+
+    pub fn mark_epoch_durable(&self, epoch: u64) {
         let mut guard = self
             .wait_state
             .lock()
@@ -646,12 +731,6 @@ impl EpochOrderCoordinator {
         );
         drop(guard);
         self.wait_cv.notify_all();
-
-        Ok(EpochFlushBatch {
-            epoch,
-            records,
-            records_per_core,
-        })
     }
 
     pub fn wait_until_epoch_durable(&self, epoch: u64, timeout: Duration) -> Result<(), String> {
@@ -1036,6 +1115,8 @@ fn bd_ncivz_2_group_commit_flushes_epoch_across_cores() {
         assert_eq!(batch.total_records(), 3);
         assert!(batch.records.iter().all(|record| record.epoch == 0));
 
+        assert_eq!(coordinator.durable_epoch(), None);
+        coordinator.mark_epoch_durable(0);
         assert_eq!(coordinator.durable_epoch(), Some(0));
         coordinator
             .wait_until_epoch_durable(0, Duration::from_millis(25))
@@ -1087,6 +1168,8 @@ fn bd_ncivz_2_writers_block_until_epoch_is_durable() {
                 .total_records(),
             1
         );
+        assert_eq!(coordinator.durable_epoch(), None);
+        coordinator.mark_epoch_durable(0);
 
         waiter.await.expect("epoch should become durable");
     });
