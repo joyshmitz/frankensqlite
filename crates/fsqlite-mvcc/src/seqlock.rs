@@ -626,7 +626,7 @@ mod tests {
     /// optimization: reads scale perfectly with thread count.
     #[test]
     fn test_seqlock_reader_no_lock() {
-        use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         let sl = Arc::new(SeqLock::new(42));
         let barrier = Arc::new(Barrier::new(8));
@@ -728,8 +728,8 @@ mod tests {
     /// compared to a Mutex-protected value under 8 concurrent readers.
     #[test]
     fn test_seqlock_throughput_vs_mutex() {
-        use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
         use fsqlite_types::sync_primitives::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         const THREADS: usize = 8;
         const DURATION_MS: u64 = 100;

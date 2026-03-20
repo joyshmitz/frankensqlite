@@ -68,6 +68,21 @@ impl GroupCommitQueue {
 
 type GroupCommitQueueRef = Arc<GroupCommitQueue>;
 
+// ---------------------------------------------------------------------------
+// Shared WAL Backend (D1-CRITICAL: enables split-lock commit)
+// ---------------------------------------------------------------------------
+//
+// The WAL backend is wrapped in a separate Arc<Mutex<...>> to enable split-lock
+// commit. This allows Thread B to start its prepare phase while Thread A does WAL I/O.
+
+/// Thread-safe shared WAL backend for split-lock commit protocol.
+pub type SharedWalBackend = Arc<Mutex<Option<Box<dyn WalBackend>>>>;
+
+/// Create a new empty shared WAL backend.
+fn new_shared_wal_backend() -> SharedWalBackend {
+    Arc::new(Mutex::new(None))
+}
+
 static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>>> =
     OnceLock::new();
 
@@ -1076,6 +1091,8 @@ pub struct SimplePager<V: Vfs> {
     pool: PageBufPool,
     /// Published metadata/page plane for lock-light steady-state reads.
     published: Arc<PublishedPagerState>,
+    /// WAL backend for split-lock commit (D1-CRITICAL).
+    wal_backend: SharedWalBackend,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -1179,6 +1196,7 @@ where
                 inner: Arc::clone(&self.inner),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
+                wal_backend: Arc::clone(&self.wal_backend),
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
                 published_db_size: Cell::new(published_snapshot.db_size),
                 write_set: HashMap::new(),
@@ -1356,6 +1374,7 @@ where
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
+            wal_backend: Arc::clone(&self.wal_backend),
             published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
             published_db_size: Cell::new(published_snapshot.db_size),
             write_set: HashMap::new(),
@@ -1935,6 +1954,7 @@ where
                 JournalMode::Delete,
                 freelist_count,
             )),
+            wal_backend: new_shared_wal_backend(),
         })
     }
 
@@ -2045,6 +2065,7 @@ where
                 JournalMode::Delete,
                 0, // freelist_count = 0 for read-only
             )),
+            wal_backend: new_shared_wal_backend(),
         })
     }
 
@@ -2276,6 +2297,8 @@ pub struct SimpleTransaction<V: Vfs> {
     inner: Arc<Mutex<PagerInner<V::File>>>,
     cache: Arc<ShardedPageCache>,
     published: Arc<PublishedPagerState>,
+    /// WAL backend for split-lock commit (D1-CRITICAL).
+    wal_backend: SharedWalBackend,
     /// Visible commit sequence at snapshot capture. Uses `Cell` for interior
     /// mutability so `get_page` (which takes `&self`) can refresh the snapshot
     /// when encountering pages beyond the current db_size boundary.
@@ -2774,27 +2797,83 @@ where
     /// `WAL_APPEND_GATES` mutex, providing the same serialization but with
     /// infrastructure in place for future batching optimization.
     ///
-    /// NOTE: True Flusher/Waiter cooperative batching requires restructuring
-    /// to pass `Arc<Mutex<PagerInner>>` rather than `&mut PagerInner`, so
-    /// waiters can release and re-acquire the lock. This is Phase 2 work.
+    /// D1-CRITICAL: Split-lock commit implementation.
+    /// The caller drops inner.lock() BEFORE calling this, so other threads
+    /// can start their prepare phase while we wait for the consolidator lock.
     fn commit_wal_group_commit(
         cx: &Cx,
-        inner: &mut PagerInner<V::File>,
+        inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
+        wal_backend: &SharedWalBackend,
         write_set: &HashMap<PageNumber, StagedPage>,
         write_pages_sorted: &[PageNumber],
         queue: &GroupCommitQueueRef,
-    ) -> Result<()> {
-        // Acquire the consolidator lock to serialize WAL commits within
-        // this process. This replaces the old WAL_APPEND_GATES mutex.
+    ) -> Result<u32> {
+        // D1-CRITICAL: Acquire consolidator.lock() FIRST, BEFORE inner.lock()!
+        // The caller has already released their inner.lock(), so other threads
+        // can now start their prepare phase while we wait here.
         let _consolidator_guard = queue
             .consolidator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Use the existing commit_wal implementation for the actual I/O.
-        // This preserves all correctness guarantees while eliminating
-        // the global WAL_APPEND_GATES contention point.
-        Self::commit_wal(cx, inner, write_set, write_pages_sorted)
+        // Now briefly acquire inner.lock() for the actual WAL I/O.
+        // This is much shorter than holding it for the entire prepare phase.
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+
+        // Perform the WAL commit using the shared WAL backend
+        Self::commit_wal_with_shared_backend(
+            cx,
+            &mut inner,
+            wal_backend,
+            write_set,
+            write_pages_sorted,
+        )
+    }
+
+    /// WAL commit using the shared WAL backend (D1-CRITICAL split-lock path).
+    fn commit_wal_with_shared_backend(
+        cx: &Cx,
+        inner: &mut PagerInner<V::File>,
+        wal_backend: &SharedWalBackend,
+        write_set: &HashMap<PageNumber, StagedPage>,
+        write_pages_sorted: &[PageNumber],
+    ) -> Result<u32> {
+        if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
+        {
+            // Lock the shared WAL backend
+            let mut wal_guard = wal_backend
+                .lock()
+                .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
+
+            let wal = wal_guard.as_mut().ok_or_else(|| {
+                FrankenError::internal("WAL mode active but no WAL backend installed")
+            })?;
+
+            let mut prepared_batch = wal.prepare_append_frames(&batch.frames)?;
+            if let Some(prepared_batch) = prepared_batch.as_mut() {
+                wal.finalize_prepared_frames(cx, prepared_batch)?;
+            }
+
+            // Escalate to EXCLUSIVE before writing WAL frames.
+            inner.db_file.lock(cx, LockLevel::Exclusive)?;
+
+            if let Some(prepared_batch) = prepared_batch.as_mut() {
+                wal.append_prepared_frames(cx, prepared_batch)?;
+            } else {
+                wal.append_frames(cx, &batch.frames)?;
+            }
+
+            if inner.wal_commit_sync_policy.should_sync_on_commit() {
+                wal.sync(cx)?;
+            }
+
+            // Return the new db_size for the caller to update
+            return Ok(batch.new_db_size);
+        }
+
+        Ok(inner.db_size)
     }
 
     fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
@@ -3292,29 +3371,52 @@ where
         }
 
         // Phase B: Commit via WAL or journal
-        let commit_result = if self.journal_mode == JournalMode::Wal {
-            // WAL mode: Use group commit for same-process batching
-            Self::commit_wal_group_commit(
+        // D1-CRITICAL: For WAL mode, we use split-lock commit:
+        // - Drop inner.lock() to allow other threads to start their prepare phase
+        // - Acquire consolidator.lock() (serializes WAL writes)
+        // - Briefly re-acquire inner.lock() for actual WAL I/O
+        // - Return new_db_size for the caller to update
+        let (commit_result, new_db_size) = if self.journal_mode == JournalMode::Wal {
+            // Drop inner lock BEFORE acquiring consolidator lock.
+            // This is the key parallelization win - other threads can now
+            // run their Phase A (prepare) while we wait on consolidator.
+            drop(inner);
+
+            // WAL mode: Use split-lock group commit
+            let result = Self::commit_wal_group_commit(
                 cx,
-                &mut inner,
+                &self.inner,
+                &self.wal_backend,
                 &self.write_set,
                 &self.write_pages_sorted,
                 &self.group_commit_queue,
-            )
+            );
+
+            // Re-acquire inner lock for Phase C (finalize)
+            inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+
+            match result {
+                Ok(db_size) => (Ok(()), db_size),
+                Err(e) => (Err(e), inner.db_size),
+            }
         } else {
-            // Journal mode: Direct commit (no group commit)
-            Self::commit_journal(
+            // Journal mode: Direct commit (no split-lock, keeps inner locked)
+            let result = Self::commit_journal(
                 cx,
                 &self.vfs,
                 &self.journal_path,
                 &mut inner,
                 &self.write_set,
                 self.original_db_size,
-            )
+            );
+            (result, committed_db_size)
         };
 
         if commit_result.is_ok() {
-            inner.db_size = committed_db_size;
+            inner.db_size = new_db_size;
             inner.commit_seq = inner.commit_seq.next();
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
@@ -3450,14 +3552,27 @@ where
             }
 
             if self.journal_mode == JournalMode::Wal {
-                // WAL mode: Use group commit for same-process batching
-                Self::commit_wal_group_commit(
+                // D1-CRITICAL: Use split-lock group commit
+                drop(inner);
+                let result = Self::commit_wal_group_commit(
                     cx,
-                    &mut inner,
+                    &self.inner,
+                    &self.wal_backend,
                     &self.write_set,
                     &self.write_pages_sorted,
                     &self.group_commit_queue,
-                )
+                );
+                inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                match result {
+                    Ok(db_size) => {
+                        inner.db_size = db_size;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             } else {
                 Self::commit_journal(
                     cx,
@@ -3471,7 +3586,7 @@ where
         };
 
         if commit_result.is_ok() {
-            inner.db_size = committed_db_size;
+            // db_size already updated in WAL path above
             inner.commit_seq = inner.commit_seq.next();
             // NOTE: We intentionally do NOT decrement active_transactions or
             // set writer_active=false — the transaction stays "active" for reuse.
