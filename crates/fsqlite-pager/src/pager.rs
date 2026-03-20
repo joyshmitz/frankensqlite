@@ -2784,6 +2784,15 @@ where
     V::File: Send + Sync,
 {
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        if self.freed_pages.contains(&page_no) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} was freed earlier in this transaction",
+                    page_no.get()
+                ),
+            });
+        }
+
         if let Some(staged) = self.write_set.get(&page_no) {
             return Ok(staged.published_page());
         }
@@ -5138,6 +5147,33 @@ mod tests {
             "bead_id={BEAD_ID} case=freed_pages_reenter_committed_freelist_after_commit"
         );
         next_txn.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_get_page_rejects_page_freed_in_same_transaction() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page, &vec![0xAA; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            page
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.free_page(&cx, page).unwrap();
+
+        let err = txn
+            .get_page(&cx, page)
+            .expect_err("read-after-free must be rejected");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("freed earlier in this transaction"),
+            "expected read-after-free error, got: {detail}"
+        );
     }
 
     #[test]
