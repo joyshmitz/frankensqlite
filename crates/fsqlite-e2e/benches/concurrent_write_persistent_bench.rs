@@ -34,7 +34,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::SqliteValue;
 
 const ROWS_PER_THREAD: i64 = 1000;
+/// Must be >= ROWS_PER_THREAD to avoid row ID collisions between threads.
 const ROW_ID_MULTIPLIER: i64 = 100_000;
+/// Maximum retries before giving up on a transaction (applies to both engines).
+const MAX_TXN_RETRIES: u32 = 100;
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
@@ -134,6 +137,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                             // Each row is its own transaction for realistic commit latency
                             for i in 0..ROWS_PER_THREAD {
                                 let start = Instant::now();
+                                let mut begin_retries = 0u32;
                                 loop {
                                     match conn.execute_batch("BEGIN IMMEDIATE") {
                                         Ok(()) => break,
@@ -141,6 +145,10 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             let msg = e.to_string();
                                             if msg.contains("BUSY") || msg.contains("locked") {
                                                 retries.fetch_add(1, Ordering::Relaxed);
+                                                begin_retries += 1;
+                                                if begin_retries >= MAX_TXN_RETRIES {
+                                                    panic!("BEGIN failed after {MAX_TXN_RETRIES} retries: {e}");
+                                                }
                                                 std::thread::sleep(Duration::from_micros(100));
                                             } else {
                                                 panic!("BEGIN failed: {e}");
@@ -149,6 +157,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                     }
                                 }
                                 stmt.execute(rusqlite::params![i]).unwrap();
+                                let mut commit_retries = 0u32;
                                 loop {
                                     match conn.execute_batch("COMMIT") {
                                         Ok(()) => break,
@@ -156,6 +165,10 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             let msg = e.to_string();
                                             if msg.contains("BUSY") || msg.contains("locked") {
                                                 retries.fetch_add(1, Ordering::Relaxed);
+                                                commit_retries += 1;
+                                                if commit_retries >= MAX_TXN_RETRIES {
+                                                    panic!("COMMIT failed after {MAX_TXN_RETRIES} retries: {e}");
+                                                }
                                                 std::thread::sleep(Duration::from_micros(100));
                                             } else {
                                                 panic!("COMMIT failed: {e}");
@@ -242,8 +255,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                             for i in 0..ROWS_PER_THREAD {
                                 let row_id = base_id + i;
                                 let start = Instant::now();
-                                let mut retry_count = 0;
-                                const MAX_RETRIES: u32 = 100;
+                                let mut retry_count = 0u32;
 
                                 'txn: loop {
                                     // BEGIN CONCURRENT with retry
@@ -275,8 +287,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             conflicts.fetch_add(1, Ordering::Relaxed);
                                             let _ = conn.execute("ROLLBACK");
                                             retry_count += 1;
-                                            if retry_count >= MAX_RETRIES {
-                                                eprintln!("[FrankenSQLite {tid}] INSERT gave up after {MAX_RETRIES} retries: {e:?}");
+                                            if retry_count >= MAX_TXN_RETRIES {
+                                                eprintln!("[FrankenSQLite {tid}] INSERT gave up after {MAX_TXN_RETRIES} retries: {e:?}");
                                                 break 'txn;
                                             }
                                             std::thread::sleep(Duration::from_micros(100 * u64::from(retry_count)));
@@ -300,8 +312,8 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                 conflicts.fetch_add(1, Ordering::Relaxed);
                                                 let _ = conn.execute("ROLLBACK");
                                                 retry_count += 1;
-                                                if retry_count >= MAX_RETRIES {
-                                                    panic!("COMMIT failed after {MAX_RETRIES} retries: {e:?}");
+                                                if retry_count >= MAX_TXN_RETRIES {
+                                                    panic!("COMMIT failed after {MAX_TXN_RETRIES} retries: {e:?}");
                                                 }
                                                 std::thread::sleep(Duration::from_micros(100 * u64::from(retry_count)));
                                                 // Loop back to BEGIN CONCURRENT
