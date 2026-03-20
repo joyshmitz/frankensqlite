@@ -40,6 +40,11 @@ const DEFAULT_CHAIN_LENGTH_WARNING: usize = 32;
 /// during commit-time publish.  This keeps average chains short (§8.10 version
 /// chain compaction) without waiting for the hard max_chain_length limit.
 const PROACTIVE_COMPACT_THRESHOLD: usize = 8;
+/// C7 soft bound multiplier: proceed after opportunistic prune even if chain
+/// still exceeds max_chain_length, up to this multiple.  Mirrors Postgres
+/// pruneheap.c:199 — the bound is advisory, not hard.  Only emit Busy error
+/// if chain exceeds SOFT_BOUND_MULTIPLIER × max_chain_length.
+const SOFT_BOUND_MULTIPLIER: usize = 4;
 const NO_GC_HORIZON: u64 = u64::MAX;
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
@@ -817,49 +822,63 @@ impl TransactionManager {
             return Ok(());
         }
 
-        let mut waited_ms = 0_u64;
-        loop {
-            let horizon = self.eager_gc_horizon();
-            let freed = self.version_store.prune_page_chain_eager(pgno, horizon);
-            if freed > 0 {
-                let freed_u64 = u64::try_from(freed).unwrap_or(u64::MAX);
-                GLOBAL_EBR_METRICS.record_gc_freed(freed_u64);
-            }
-
-            // `enforce_chain_bound_for_page()` is only reached while the caller
-            // still owns write exclusion for `pgno` (page lock in concurrent
-            // mode, global write exclusion in serialized mode), so the page
-            // cannot gain a newer committed version between this prune and the
-            // immediate length check. Reuse the observed removal count to avoid
-            // a second full chain walk after successful eager GC.
-            chain_len = if freed > 0 {
-                chain_len.saturating_sub(freed)
-            } else {
-                self.version_store.chain_length(pgno)
-            };
-            self.record_chain_length_sample(chain_len);
-            if chain_len < self.max_chain_length {
-                return Ok(());
-            }
-
-            if waited_ms >= self.busy_timeout_ms {
-                GLOBAL_EBR_METRICS.record_gc_blocked();
-                tracing::warn!(
-                    pgno = pgno.get(),
-                    chain_len,
-                    max_chain_length = self.max_chain_length,
-                    warning_threshold = self.chain_length_warning,
-                    waited_ms,
-                    busy_timeout_ms = self.busy_timeout_ms,
-                    gc_horizon = horizon.get(),
-                    "MVCC chain-length backpressure timeout"
-                );
-                return Err(MvccError::Busy);
-            }
-
-            waited_ms = waited_ms.saturating_add(1);
-            std::thread::sleep(Duration::from_millis(1));
+        // C7 (bd-l9k8e.7): Opportunistic cleanup instead of blocking.
+        // Attempt one quick prune pass.  If insufficient, proceed anyway
+        // (soft bound) unless chain exceeds the hard limit.  This mirrors
+        // Postgres pruneheap.c:199 — the threshold is advisory, not hard.
+        // No thread::sleep; backpressure is relieved by soft-bound semantics.
+        let horizon = self.eager_gc_horizon();
+        let freed = self.version_store.prune_page_chain_eager(pgno, horizon);
+        if freed > 0 {
+            let freed_u64 = u64::try_from(freed).unwrap_or(u64::MAX);
+            GLOBAL_EBR_METRICS.record_gc_freed(freed_u64);
+            tracing::debug!(
+                pgno = pgno.get(),
+                freed,
+                gc_horizon = horizon.get(),
+                "opportunistic_prune"
+            );
         }
+
+        // Recompute chain length after prune.
+        chain_len = if freed > 0 {
+            chain_len.saturating_sub(freed)
+        } else {
+            self.version_store.chain_length(pgno)
+        };
+        self.record_chain_length_sample(chain_len);
+
+        // Below soft threshold: proceed normally.
+        if chain_len < self.max_chain_length {
+            return Ok(());
+        }
+
+        // Soft bound: proceed even if chain exceeds max_chain_length,
+        // up to SOFT_BOUND_MULTIPLIER × max_chain_length.
+        let hard_limit = self.max_chain_length.saturating_mul(SOFT_BOUND_MULTIPLIER);
+        if chain_len < hard_limit {
+            tracing::warn!(
+                pgno = pgno.get(),
+                chain_len,
+                soft_threshold = self.max_chain_length,
+                hard_limit,
+                gc_horizon = horizon.get(),
+                "chain_soft_bound_exceeded_proceeding"
+            );
+            return Ok(());
+        }
+
+        // Hard limit exceeded: record metric and return Busy.
+        GLOBAL_EBR_METRICS.record_gc_blocked();
+        tracing::error!(
+            pgno = pgno.get(),
+            chain_len,
+            soft_threshold = self.max_chain_length,
+            hard_limit,
+            gc_horizon = horizon.get(),
+            "MVCC chain hard limit exceeded — gc_horizon pinned by long-running txn"
+        );
+        Err(MvccError::Busy)
     }
 
     /// Write a page within a transaction.
@@ -955,6 +974,8 @@ impl TransactionManager {
         if txn.state != TransactionState::Active {
             return; // already finalized
         }
+
+        self.cell_log.rollback_txn(txn.token());
 
         // Clear structural pages tracking
         txn.clear_structural_pages();
@@ -1492,6 +1513,8 @@ impl TransactionManager {
             txn.mark_page_write_committed(pgno, commit_seq);
         }
 
+        self.cell_log.commit_txn(txn_token, commit_seq);
+
         // Proactive version chain compaction (§8.10 + §12.1 adaptive):
         // attempt GC on written pages whose chains exceed the adaptive
         // compaction threshold (2× EWMA of observed chain lengths).
@@ -1502,7 +1525,12 @@ impl TransactionManager {
             let chain_len = self.version_store.chain_length(*pgno);
             self.record_chain_length_sample(chain_len);
             if chain_len > compact_threshold {
-                let _ = self.version_store.prune_page_chain_eager(*pgno, horizon);
+                let freed = self.version_store.prune_page_chain_eager(*pgno, horizon);
+                // C7 (bd-l9k8e.7): Record GC metric for proactive compaction.
+                if freed > 0 {
+                    let freed_u64 = u64::try_from(freed).unwrap_or(u64::MAX);
+                    GLOBAL_EBR_METRICS.record_gc_freed(freed_u64);
+                }
             }
         }
 
@@ -5845,21 +5873,72 @@ mod tests {
         );
     }
 
+    /// C7 (bd-l9k8e.7): Test soft-bound chain behavior.
+    ///
+    /// With SOFT_BOUND_MULTIPLIER = 4, chains between max_chain_length and
+    /// max_chain_length * 4 proceed without error (soft bound).  Only chains
+    /// exceeding the hard limit trigger MvccError::Busy.
     #[test]
-    fn test_chain_backpressure_reports_blocked_when_horizon_pinned() {
-        let mut mgr = mgr_with_busy_timeout_ms(3);
+    fn test_chain_soft_bound_allows_exceeding_max_chain_length() {
+        let mut mgr = mgr();
         mgr.set_max_chain_length(4);
         mgr.set_chain_length_warning(2);
         let pgno = PageNumber::new(6_779).unwrap();
-        let before = GLOBAL_EBR_METRICS.snapshot();
 
+        // Seed the chain with one version.
         let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
         mgr.write_page(&mut seed, pgno, test_data(0x01)).unwrap();
         mgr.commit(&mut seed).unwrap();
 
+        // Pin the GC horizon with a long-running reader.
         let mut pinned_reader = mgr.begin(BeginKind::Concurrent).unwrap();
         let _ = mgr.read_page(&mut pinned_reader, pgno);
 
+        // Write enough to exceed max_chain_length (4) but stay below hard
+        // limit (16).  With C7 soft-bound, these should all succeed.
+        let mut commits_in_soft_range = 0_u32;
+        for step in 0_u32..12_u32 {
+            let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
+            let byte = u8::try_from((step + 2) % 251).unwrap();
+            mgr.write_page(&mut writer, pgno, test_data(byte)).unwrap();
+            match mgr.commit(&mut writer) {
+                Ok(_) => commits_in_soft_range += 1,
+                Err(MvccError::Busy) => break,
+                Err(other) => panic!("unexpected commit error: {other:?}"),
+            }
+        }
+
+        // All 12 writes should succeed under soft-bound (chain_len < 16).
+        assert_eq!(
+            commits_in_soft_range, 12,
+            "C7 soft-bound: commits between max_chain_length and hard_limit should succeed"
+        );
+
+        mgr.abort(&mut pinned_reader);
+    }
+
+    /// C7 (bd-l9k8e.7): Test hard limit enforcement.
+    ///
+    /// Chains exceeding SOFT_BOUND_MULTIPLIER * max_chain_length trigger
+    /// MvccError::Busy and increment the gc_blocked metric.
+    #[test]
+    fn test_chain_hard_limit_triggers_busy_when_horizon_pinned() {
+        let mut mgr = mgr();
+        mgr.set_max_chain_length(4);
+        mgr.set_chain_length_warning(2);
+        let pgno = PageNumber::new(6_780).unwrap();
+        let before = GLOBAL_EBR_METRICS.snapshot();
+
+        // Seed the chain.
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x01)).unwrap();
+        mgr.commit(&mut seed).unwrap();
+
+        // Pin the GC horizon.
+        let mut pinned_reader = mgr.begin(BeginKind::Concurrent).unwrap();
+        let _ = mgr.read_page(&mut pinned_reader, pgno);
+
+        // Write enough to exceed hard limit (4 * 4 = 16).
         let mut saw_busy = false;
         for step in 0_u32..32_u32 {
             let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
@@ -5877,14 +5956,14 @@ mod tests {
 
         assert!(
             saw_busy,
-            "expected backpressure timeout while old snapshot pins gc horizon"
+            "expected MvccError::Busy when chain exceeds hard limit (SOFT_BOUND_MULTIPLIER * max_chain_length)"
         );
         mgr.abort(&mut pinned_reader);
 
         let after = GLOBAL_EBR_METRICS.snapshot();
         assert!(
             after.gc_blocked_count > before.gc_blocked_count,
-            "blocked backpressure counter should increase after timeout"
+            "gc_blocked metric should increment when hard limit exceeded"
         );
     }
 
@@ -6118,8 +6197,12 @@ mod tests {
         let commit_seq = mgr.commit(&mut txn).expect("commit should succeed");
 
         // Logical pages commit cell deltas but don't create full page versions
-        // (until C5 Materialize Pages is implemented)
-        // For now, verify commit succeeded and commit_index was updated
+        // (until C5 Materialize Pages is implemented).
+        // The commit path must still publish cell-delta visibility.
+        assert_eq!(
+            mgr.cell_log().resolve(pgno, &cell_key, commit_seq),
+            Some(vec![1, 2, 3, 4])
+        );
         assert!(
             mgr.commit_index.latest(pgno).is_some(),
             "commit_index should have entry for logical page"
@@ -6180,6 +6263,10 @@ mod tests {
         // Both pages should be in commit_index
         assert_eq!(mgr.commit_index.latest(structural_pgno), Some(commit_seq));
         assert_eq!(mgr.commit_index.latest(logical_pgno), Some(commit_seq));
+        assert_eq!(
+            mgr.cell_log().resolve(logical_pgno, &cell_key, commit_seq),
+            Some(vec![5, 6, 7, 8])
+        );
     }
 
     #[test]
@@ -6204,6 +6291,7 @@ mod tests {
             .cell_log()
             .record_insert(cell_key, pgno, vec![9, 10, 11, 12], txn.token());
         assert!(idx.is_some(), "record_insert should succeed");
+        assert_eq!(mgr.cell_log().delta_count(), 1);
 
         // Abort should clean up the cell delta
         mgr.abort(&mut txn);
@@ -6215,6 +6303,13 @@ mod tests {
         assert!(
             txn.structural_pages.is_empty(),
             "structural_pages should be cleared after abort"
+        );
+        assert_eq!(mgr.cell_log().delta_count(), 0);
+        assert!(
+            mgr.cell_log()
+                .resolve(pgno, &cell_key, CommitSeq::new(u64::MAX))
+                .is_none(),
+            "aborted cell delta should be rolled back"
         );
     }
 

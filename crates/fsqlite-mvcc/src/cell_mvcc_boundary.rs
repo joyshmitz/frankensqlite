@@ -112,6 +112,7 @@
 //! **Rationale:** The page structure is identical for table and index leaf pages.
 //! Only the cell format differs, which the CellKey abstraction handles.
 
+use fsqlite_btree::{BtreePageType, has_overflow};
 use fsqlite_types::PageNumber;
 
 // ---------------------------------------------------------------------------
@@ -189,6 +190,16 @@ pub struct PageMetadata {
 }
 
 impl PageMetadata {
+    #[must_use]
+    pub const fn page_type(&self) -> BtreePageType {
+        match (self.is_leaf, self.is_table) {
+            (true, true) => BtreePageType::LeafTable,
+            (true, false) => BtreePageType::LeafIndex,
+            (false, true) => BtreePageType::InteriorTable,
+            (false, false) => BtreePageType::InteriorIndex,
+        }
+    }
+
     /// Calculate available space for a new cell.
     #[must_use]
     pub fn available_space(&self) -> usize {
@@ -239,10 +250,20 @@ pub fn classify_btree_op(op: &BtreeOp, page: &PageMetadata) -> MvccOpClass {
                 return MvccOpClass::Structural;
             }
 
+            let Ok(payload_size_u32) = u32::try_from(*payload_size) else {
+                return MvccOpClass::Structural;
+            };
+
+            // Overflow chain creation is inherently structural even when the
+            // page has enough free bytes for the full payload.
+            if has_overflow(payload_size_u32, page.usable_size, page.page_type()) {
+                return MvccOpClass::Structural;
+            }
+
             // Estimate cell size (conservative upper bound).
             // Table: 9 (varint payload) + 9 (varint rowid) + payload + 4 (overflow ptr optional)
             // Index: 9 (varint payload) + payload + 4 (overflow ptr optional)
-            let estimated_cell_size = 22 + payload_size;
+            let estimated_cell_size = 22_usize.saturating_add(*payload_size);
 
             if page.cell_fits(estimated_cell_size) {
                 MvccOpClass::Logical
@@ -474,11 +495,33 @@ mod tests {
         assert_eq!(classify_btree_op(&op, &page), MvccOpClass::Logical);
 
         // Large key doesn't fit
-        let page_full = leaf_table_page(100, 30);
+        let mut page_full = leaf_table_page(100, 30);
+        page_full.is_table = false;
         let op_big = BtreeOp::IndexInsert { key_size: 100 };
         assert_eq!(
             classify_btree_op(&op_big, &page_full),
             MvccOpClass::Structural
         );
+    }
+
+    #[test]
+    fn test_table_insert_requiring_overflow_is_structural_even_when_empty_page_has_space() {
+        let page = leaf_table_page(0, 4086);
+        let op = BtreeOp::TableInsert {
+            rowid: 100,
+            payload_size: 4062,
+        };
+
+        assert_eq!(classify_btree_op(&op, &page), MvccOpClass::Structural);
+    }
+
+    #[test]
+    fn test_index_insert_requiring_overflow_is_structural_even_when_page_has_space() {
+        let mut page = leaf_table_page(0, 4086);
+        page.is_table = false;
+
+        let op = BtreeOp::IndexInsert { key_size: 1100 };
+
+        assert_eq!(classify_btree_op(&op, &page), MvccOpClass::Structural);
     }
 }

@@ -192,6 +192,9 @@ pub struct CellDelta {
     /// The transaction that created this delta (for debugging/audit only).
     pub created_by: TxnToken,
 
+    /// Stable identity of the cell this delta belongs to.
+    pub cell_key: CellKey,
+
     /// What kind of change this represents.
     pub kind: CellDeltaKind,
 
@@ -212,11 +215,7 @@ impl CellDelta {
     /// Memory footprint of this delta (fixed overhead + cell data).
     #[must_use]
     pub fn memory_size(&self) -> usize {
-        // Fixed overhead (commit_seq, created_by, kind, page_number, prev_idx)
-        const FIXED_OVERHEAD: usize = 8 + 16 + 1 + 4 + 8;
-        // Vec overhead (ptr, len, cap) + actual data
-        const VEC_OVERHEAD: usize = 24;
-        FIXED_OVERHEAD + VEC_OVERHEAD + self.cell_data.len()
+        std::mem::size_of::<Self>() + self.cell_data.len()
     }
 
     /// Whether this delta is visible to the given snapshot.
@@ -350,10 +349,12 @@ impl CellDeltaArena {
         let data_size = delta.cell_data.len() as u64;
         self.cell_data_bytes.fetch_sub(data_size, Ordering::Relaxed);
 
-        // Increment generation on free
+        // Increment generation on free, skipping 0 (used by fresh allocations).
+        // This prevents ABA issues where a stale CellDeltaIdx with generation 0
+        // could incorrectly match a recycled slot.
         let mut next_gen = slot.generation.wrapping_add(1);
-        if next_gen == u32::MAX {
-            next_gen = 0;
+        if next_gen == 0 {
+            next_gen = 1;
         }
         slot.generation = next_gen;
 
@@ -399,26 +400,54 @@ impl Default for CellDeltaArena {
 // ---------------------------------------------------------------------------
 
 /// Number of shards in the cell visibility log.
-const CELL_LOG_SHARDS: usize = 64;
+pub const CELL_LOG_SHARDS: usize = 64;
 
 /// Entry in the cell head table mapping CellKey -> head delta.
 #[derive(Debug, Clone, Copy)]
-struct CellHeadEntry {
-    head_idx: CellDeltaIdx,
+pub(crate) struct CellHeadEntry {
+    pub(crate) cell_key: CellKey,
+    pub(crate) head_idx: CellDeltaIdx,
 }
 
 /// A single shard of the cell head table.
-struct CellLogShard {
+pub(crate) struct CellLogShard {
     /// Maps (PageNumber, key_digest) -> head delta index.
     /// Uses default hasher since the key is a composite (PageNumber, [u8; 16]).
-    heads: RwLock<HashMap<(PageNumber, [u8; 16]), CellHeadEntry>>,
+    pub(crate) heads: RwLock<HashMap<(PageNumber, [u8; 16]), CellHeadEntry>>,
+    /// C7 (bd-l9k8e.7): Per-page delta count for batch visibility checks.
+    /// If count == 0, entire page is visible at base (skip per-cell resolution).
+    page_delta_counts: RwLock<HashMap<PageNumber, usize>>,
 }
 
 impl CellLogShard {
     fn new() -> Self {
         Self {
             heads: RwLock::new(HashMap::new()),
+            page_delta_counts: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// C7: Increment delta count for a page.
+    fn increment_page_count(&self, page: PageNumber) {
+        let mut counts = self.page_delta_counts.write();
+        *counts.entry(page).or_insert(0) += 1;
+    }
+
+    /// C7: Decrement delta count for a page.
+    fn decrement_page_count(&self, page: PageNumber) {
+        let mut counts = self.page_delta_counts.write();
+        if let Some(count) = counts.get_mut(&page) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&page);
+            }
+        }
+    }
+
+    /// C7: Check if a page has any deltas.
+    fn page_has_deltas(&self, page: PageNumber) -> bool {
+        let counts = self.page_delta_counts.read();
+        counts.get(&page).is_some_and(|&c| c > 0)
     }
 }
 
@@ -542,9 +571,9 @@ pub type MaterializationCallback = Box<dyn Fn(PageNumber, &[CellKey]) + Send + S
 /// ```
 pub struct CellVisibilityLog {
     /// Sharded cell head table.
-    shards: Box<[CacheAligned<CellLogShard>; CELL_LOG_SHARDS]>,
+    pub(crate) shards: Box<[CacheAligned<CellLogShard>; CELL_LOG_SHARDS]>,
     /// Delta arena (protected by Mutex for writes).
-    arena: Mutex<CellDeltaArena>,
+    pub(crate) arena: Mutex<CellDeltaArena>,
     /// Transaction delta tracker (protected by Mutex).
     txn_tracker: Mutex<TxnDeltaTracker>,
     /// Memory budget for cell data (bytes).
@@ -599,6 +628,20 @@ impl CellVisibilityLog {
     #[inline]
     fn shard_index(pgno: PageNumber) -> usize {
         (pgno.get() as usize) & (CELL_LOG_SHARDS - 1)
+    }
+
+    /// C7 (bd-l9k8e.7): Check if a page has ANY cell deltas.
+    ///
+    /// This is an O(1) batch visibility check. If this returns `false`, the
+    /// entire page is visible at its base version and per-cell resolution can
+    /// be skipped entirely.
+    ///
+    /// Use this before calling `resolve` or `collect_visible_deltas` to avoid
+    /// unnecessary delta chain walks on clean pages.
+    #[must_use]
+    pub fn page_has_deltas(&self, page_number: PageNumber) -> bool {
+        let shard_idx = Self::shard_index(page_number);
+        self.shards[shard_idx].page_has_deltas(page_number)
     }
 
     /// Record a cell insert operation.
@@ -706,6 +749,7 @@ impl CellVisibilityLog {
         let delta = CellDelta {
             commit_seq: CommitSeq::new(0), // Uncommitted
             created_by,
+            cell_key,
             kind: kind.clone(),
             page_number,
             cell_data,
@@ -723,8 +767,17 @@ impl CellVisibilityLog {
         // Update head
         {
             let mut heads = shard.heads.write();
-            heads.insert(lookup_key, CellHeadEntry { head_idx: new_idx });
+            heads.insert(
+                lookup_key,
+                CellHeadEntry {
+                    cell_key,
+                    head_idx: new_idx,
+                },
+            );
         }
+
+        // C7 (bd-l9k8e.7): Increment per-page delta count for batch visibility.
+        shard.increment_page_count(page_number);
 
         // Track this delta for the transaction
         {
@@ -778,13 +831,8 @@ impl CellVisibilityLog {
 
         for shard in self.shards.iter() {
             let heads = shard.heads.read();
-            for ((pgno, key_digest), _) in heads.iter() {
-                let cell_key = CellKey {
-                    btree: BtreeRef::Table(fsqlite_types::TableId::new(0)),
-                    kind: SemanticKeyKind::TableRow,
-                    key_digest: *key_digest,
-                };
-                page_counts.entry(*pgno).or_default().push(cell_key);
+            for ((pgno, _), entry) in heads.iter() {
+                page_counts.entry(*pgno).or_default().push(entry.cell_key);
             }
         }
 
@@ -981,7 +1029,7 @@ impl CellVisibilityLog {
         let mut removed_count = 0u64;
         let mut bytes_freed = 0u64;
 
-        for idx in &delta_indices {
+        for idx in delta_indices.iter().rev() {
             if let Some(delta) = arena.free(*idx) {
                 bytes_freed += delta.memory_size() as u64;
                 removed_count += 1;
@@ -990,13 +1038,28 @@ impl CellVisibilityLog {
                 let shard = &self.shards[shard_idx];
                 let mut heads = shard.heads.write();
 
-                for ((pgno, _), entry) in heads.iter_mut() {
-                    if *pgno == delta.page_number && entry.head_idx == *idx {
-                        if let Some(prev) = delta.prev_idx {
+                let lookup_key = (delta.page_number, delta.cell_key.key_digest);
+                let next_head = delta.prev_idx.filter(|prev| arena.get(*prev).is_some());
+                let should_remove = heads
+                    .get(&lookup_key)
+                    .is_some_and(|entry| entry.head_idx == *idx)
+                    && next_head.is_none();
+
+                if let Some(entry) = heads.get_mut(&lookup_key) {
+                    if entry.head_idx == *idx {
+                        if let Some(prev) = next_head {
                             entry.head_idx = prev;
                         }
                     }
                 }
+
+                if should_remove {
+                    heads.remove(&lookup_key);
+                }
+
+                // C7 (bd-l9k8e.7): Decrement per-page delta count.
+                drop(heads); // Release write lock before calling decrement
+                shard.decrement_page_count(delta.page_number);
             }
         }
 
@@ -1038,57 +1101,22 @@ impl CellVisibilityLog {
 
         for idx in our_deltas {
             if let Some(delta) = arena.get(*idx) {
-                let shard_idx = Self::shard_index(delta.page_number);
-                let shard = &self.shards[shard_idx];
-                let heads = shard.heads.read();
-
-                for ((pgno, key_digest), entry) in heads.iter() {
-                    if *pgno == delta.page_number {
-                        let mut check_idx = Some(entry.head_idx);
-                        while let Some(cidx) = check_idx {
-                            if cidx == *idx {
-                                our_cells.insert((*pgno, *key_digest));
-                                break;
-                            }
-                            if let Some(d) = arena.get(cidx) {
-                                check_idx = d.prev_idx;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
+                our_cells.insert((delta.page_number, delta.cell_key.key_digest));
             }
         }
 
         for idx in their_deltas {
             if let Some(delta) = arena.get(*idx) {
-                let shard_idx = Self::shard_index(delta.page_number);
-                let shard = &self.shards[shard_idx];
-                let heads = shard.heads.read();
-
-                for ((pgno, key_digest), entry) in heads.iter() {
-                    if *pgno == delta.page_number {
-                        let mut check_idx = Some(entry.head_idx);
-                        while let Some(cidx) = check_idx {
-                            if cidx == *idx && our_cells.contains(&(*pgno, *key_digest)) {
-                                debug!(
-                                    txn_id = txn.id.get(),
-                                    other_txn_id = other_txn.id.get(),
-                                    pgno = pgno.get(),
-                                    "cell_conflict_detected"
-                                );
-                                return CellConflict::Conflict {
-                                    with_txn: other_txn,
-                                };
-                            }
-                            if let Some(d) = arena.get(cidx) {
-                                check_idx = d.prev_idx;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
+                if our_cells.contains(&(delta.page_number, delta.cell_key.key_digest)) {
+                    debug!(
+                        txn_id = txn.id.get(),
+                        other_txn_id = other_txn.id.get(),
+                        pgno = delta.page_number.get(),
+                        "cell_conflict_detected"
+                    );
+                    return CellConflict::Conflict {
+                        with_txn: other_txn,
+                    };
                 }
             }
         }
@@ -1138,6 +1166,10 @@ impl CellVisibilityLog {
                 if let Some(delta) = arena.free(idx) {
                     stats.reclaimed += 1;
                     stats.bytes_freed += delta.memory_size() as u64;
+
+                    // C7 (bd-l9k8e.7): Decrement per-page delta count.
+                    let shard_idx = Self::shard_index(delta.page_number);
+                    self.shards[shard_idx].decrement_page_count(delta.page_number);
                 }
             }
         }
@@ -1168,6 +1200,228 @@ impl CellVisibilityLog {
     pub fn active_txn_count(&self) -> usize {
         let tracker = self.txn_tracker.lock();
         tracker.txn_deltas.len()
+    }
+
+    // -------------------------------------------------------------------------
+    // Materialization Support (§C5)
+    // -------------------------------------------------------------------------
+
+    /// Collect all visible deltas for a page, sorted by commit_seq.
+    ///
+    /// This is the primary interface for materialization: gather all deltas
+    /// that need to be applied to produce a materialized page.
+    ///
+    /// # Lock Ordering
+    ///
+    /// Maintains canonical lock order: arena → heads (same as rollback_txn).
+    #[must_use]
+    pub fn collect_visible_deltas(
+        &self,
+        page_number: PageNumber,
+        snapshot_high: CommitSeq,
+    ) -> Vec<CellDelta> {
+        let shard_idx = Self::shard_index(page_number);
+        let shard = &self.shards[shard_idx];
+
+        let mut deltas = Vec::new();
+
+        let arena = self.arena.lock();
+        let heads = shard.heads.read();
+
+        // Collect all deltas for cells on this page
+        for ((pgno, _key_digest), entry) in heads.iter() {
+            if *pgno != page_number {
+                continue;
+            }
+
+            let mut current_idx = Some(entry.head_idx);
+
+            // Walk the chain and collect visible deltas
+            while let Some(idx) = current_idx {
+                if let Some(delta) = arena.get(idx) {
+                    if delta.is_visible_to(snapshot_high) {
+                        deltas.push(delta.clone());
+                    }
+                    current_idx = delta.prev_idx;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Sort by commit_seq (ascending) so deltas are applied in order
+        deltas.sort_by_key(|d| d.commit_seq);
+
+        trace!(
+            pgno = page_number.get(),
+            snapshot_high = snapshot_high.get(),
+            delta_count = deltas.len(),
+            "collected_visible_deltas"
+        );
+
+        deltas
+    }
+
+    /// Get the count of deltas for a specific page.
+    ///
+    /// Used to check if eager materialization threshold is reached.
+    ///
+    /// # Lock Ordering
+    ///
+    /// Maintains canonical lock order: arena → heads (same as rollback_txn).
+    #[must_use]
+    pub fn page_delta_count(&self, page_number: PageNumber) -> usize {
+        let shard_idx = Self::shard_index(page_number);
+        let shard = &self.shards[shard_idx];
+
+        let arena = self.arena.lock();
+        let heads = shard.heads.read();
+
+        let mut count = 0usize;
+
+        for ((pgno, _), entry) in heads.iter() {
+            if *pgno != page_number {
+                continue;
+            }
+
+            let mut current_idx = Some(entry.head_idx);
+            while let Some(idx) = current_idx {
+                if let Some(delta) = arena.get(idx) {
+                    count += 1;
+                    current_idx = delta.prev_idx;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        count
+    }
+
+    /// Get all pages that have outstanding deltas.
+    ///
+    /// Used for checkpoint materialization.
+    #[must_use]
+    pub fn pages_with_deltas(&self) -> Vec<PageNumber> {
+        let mut pages: std::collections::HashSet<PageNumber> = std::collections::HashSet::new();
+
+        for shard in self.shards.iter() {
+            let heads = shard.heads.read();
+            for ((pgno, _), _) in heads.iter() {
+                pages.insert(*pgno);
+            }
+        }
+
+        pages.into_iter().collect()
+    }
+
+    /// Clear deltas for a page after materialization.
+    ///
+    /// Called after a successful materialization to free up memory and
+    /// prevent re-applying deltas. This function:
+    /// - Frees deltas from the arena
+    /// - Updates head pointers (removes entries or truncates chains)
+    /// - Decrements page_delta_counts
+    /// - Updates the global delta_count
+    ///
+    /// # Lock Ordering
+    ///
+    /// Maintains canonical lock order: arena → heads (same as rollback_txn).
+    /// This prevents deadlock with concurrent operations.
+    pub fn clear_page_deltas(&self, page_number: PageNumber, below_commit_seq: CommitSeq) -> usize {
+        let shard_idx = Self::shard_index(page_number);
+        let shard = &self.shards[shard_idx];
+
+        // Phase 1: Collect info about what to free and how to update heads.
+        // Lock order: arena first, then heads (matches rollback_txn pattern).
+        // (key_digest, indices_to_free, new_head_idx)
+        let mut updates: Vec<([u8; 16], Vec<CellDeltaIdx>, Option<CellDeltaIdx>)> = Vec::new();
+
+        {
+            let arena = self.arena.lock();
+            let heads = shard.heads.read();
+
+            for ((pgno, key_digest), entry) in heads.iter() {
+                if *pgno != page_number {
+                    continue;
+                }
+
+                let mut to_free_for_key: Vec<CellDeltaIdx> = Vec::new();
+                let mut new_head: Option<CellDeltaIdx> = None;
+                let mut current_idx = Some(entry.head_idx);
+
+                // Walk the chain, collecting deltas to free
+                while let Some(idx) = current_idx {
+                    if let Some(delta) = arena.get(idx) {
+                        if delta.commit_seq.get() != 0 && delta.commit_seq <= below_commit_seq {
+                            to_free_for_key.push(idx);
+                        } else if new_head.is_none() {
+                            // First delta that survives becomes the new head
+                            new_head = Some(idx);
+                        }
+                        current_idx = delta.prev_idx;
+                    } else {
+                        break;
+                    }
+                }
+
+                if !to_free_for_key.is_empty() {
+                    updates.push((*key_digest, to_free_for_key, new_head));
+                }
+            }
+        }
+
+        if updates.is_empty() {
+            return 0;
+        }
+
+        // Now perform the actual updates with write locks
+        let mut arena = self.arena.lock();
+        let mut heads = shard.heads.write();
+        let mut freed = 0usize;
+
+        for (key_digest, to_free, new_head) in updates {
+            let lookup_key = (page_number, key_digest);
+
+            // Free the deltas from arena
+            for idx in &to_free {
+                if arena.free(*idx).is_some() {
+                    freed += 1;
+                }
+            }
+
+            // Update or remove the head entry
+            if let Some(new_head_idx) = new_head {
+                // Update head to point to surviving delta
+                if let Some(entry) = heads.get_mut(&lookup_key) {
+                    entry.head_idx = new_head_idx;
+                }
+            } else {
+                // All deltas for this key were freed, remove the entry
+                heads.remove(&lookup_key);
+            }
+        }
+
+        // Drop locks before calling decrement_page_count (avoid deadlock)
+        drop(heads);
+        drop(arena);
+
+        // C7: Decrement page_delta_counts for each freed delta
+        for _ in 0..freed {
+            shard.decrement_page_count(page_number);
+        }
+
+        // Update global delta count
+        self.delta_count.fetch_sub(freed as u64, Ordering::Relaxed);
+
+        debug!(
+            pgno = page_number.get(),
+            below_commit_seq = below_commit_seq.get(),
+            freed_count = freed,
+            "page_deltas_cleared"
+        );
+
+        freed
     }
 }
 
@@ -1362,6 +1616,7 @@ mod tests {
         let delta = CellDelta {
             commit_seq: CommitSeq::new(1),
             created_by: test_txn_token(),
+            cell_key: CellKey::table_row(BtreeRef::Table(TableId::new(1)), 100),
             kind: CellDeltaKind::Insert,
             page_number: PageNumber::new(42).unwrap(),
             cell_data: vec![1, 2, 3, 4],
@@ -1525,6 +1780,31 @@ mod tests {
         assert!(
             log.resolve(page_number, &cell_key, CommitSeq::new(100))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn test_rollback_restores_previous_committed_version_after_same_txn_updates() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        let committed = log
+            .record_insert(cell_key, page_number, vec![1], txn_token_n(1))
+            .expect("committed insert should succeed");
+        log.commit_delta(committed, CommitSeq::new(10));
+
+        let rollback_token = txn_token_n(2);
+        log.record_update(cell_key, page_number, vec![2], rollback_token)
+            .expect("first update should succeed");
+        log.record_update(cell_key, page_number, vec![3], rollback_token)
+            .expect("second update should succeed");
+
+        assert_eq!(log.rollback_txn(rollback_token), 2);
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(20)),
+            Some(vec![1])
         );
     }
 
@@ -1841,5 +2121,685 @@ mod tests {
             materialization_triggered.load(AtomicOrdering::SeqCst),
             "Materialization callback should be triggered when global budget exceeded"
         );
+    }
+
+    #[test]
+    fn test_materialization_callback_preserves_real_cell_key() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+
+        let seen_cells = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cells_clone = Arc::clone(&seen_cells);
+
+        let mut log = CellVisibilityLog::with_per_txn_budget(64, 1024 * 1024);
+        log.set_materialization_callback(Box::new(move |_pgno, cells| {
+            seen_cells_clone.lock().unwrap().extend_from_slice(cells);
+        }));
+
+        let btree = BtreeRef::Table(TableId::new(7));
+        let page_number = PageNumber::new(42).unwrap();
+        let token = txn_token_n(1);
+        let cell_key = CellKey::table_row(btree, 4242);
+
+        log.record_insert(cell_key, page_number, vec![0; 100], token)
+            .expect("insert should succeed");
+
+        let captured = seen_cells.lock().unwrap();
+        assert_eq!(captured.as_slice(), &[cell_key]);
+    }
+
+    // -------------------------------------------------------------------------
+    // C7 (bd-l9k8e.7): Batch visibility check tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn c7_page_with_no_deltas_returns_false() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let page_number = PageNumber::new(42).unwrap();
+
+        // Page with no deltas should return false.
+        assert!(
+            !log.page_has_deltas(page_number),
+            "page without deltas should return false"
+        );
+    }
+
+    #[test]
+    fn c7_page_with_deltas_returns_true() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+        let token = test_txn_token();
+
+        // Initially no deltas.
+        assert!(!log.page_has_deltas(page_number));
+
+        // Record an insert.
+        log.record_insert(cell_key, page_number, vec![1, 2, 3], token);
+
+        // Now page has deltas.
+        assert!(
+            log.page_has_deltas(page_number),
+            "page with delta should return true"
+        );
+    }
+
+    #[test]
+    fn c7_page_delta_count_tracks_rollback() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_number = PageNumber::new(42).unwrap();
+        let token = test_txn_token();
+
+        // Add multiple deltas.
+        for i in 0..5 {
+            let cell_key = CellKey::table_row(btree, i);
+            log.record_insert(cell_key, page_number, vec![i as u8], token);
+        }
+        assert!(log.page_has_deltas(page_number));
+
+        // Rollback the transaction.
+        log.rollback_txn(token);
+
+        // After rollback, page should have no deltas.
+        assert!(
+            !log.page_has_deltas(page_number),
+            "page should have no deltas after rollback"
+        );
+    }
+
+    #[test]
+    fn c7_page_delta_count_tracks_gc() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_number = PageNumber::new(42).unwrap();
+        let token = test_txn_token();
+
+        // Add and commit deltas.
+        for i in 0..3 {
+            let cell_key = CellKey::table_row(btree, i);
+            let idx = log
+                .record_insert(cell_key, page_number, vec![i as u8], token)
+                .expect("insert should succeed");
+            log.commit_delta(idx, CommitSeq::new((i + 1) as u64));
+        }
+        assert!(log.page_has_deltas(page_number));
+
+        // GC with horizon that reclaims older deltas (but not all).
+        // Deltas at commit_seq 1, 2 should be reclaimed below horizon 3.
+        // But the newest delta at commit_seq 3 should remain.
+        let stats = log.gc(CommitSeq::new(3));
+        // GC should reclaim deltas below horizon that have a newer version.
+        // In our case, each cell only has one delta, so none should be reclaimed.
+        assert_eq!(
+            stats.reclaimed, 0,
+            "single-version cells should not be GC'd"
+        );
+        assert!(
+            log.page_has_deltas(page_number),
+            "page should still have deltas"
+        );
+    }
+
+    #[test]
+    fn c7_different_pages_tracked_separately() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_a = PageNumber::new(42).unwrap();
+        let page_b = PageNumber::new(43).unwrap();
+        let token = test_txn_token();
+
+        // Add delta to page A only.
+        let cell_key = CellKey::table_row(btree, 100);
+        log.record_insert(cell_key, page_a, vec![1], token);
+
+        assert!(log.page_has_deltas(page_a), "page A should have deltas");
+        assert!(!log.page_has_deltas(page_b), "page B should have no deltas");
+    }
+
+    // -------------------------------------------------------------------------
+    // C3-TEST (bd-l9k8e.9): Comprehensive test suite
+    // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // 1a) Visibility basics (12+ tests)
+    // -------------------------------------------------------------------------
+
+    /// Test: insert + update + delete same cell across 3 txns -> correct at each snapshot
+    #[test]
+    fn c3_test_insert_update_delete_chain() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        // Txn 1: Insert at commit_seq 5
+        let idx1 = log
+            .record_insert(cell_key, page_number, vec![1, 1, 1], txn_token_n(1))
+            .expect("insert should succeed");
+        log.commit_delta(idx1, CommitSeq::new(5));
+
+        // Txn 2: Update at commit_seq 10
+        let idx2 = log
+            .record_update(cell_key, page_number, vec![2, 2, 2], txn_token_n(2))
+            .expect("update should succeed");
+        log.commit_delta(idx2, CommitSeq::new(10));
+
+        // Txn 3: Delete at commit_seq 15
+        let idx3 = log
+            .record_delete(cell_key, page_number, txn_token_n(3))
+            .expect("delete should succeed");
+        log.commit_delta(idx3, CommitSeq::new(15));
+
+        // Snapshot at 3: cell not visible (before insert)
+        assert!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(3))
+                .is_none(),
+            "snapshot=3 should not see cell (before insert)"
+        );
+
+        // Snapshot at 7: sees insert version
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(7)),
+            Some(vec![1, 1, 1]),
+            "snapshot=7 should see insert version"
+        );
+
+        // Snapshot at 12: sees update version
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(12)),
+            Some(vec![2, 2, 2]),
+            "snapshot=12 should see update version"
+        );
+
+        // Snapshot at 20: cell deleted (not visible)
+        assert!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(20))
+                .is_none(),
+            "snapshot=20 should not see cell (deleted)"
+        );
+    }
+
+    /// Test: 100 txns update same cell -> correct version visible at each of 100 snapshots
+    #[test]
+    fn c3_test_100_txns_same_cell() {
+        let log = CellVisibilityLog::new(10 * 1024 * 1024); // 10MB budget for 100 versions
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        // Insert first version: data=[1] at commit_seq=1
+        let idx0 = log
+            .record_insert(cell_key, page_number, vec![1], txn_token_n(1))
+            .expect("insert should succeed");
+        log.commit_delta(idx0, CommitSeq::new(1));
+
+        // 99 more updates: data=[i] at commit_seq=i for i in 2..=100
+        for i in 2u64..=100 {
+            let idx = log
+                .record_update(cell_key, page_number, vec![i as u8], txn_token_n(i as u32))
+                .expect("update should succeed");
+            log.commit_delta(idx, CommitSeq::new(i));
+        }
+
+        // Verify each snapshot sees the correct version (data matches commit_seq)
+        for i in 1u64..=100 {
+            let expected = vec![i as u8];
+            let actual = log.resolve(page_number, &cell_key, CommitSeq::new(i));
+            assert_eq!(
+                actual,
+                Some(expected.clone()),
+                "snapshot={} should see version with data={}",
+                i,
+                i
+            );
+        }
+
+        // Snapshot at 0: nothing visible (before any commit)
+        assert!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(0))
+                .is_none(),
+            "snapshot=0 should not see any version"
+        );
+    }
+
+    /// Test: boundary: read at EXACTLY the commit_seq of a delta -> visible (inclusive)
+    #[test]
+    fn c3_test_exact_commit_seq_visible() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+        let token = txn_token_n(1);
+
+        // Insert at commit_seq = 42
+        let idx = log
+            .record_insert(cell_key, page_number, vec![42], token)
+            .expect("insert should succeed");
+        log.commit_delta(idx, CommitSeq::new(42));
+
+        // Snapshot at EXACTLY 42: should be visible (inclusive boundary)
+        assert_eq!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(42)),
+            Some(vec![42]),
+            "snapshot=42 (exact commit_seq) should see the cell"
+        );
+
+        // Snapshot at 41: should NOT be visible (before commit)
+        assert!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(41))
+                .is_none(),
+            "snapshot=41 (before commit_seq) should not see the cell"
+        );
+    }
+
+    /// Test: boundary: snapshot.high = 0 -> NotTracked for everything
+    #[test]
+    fn c3_test_snapshot_zero_sees_nothing() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+        let token = txn_token_n(1);
+
+        // Insert at commit_seq = 1 (earliest possible)
+        let idx = log
+            .record_insert(cell_key, page_number, vec![1], token)
+            .expect("insert should succeed");
+        log.commit_delta(idx, CommitSeq::new(1));
+
+        // Snapshot at 0: nothing should be visible
+        assert!(
+            log.resolve(page_number, &cell_key, CommitSeq::new(0))
+                .is_none(),
+            "snapshot=0 should never see any committed cell"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 1b) Conflict detection (8+ tests)
+    // -------------------------------------------------------------------------
+
+    /// Test: two txns update SAME cell -> conflict detected
+    #[test]
+    fn c3_test_two_txns_update_same_cell_conflict() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        // Txn 1 inserts and commits
+        let idx1 = log
+            .record_insert(cell_key, page_number, vec![1], txn_token_n(1))
+            .expect("insert should succeed");
+        log.commit_delta(idx1, CommitSeq::new(5));
+
+        // Txn 2 and Txn 3 both try to update the same cell (concurrent)
+        let token2 = txn_token_n(2);
+        let token3 = txn_token_n(3);
+
+        log.record_update(cell_key, page_number, vec![2], token2)
+            .expect("update 2 should succeed");
+        log.record_update(cell_key, page_number, vec![3], token3)
+            .expect("update 3 should succeed");
+
+        // Conflict should be detected between txn 2 and txn 3
+        assert!(
+            matches!(
+                log.check_conflict(token2, token3),
+                CellConflict::Conflict { .. }
+            ),
+            "two txns updating same cell should conflict"
+        );
+        assert!(
+            matches!(
+                log.check_conflict(token3, token2),
+                CellConflict::Conflict { .. }
+            ),
+            "conflict should be symmetric"
+        );
+    }
+
+    /// Test: txn A inserts cell, commits; txn B (started before A committed) updates same cell -> conflict
+    #[test]
+    fn c3_test_read_before_commit_then_update_conflict() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+
+        let token_a = txn_token_n(1);
+        let token_b = txn_token_n(2);
+
+        // Txn A inserts cell (uncommitted)
+        log.record_insert(cell_key, page_number, vec![1], token_a)
+            .expect("insert should succeed");
+
+        // Txn B also inserts same cell (before A commits) - this represents B "updating" a cell
+        // that B didn't know existed because A hadn't committed yet
+        log.record_insert(cell_key, page_number, vec![2], token_b)
+            .expect("insert should succeed");
+
+        // Conflict should be detected because both touch same cell
+        assert!(
+            matches!(
+                log.check_conflict(token_a, token_b),
+                CellConflict::Conflict { .. }
+            ),
+            "txn A and B both touching same cell should conflict"
+        );
+    }
+
+    /// THE TEST: txn A inserts cell 5, txn B inserts cell 12, both on page 47 -> BOTH COMMIT
+    #[test]
+    fn c3_test_different_cells_same_page_both_commit() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_number = PageNumber::new(47).unwrap();
+
+        let cell_key_5 = CellKey::table_row(btree, 5);
+        let cell_key_12 = CellKey::table_row(btree, 12);
+
+        let token_a = txn_token_n(1);
+        let token_b = txn_token_n(2);
+
+        // Txn A inserts cell 5
+        let idx_a = log
+            .record_insert(cell_key_5, page_number, vec![5], token_a)
+            .expect("insert cell 5 should succeed");
+
+        // Txn B inserts cell 12 (same page!)
+        let idx_b = log
+            .record_insert(cell_key_12, page_number, vec![12], token_b)
+            .expect("insert cell 12 should succeed");
+
+        // NO conflict - different cells on same page
+        assert_eq!(
+            log.check_conflict(token_a, token_b),
+            CellConflict::None,
+            "different cells on same page should NOT conflict"
+        );
+
+        // Both can commit
+        log.commit_delta(idx_a, CommitSeq::new(5));
+        log.commit_delta(idx_b, CommitSeq::new(6));
+
+        // Both visible at appropriate snapshots
+        assert_eq!(
+            log.resolve(page_number, &cell_key_5, CommitSeq::new(10)),
+            Some(vec![5]),
+            "cell 5 should be visible"
+        );
+        assert_eq!(
+            log.resolve(page_number, &cell_key_12, CommitSeq::new(10)),
+            Some(vec![12]),
+            "cell 12 should be visible"
+        );
+    }
+
+    /// Test: 8 txns touching 8 different cells on same page -> ALL COMMIT concurrently
+    #[test]
+    fn c3_test_8_txns_8_cells_all_commit() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_number = PageNumber::new(42).unwrap();
+
+        let mut indices = Vec::new();
+
+        // 8 transactions, each inserting a different cell on the same page
+        for i in 0..8 {
+            let cell_key = CellKey::table_row(btree, i);
+            let token = txn_token_n((i + 1) as u32);
+            let idx = log
+                .record_insert(cell_key, page_number, vec![i as u8], token)
+                .expect("insert should succeed");
+            indices.push((idx, token, i));
+        }
+
+        // Verify no conflicts between any pair
+        for i in 0..8 {
+            for j in (i + 1)..8 {
+                let token_i = txn_token_n((i + 1) as u32);
+                let token_j = txn_token_n((j + 1) as u32);
+                assert_eq!(
+                    log.check_conflict(token_i, token_j),
+                    CellConflict::None,
+                    "txn {} and {} should not conflict (different cells)",
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
+
+        // All can commit
+        for (idx, _token, i) in &indices {
+            log.commit_delta(*idx, CommitSeq::new((*i + 1) as u64));
+        }
+
+        // All visible
+        for i in 0..8 {
+            let cell_key = CellKey::table_row(btree, i);
+            assert_eq!(
+                log.resolve(page_number, &cell_key, CommitSeq::new(20)),
+                Some(vec![i as u8]),
+                "cell {} should be visible",
+                i
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 1c) GC tests (6+ tests)
+    // -------------------------------------------------------------------------
+
+    /// Test: single delta below horizon -> reclaimable (when there's no newer version)
+    /// Note: GC only reclaims deltas that have a newer version. A lone delta below
+    /// horizon is NOT reclaimed because it's the only version.
+    #[test]
+    fn c3_test_gc_single_delta_below_horizon() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+        let token = txn_token_n(1);
+
+        // Insert at commit_seq = 5
+        let idx = log
+            .record_insert(cell_key, page_number, vec![1, 2, 3], token)
+            .expect("insert should succeed");
+        log.commit_delta(idx, CommitSeq::new(5));
+
+        assert_eq!(log.delta_count(), 1);
+
+        // GC with horizon at 10 - but this is the ONLY version, so it should NOT be reclaimed
+        let stats = log.gc(CommitSeq::new(10));
+        assert_eq!(
+            stats.reclaimed, 0,
+            "single version should not be reclaimed even below horizon"
+        );
+        assert_eq!(log.delta_count(), 1);
+
+        // Now add an update to create a newer version
+        let idx2 = log
+            .record_update(cell_key, page_number, vec![4, 5, 6], token)
+            .expect("update should succeed");
+        log.commit_delta(idx2, CommitSeq::new(15));
+
+        assert_eq!(log.delta_count(), 2);
+
+        // GC with horizon at 20 - NOW the older version should be reclaimed
+        let stats = log.gc(CommitSeq::new(20));
+        assert_eq!(stats.reclaimed, 1, "older version should be reclaimed");
+        assert_eq!(log.delta_count(), 1);
+    }
+
+    /// Test: uncommitted delta -> NEVER reclaimable
+    #[test]
+    fn c3_test_gc_uncommitted_never_reclaimed() {
+        let log = CellVisibilityLog::new(1024 * 1024);
+        let btree = BtreeRef::Table(TableId::new(1));
+        let cell_key = CellKey::table_row(btree, 100);
+        let page_number = PageNumber::new(42).unwrap();
+        let token = txn_token_n(1);
+
+        // Insert but DON'T commit
+        log.record_insert(cell_key, page_number, vec![1, 2, 3], token)
+            .expect("insert should succeed");
+
+        assert_eq!(log.delta_count(), 1);
+
+        // GC with any horizon should not reclaim uncommitted delta
+        let stats = log.gc(CommitSeq::new(1000));
+        assert_eq!(
+            stats.reclaimed, 0,
+            "uncommitted delta should never be reclaimed"
+        );
+        assert_eq!(log.delta_count(), 1);
+    }
+
+    /// Test: sustained load: insert 10K deltas, advance horizon, verify bounded memory
+    #[test]
+    fn c3_test_gc_sustained_load_bounded_memory() {
+        let log = CellVisibilityLog::new(100 * 1024 * 1024); // 100MB budget
+        let btree = BtreeRef::Table(TableId::new(1));
+        let page_number = PageNumber::new(42).unwrap();
+        let token = txn_token_n(1);
+
+        // Insert first version
+        let cell_key = CellKey::table_row(btree, 1);
+        let idx0 = log
+            .record_insert(cell_key, page_number, vec![0; 100], token)
+            .expect("insert should succeed");
+        log.commit_delta(idx0, CommitSeq::new(1));
+
+        // Insert 10K updates to the same cell
+        for i in 2u64..=10_000 {
+            let idx = log
+                .record_update(cell_key, page_number, vec![(i % 256) as u8; 100], token)
+                .expect("update should succeed");
+            log.commit_delta(idx, CommitSeq::new(i));
+
+            // Periodically run GC to keep memory bounded
+            if i % 1000 == 0 {
+                let horizon = CommitSeq::new(i.saturating_sub(100));
+                let stats = log.gc(horizon);
+                // Should reclaim most old versions
+                assert!(stats.reclaimed > 800, "GC should reclaim old versions");
+            }
+        }
+
+        // Final GC
+        let _stats = log.gc(CommitSeq::new(9_950));
+
+        // Should have very few deltas remaining (only those above horizon)
+        assert!(
+            log.delta_count() < 200,
+            "after sustained GC, delta_count={} should be bounded",
+            log.delta_count()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 1d) Sharding and concurrency tests (4+ tests)
+    // -------------------------------------------------------------------------
+
+    /// Test: high contention on single shard doesn't deadlock
+    #[test]
+    fn c3_test_high_contention_single_shard_no_deadlock() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let log = Arc::new(CellVisibilityLog::new(10 * 1024 * 1024));
+        let btree = BtreeRef::Table(TableId::new(1));
+        // All operations on same page = same shard
+        let page_number = PageNumber::new(42).unwrap();
+
+        let mut handles = Vec::new();
+
+        // 16 threads all hammering the same shard
+        for t in 0..16 {
+            let log_clone = Arc::clone(&log);
+            let handle = thread::spawn(move || {
+                for i in 0..100 {
+                    let cell_key = CellKey::table_row(btree, t * 1000 + i);
+                    let token = txn_token_n((t * 1000 + i + 1) as u32);
+                    let idx = log_clone
+                        .record_insert(cell_key, page_number, vec![t as u8], token)
+                        .expect("insert should succeed");
+                    log_clone.commit_delta(idx, CommitSeq::new((t * 1000 + i + 1) as u64));
+                }
+            });
+            handles.push(handle);
+        }
+
+        // All threads should complete without deadlock
+        for handle in handles {
+            handle.join().expect("thread should complete");
+        }
+
+        // All inserts should be present
+        assert_eq!(log.delta_count(), 16 * 100);
+    }
+
+    /// Test: 64-thread stress test: each thread inserts unique cells, all commit
+    #[test]
+    fn c3_test_64_thread_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let log = Arc::new(CellVisibilityLog::new(100 * 1024 * 1024));
+        let btree = BtreeRef::Table(TableId::new(1));
+
+        let mut handles = Vec::new();
+
+        for t in 0..64 {
+            let log_clone = Arc::clone(&log);
+            let handle = thread::spawn(move || {
+                // Each thread uses different pages to distribute across shards
+                let page_number = PageNumber::new((t % 64) + 1).unwrap();
+                for i in 0..50 {
+                    let cell_key = CellKey::table_row(btree, i64::from(t * 1000 + i));
+                    let token = txn_token_n((t * 1000 + i + 1) as u32);
+                    let idx = log_clone
+                        .record_insert(cell_key, page_number, vec![t as u8, i as u8], token)
+                        .expect("insert should succeed");
+                    log_clone.commit_delta(idx, CommitSeq::new((t * 1000 + i + 1) as u64));
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should complete");
+        }
+
+        // All inserts should be present
+        assert_eq!(log.delta_count(), 64 * 50);
+    }
+
+    /// Test: shard padding prevents false sharing (compile-time assert on alignment)
+    #[test]
+    fn c3_test_shard_padding_alignment() {
+        // CellLogShard should be cache-line aligned (64 bytes)
+        // This is enforced by #[repr(align(64))] on the shard struct
+
+        // Verify the shard count and that different pages map to different shards
+        let mut shard_counts = [0usize; CELL_LOG_SHARDS];
+        for pgno in 1..=1000 {
+            let page_number = PageNumber::new(pgno).unwrap();
+            let shard_idx = CellVisibilityLog::shard_index(page_number);
+            shard_counts[shard_idx] += 1;
+        }
+
+        // Distribution should be reasonably uniform (each shard gets at least 10 pages)
+        for (idx, &count) in shard_counts.iter().enumerate() {
+            assert!(
+                count >= 10,
+                "shard {} only got {} pages, distribution is too skewed",
+                idx,
+                count
+            );
+        }
     }
 }

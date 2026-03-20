@@ -12,6 +12,7 @@ pub mod bocpd;
 pub mod cache_aligned;
 pub mod cell_delta_wal;
 pub mod cell_mvcc_boundary;
+pub mod cell_routing;
 pub mod cell_visibility;
 pub mod compat;
 pub mod conflict_model;
@@ -29,6 +30,7 @@ pub mod index_regen;
 pub mod invariants;
 pub mod left_right;
 pub mod lifecycle;
+pub mod materialize;
 pub mod observability;
 pub mod physical_merge;
 pub mod provenance;
@@ -79,6 +81,11 @@ pub use cell_delta_wal::{
     CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_FRAME_TYPE, CELL_DELTA_HEADER_SIZE,
     CELL_DELTA_MAX_DATA_LEN, CELL_DELTA_MIN_FRAME_SIZE, CellDeltaOp, CellDeltaRecoverySummary,
     CellDeltaWalFrame, deserialize_cell_delta_batch, serialize_cell_delta_batch,
+};
+pub use cell_routing::{
+    CellMvccMode, EscalationResult, PageTrackingState, RoutingContext, RoutingDecision,
+    RoutingReason, TxnEscalationTracker, escalate_to_page_level, get_cell_mvcc_mode,
+    set_cell_mvcc_mode, should_use_cell_path,
 };
 pub use cell_visibility::{
     CellConflict, CellDelta, CellDeltaArena, CellDeltaIdx, CellDeltaKind, CellGcStats, CellKey,
@@ -158,6 +165,10 @@ pub use left_right::{
     reset_leftright_metrics,
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
+pub use materialize::{
+    DEFAULT_MATERIALIZATION_THRESHOLD, MaterializationError, MaterializationResult,
+    MaterializationTrigger, materialize_page, should_materialize_eagerly,
+};
 pub use observability::{
     CasMetricsSnapshot, CasRetriesHistogram, SharedObserver, SnapshotReadMetricsSnapshot,
     SsiMetricsSnapshot, VersionsTraversedHistogram, cas_metrics_snapshot, emit_conflict_resolved,

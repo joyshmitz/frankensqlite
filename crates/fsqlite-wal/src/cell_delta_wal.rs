@@ -5,15 +5,17 @@
 //!
 //! # Design Overview
 //!
-//! Cell-delta frames are distinguished from full-page frames by the high bit of
-//! the page_number field. SQLite databases have at most ~2^30 pages, so the high
-//! bit (0x80000000) is safe to use as a frame type discriminator.
+//! Cell-delta frames are distinguished from full-page frames by a dedicated
+//! marker word in the first 4 bytes. Older encodings also packed the page
+//! number into the lower 31 bits of that word; deserialization still accepts
+//! those legacy frames, but new frames write only the marker so the real page
+//! number can use the full `u32` range supported by [`PageNumber`].
 //!
 //! ## Frame Format
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │ page_number | 0x80000000  (4 bytes, BE) — cell-delta indicator │
+//! │ frame_marker = 0x80000000  (4 bytes, BE) — cell-delta indicator │
 //! ├─────────────────────────────────────────────────────────────────┤
 //! │ actual_page_number          (4 bytes, BE)                      │
 //! ├─────────────────────────────────────────────────────────────────┤
@@ -57,8 +59,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId};
 use tracing::debug;
 
-/// Marker bit in page_number field to indicate a cell-delta frame.
-/// SQLite max page count is ~2^30, so bit 31 is always clear for real pages.
+/// Marker word that indicates a cell-delta frame.
 pub const CELL_DELTA_FRAME_MARKER: u32 = 0x8000_0000;
 
 /// Fixed header size for cell-delta frames (excluding variable cell_data).
@@ -166,8 +167,10 @@ impl CellDeltaWalFrame {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.serialized_size());
 
-        // Marker + actual page number (4 bytes each)
-        buf.extend_from_slice(&(CELL_DELTA_FRAME_MARKER | self.page_number.get()).to_be_bytes());
+        // Frame marker + actual page number (4 bytes each).
+        // Keep the first word as a pure type tag so page numbers can use the
+        // full non-zero u32 range accepted by PageNumber.
+        buf.extend_from_slice(&CELL_DELTA_FRAME_MARKER.to_be_bytes());
         buf.extend_from_slice(&self.page_number.get().to_be_bytes());
 
         // Cell key digest (16 bytes)
@@ -235,6 +238,17 @@ impl CellDeltaWalFrame {
         let page_number = PageNumber::new(actual_pgno).ok_or_else(|| FrankenError::WalCorrupt {
             detail: "cell-delta frame has invalid page number 0".to_owned(),
         })?;
+        if let Some(marker_page) = extract_page_number_from_marker(marker_and_pgno) {
+            if marker_page != page_number {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "cell-delta frame marker page {} disagrees with actual page {}",
+                        marker_page.get(),
+                        page_number.get()
+                    ),
+                });
+            }
+        }
 
         let mut cell_key_digest = [0u8; 16];
         cell_key_digest.copy_from_slice(&data[8..24]);
@@ -321,15 +335,20 @@ pub fn is_cell_delta_frame(frame_data: &[u8]) -> bool {
     marker_and_pgno & CELL_DELTA_FRAME_MARKER != 0
 }
 
-/// Extract the actual page number from a cell-delta frame marker.
+/// Extract the legacy embedded page number from a cell-delta frame marker.
 ///
-/// The marker encodes the page number in the lower 31 bits.
+/// New frames use the first word as a pure type marker and store the real page
+/// number in the second word, so this returns `None` for the current encoding.
 #[must_use]
 pub fn extract_page_number_from_marker(marker_and_pgno: u32) -> Option<PageNumber> {
     if marker_and_pgno & CELL_DELTA_FRAME_MARKER == 0 {
         return None; // Not a cell-delta frame
     }
-    PageNumber::new(marker_and_pgno & !CELL_DELTA_FRAME_MARKER)
+    let embedded_page = marker_and_pgno & !CELL_DELTA_FRAME_MARKER;
+    if embedded_page == 0 {
+        return None;
+    }
+    PageNumber::new(embedded_page)
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +402,10 @@ mod tests {
 
     fn test_txn_id(id: u64) -> TxnId {
         TxnId::new(id).unwrap()
+    }
+
+    fn high_bit_page_number() -> PageNumber {
+        PageNumber::new(0x8000_0042).unwrap()
     }
 
     #[test]
@@ -494,9 +517,15 @@ mod tests {
             u32::from_be_bytes([serialized[0], serialized[1], serialized[2], serialized[3]]);
         assert!(marker_and_pgno & CELL_DELTA_FRAME_MARKER != 0);
 
-        // Verify we can extract page number from marker
-        let extracted = extract_page_number_from_marker(marker_and_pgno);
-        assert_eq!(extracted, Some(test_page_number()));
+        // New frames use a pure marker word; there is no embedded page number.
+        assert_eq!(extract_page_number_from_marker(marker_and_pgno), None);
+
+        // Legacy markers may still embed the page number in the lower 31 bits.
+        let legacy_marker = CELL_DELTA_FRAME_MARKER | test_page_number().get();
+        assert_eq!(
+            extract_page_number_from_marker(legacy_marker),
+            Some(test_page_number())
+        );
     }
 
     #[test]
@@ -612,5 +641,46 @@ mod tests {
             let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
             assert_eq!(frame, deserialized);
         }
+    }
+
+    #[test]
+    fn test_high_bit_page_number_round_trips() {
+        let frame = CellDeltaWalFrame::new(
+            high_bit_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+
+        let serialized = frame.serialize();
+        let deserialized = CellDeltaWalFrame::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.page_number, high_bit_page_number());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_mismatched_legacy_marker_page_number() {
+        let frame = CellDeltaWalFrame::new(
+            test_page_number(),
+            test_cell_key_digest(),
+            CellOp::Insert,
+            CommitSeq::new(100),
+            test_txn_id(42),
+            vec![1, 2, 3],
+        );
+
+        let mut serialized = frame.serialize();
+        let mismatched_marker = CELL_DELTA_FRAME_MARKER | 0x03E7;
+        serialized[..4].copy_from_slice(&mismatched_marker.to_be_bytes());
+
+        let result = CellDeltaWalFrame::deserialize(&serialized);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("disagrees with actual page")
+        );
     }
 }
