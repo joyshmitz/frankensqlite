@@ -664,12 +664,15 @@ impl EbrRetireQueue {
     ///   (typically 2 to ensure all readers have advanced)
     #[must_use]
     pub fn drain_if_safe(&self, current_epoch: u64, min_epoch_gap: u64) -> Vec<VersionIdx> {
-        let oldest = self.oldest_retire_epoch.load(Ordering::Relaxed);
-        if oldest == 0 {
-            // No pending retirements
+        // Check if there are any pending retirements by looking at the queue.
+        // We can't use oldest_retire_epoch as a sentinel since epoch 0 is valid.
+        let pending = self.pending.lock();
+        if pending.is_empty() {
             return Vec::new();
         }
+        drop(pending);
 
+        let oldest = self.oldest_retire_epoch.load(Ordering::Relaxed);
         if current_epoch.saturating_sub(oldest) < min_epoch_gap {
             // Not enough epochs have passed
             return Vec::new();
@@ -681,7 +684,6 @@ impl EbrRetireQueue {
 
         let count = drained.len() as u64;
         if count > 0 {
-            self.oldest_retire_epoch.store(0, Ordering::Relaxed);
             self.total_recycled.fetch_add(count, Ordering::Relaxed);
             GLOBAL_EBR_METRICS.record_gc_freed(count);
         }
@@ -1216,14 +1218,14 @@ mod tests {
 
         assert_eq!(queue.pending_count(), 3);
 
-        // Epoch 2: not enough gap from oldest (epoch 0).
-        let drained = queue.drain_if_safe(2, 2);
-        assert!(drained.is_empty());
+        // Epoch 1: not enough gap from oldest (epoch 0). Gap = 1 < 2.
+        let drained = queue.drain_if_safe(1, 2);
+        assert!(drained.is_empty(), "epoch 1: gap of 1 is not sufficient");
 
-        // Epoch 5: sufficient gap from oldest (epoch 0).
+        // Epoch 2: sufficient gap from oldest (epoch 0). Gap = 2 >= 2.
         // All pending slots are drained together.
-        let drained = queue.drain_if_safe(5, 2);
-        assert_eq!(drained.len(), 3);
+        let drained = queue.drain_if_safe(2, 2);
+        assert_eq!(drained.len(), 3, "epoch 2: gap of 2 is sufficient");
     }
 
     #[test]
