@@ -827,6 +827,19 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    fn row_arrays(result: &JsValue) -> Array {
+        Reflect::get(result, &JsValue::from_str("rowArrays"))
+            .expect("rowArrays field should exist")
+            .unchecked_into::<Array>()
+    }
+
+    fn error_message(error: &JsValue) -> String {
+        Reflect::get(error, &JsValue::from_str("message"))
+            .expect("message field should exist")
+            .as_string()
+            .expect("message should be a string")
+    }
+
     #[wasm_bindgen_test]
     fn wasm_db_roundtrip() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -843,6 +856,49 @@ mod wasm_tests {
             .unchecked_into::<Array>();
 
         assert_eq!(rows.length(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_open_reports_default_memory_path_and_close_is_idempotent() {
+        let db = FrankenDb::open(None).expect("db should open via static constructor");
+        assert_eq!(db.path(), ":memory:");
+
+        db.close();
+        db.close();
+
+        let error = db
+            .query("SELECT 1")
+            .expect_err("queries after close should produce a JS error");
+        assert!(error_message(&error).contains("closed"));
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_execute_reports_changes_and_batch_runs_multiple_statements() {
+        let db = FrankenDb::new(None).expect("db should open");
+        assert_eq!(
+            db.execute("CREATE TABLE wasm_counts (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("table create should succeed"),
+            0
+        );
+        assert_eq!(
+            db.execute("INSERT INTO wasm_counts (id, name) VALUES (1, 'alpha')")
+                .expect("single insert should report one change"),
+            1
+        );
+        db.execute_batch(
+            "INSERT INTO wasm_counts (id, name) VALUES (2, 'beta');\
+             INSERT INTO wasm_counts (id, name) VALUES (3, 'gamma');\
+             UPDATE wasm_counts SET name = 'delta' WHERE id = 2;",
+        )
+        .expect("batch execution should succeed");
+
+        let rows = row_arrays(
+            &db.query("SELECT id, name FROM wasm_counts ORDER BY id")
+                .expect("query should succeed"),
+        );
+        assert_eq!(rows.length(), 3);
+        let second_row = rows.get(1).unchecked_into::<Array>();
+        assert_eq!(second_row.get(1).as_string().as_deref(), Some("delta"));
     }
 
     #[wasm_bindgen_test]
@@ -1019,6 +1075,78 @@ mod wasm_tests {
         let raw_row = row_arrays.get(0).unchecked_into::<Array>();
         assert_eq!(raw_row.get(0).as_f64(), Some(2.0));
         assert_eq!(raw_row.get(1).as_string().as_deref(), Some("beta"));
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_prepare_supports_sql_query_execute_and_explain_without_params() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute_batch(
+            "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT);\
+             INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha');\
+             INSERT INTO wasm_stmt_surface (id, name) VALUES (2, 'beta');",
+        )
+        .expect("batch execution should succeed");
+
+        let stmt = db
+            .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
+            .expect("statement should prepare");
+        assert_eq!(
+            stmt.sql(),
+            "SELECT id, name FROM wasm_stmt_surface ORDER BY id"
+        );
+        assert_eq!(
+            stmt.execute()
+                .expect("execute should report visible row count"),
+            2
+        );
+
+        let rows = row_arrays(&stmt.query().expect("prepared query should succeed"));
+        assert_eq!(rows.length(), 2);
+        let first_row = rows.get(0).unchecked_into::<Array>();
+        assert_eq!(first_row.get(0).as_f64(), Some(1.0));
+        assert_eq!(first_row.get(1).as_string().as_deref(), Some("alpha"));
+
+        let stmt_explain = stmt.explain().expect("statement explain should succeed");
+        assert!(
+            !stmt_explain.trim().is_empty(),
+            "statement explain output should not be empty"
+        );
+
+        let db_explain = db
+            .explain("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
+            .expect("db explain should succeed");
+        assert!(
+            !db_explain.trim().is_empty(),
+            "db explain output should not be empty"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_prepared_execute_with_params_inserts_rows() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute("CREATE TABLE wasm_stmt_insert (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("table create should succeed");
+
+        let stmt = db
+            .prepare("INSERT INTO wasm_stmt_insert (id, name) VALUES (?, ?)")
+            .expect("insert statement should prepare");
+        let params = Array::new();
+        params.push(&JsValue::from_f64(1.0));
+        params.push(&JsValue::from_str("alpha"));
+        assert_eq!(
+            stmt.execute_with_params(params.into())
+                .expect("prepared insert should report one change"),
+            1
+        );
+
+        let rows = row_arrays(
+            &db.query("SELECT id, name FROM wasm_stmt_insert")
+                .expect("query should succeed"),
+        );
+        assert_eq!(rows.length(), 1);
+        let row = rows.get(0).unchecked_into::<Array>();
+        assert_eq!(row.get(0).as_f64(), Some(1.0));
+        assert_eq!(row.get(1).as_string().as_deref(), Some("alpha"));
     }
 
     #[wasm_bindgen_test]
