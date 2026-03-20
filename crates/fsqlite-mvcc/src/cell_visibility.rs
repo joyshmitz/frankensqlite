@@ -2872,9 +2872,9 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        /// Property: snapshot isolation
-        /// Given: N concurrent txns, each inserting M unique cells
-        /// Property: every committed txn's reads are consistent with its snapshot
+        // Property: snapshot isolation
+        // Given: N concurrent txns, each inserting M unique cells
+        // Property: every committed txn's reads are consistent with its snapshot
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(50))]
 
@@ -2940,9 +2940,9 @@ mod tests {
             }
         }
 
-        /// Property: conflict detection completeness
-        /// Given: random interleaving of cell-level operations on same page
-        /// Property: if two txns write the same cell, at most one commits without retry
+        // Property: conflict detection completeness
+        // Given: random interleaving of cell-level operations on same page
+        // Property: if two txns write the same cell, at most one commits without retry
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -2984,9 +2984,9 @@ mod tests {
             }
         }
 
-        /// Property: GC safety
-        /// Given: random sequence of insert/update/delete + GC advances
-        /// Property: no visible version is ever reclaimed
+        // Property: GC safety
+        // Given: random sequence of insert/update/delete + GC advances
+        // Property: no visible version is ever reclaimed
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(50))]
 
