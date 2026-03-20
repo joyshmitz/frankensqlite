@@ -210,14 +210,16 @@ pub fn write_segment(
         .open(&path)?;
     let mut writer = BufWriter::new(file);
 
+    let ordered_records = ordered_segment_records(batch.epoch, &batch.records)?;
+
     // Write header
-    let header = SegmentHeader::new(batch.epoch, batch.records.len() as u32);
+    let header = SegmentHeader::new(batch.epoch, ordered_records.len() as u32);
     let header_bytes = header.to_bytes();
     writer.write_all(&header_bytes)?;
     let mut total_bytes = SEGMENT_HEADER_SIZE;
 
-    // Write records (simple length-prefixed format)
-    for record in &batch.records {
+    // Write records in canonical replay order so crash recovery is deterministic.
+    for record in &ordered_records {
         let record_bytes = serialize_record(record);
         let len = record_bytes.len() as u32;
         writer.write_all(&len.to_le_bytes())?;
@@ -260,7 +262,7 @@ pub fn read_segment(path: &Path) -> io::Result<(SegmentHeader, Vec<WalRecord>)> 
         records.push(record);
     }
 
-    Ok((header, records))
+    Ok((header, ordered_segment_records(header.epoch, &records)?))
 }
 
 /// Delete a segment file.
@@ -330,20 +332,31 @@ pub fn recover_segments(
         // Try to read the segment
         match read_segment(path) {
             Ok((header, records)) => {
+                if header.epoch != *epoch {
+                    let error = io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "segment {} has mismatched epoch: header={}, filename={}",
+                            path.display(),
+                            header.epoch,
+                            epoch
+                        ),
+                    );
+                    if options.skip_corrupt {
+                        eprintln!(
+                            "warning: skipping corrupt segment {}: {error}",
+                            path.display()
+                        );
+                        result.partial_segments.push(path.clone());
+                        continue;
+                    }
+                    return Err(error);
+                }
+
                 result.segments_recovered += 1;
                 result.records_applied += records.len();
                 result.bytes_read += file_size;
                 result.epochs.push(*epoch);
-
-                // Verify header epoch matches file name epoch
-                if header.epoch != *epoch {
-                    eprintln!(
-                        "warning: segment {} has mismatched epoch: header={}, filename={}",
-                        path.display(),
-                        header.epoch,
-                        epoch
-                    );
-                }
 
                 all_records.extend(records);
             }
@@ -371,7 +384,21 @@ pub fn recover_segments(
         }
     }
 
-    Ok((result, all_records))
+    Ok((result, EpochOrderCoordinator::recovery_order(&all_records)))
+}
+
+fn ordered_segment_records(epoch: u64, records: &[WalRecord]) -> io::Result<Vec<WalRecord>> {
+    let ordered = EpochOrderCoordinator::recovery_order(records);
+    if let Some(record) = ordered.iter().find(|record| record.epoch != epoch) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "segment epoch {epoch} contains record from epoch {}",
+                record.epoch
+            ),
+        ));
+    }
+    Ok(ordered)
 }
 
 /// Recover segments and apply records to a page cache.
@@ -644,7 +671,7 @@ impl ParallelWalCoordinator {
     /// Returns the epoch in which the batch was submitted.
     pub fn submit_batch(&self, batch: ParallelWalBatch) -> Result<u64, String> {
         let slot = self.thread_slot();
-        let epoch = self.inner.current_epoch();
+        let epoch = self.inner.current_append_epoch();
         let records = batch
             .frames
             .into_iter()
@@ -1246,6 +1273,100 @@ mod tests {
     }
 
     #[test]
+    fn test_segment_write_and_recovery_canonicalize_intra_epoch_order() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("ordered.db");
+        let page_id = PageNumber::new(1).unwrap();
+
+        let later = WalRecord {
+            txn_token: TxnToken::new(
+                fsqlite_types::TxnId::new(2).unwrap(),
+                fsqlite_types::TxnEpoch::new(0),
+            ),
+            epoch: 7,
+            page_id,
+            begin_seq: CommitSeq::new(200),
+            end_seq: Some(CommitSeq::new(200)),
+            before_image: Vec::new(),
+            after_image: vec![0x22; 8],
+        };
+        let earlier = WalRecord {
+            txn_token: TxnToken::new(
+                fsqlite_types::TxnId::new(1).unwrap(),
+                fsqlite_types::TxnEpoch::new(0),
+            ),
+            epoch: 7,
+            page_id,
+            begin_seq: CommitSeq::new(100),
+            end_seq: Some(CommitSeq::new(100)),
+            before_image: Vec::new(),
+            after_image: vec![0x11; 8],
+        };
+        let batch = EpochFlushBatch {
+            epoch: 7,
+            records: vec![later, earlier],
+            records_per_core: vec![1, 1],
+        };
+
+        write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+
+        let seg_path = segment_path(&db_path, 7);
+        let (_, records) = read_segment(&seg_path).expect("read should succeed");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].begin_seq, CommitSeq::new(100));
+        assert_eq!(records[1].begin_seq, CommitSeq::new(200));
+
+        let mut page_contents = HashMap::new();
+        recover_and_apply_segments(
+            &db_path,
+            &mut page_contents,
+            SegmentRecoveryOptions::default(),
+        )
+        .expect("recovery should succeed");
+        assert_eq!(
+            page_contents.get(&page_id.get()),
+            Some(&vec![0x22; 8]),
+            "recovery must replay the later commit last even if the flushed batch arrived out of order"
+        );
+    }
+
+    #[test]
+    fn test_write_segment_rejects_record_epoch_mismatch() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("mismatch.db");
+
+        let batch = EpochFlushBatch {
+            epoch: 5,
+            records: vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(1).unwrap(),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch: 4,
+                page_id: PageNumber::new(1).unwrap(),
+                begin_seq: CommitSeq::new(100),
+                end_seq: Some(CommitSeq::new(100)),
+                before_image: Vec::new(),
+                after_image: vec![0xAB; 8],
+            }],
+            records_per_core: vec![1],
+        };
+
+        let error = write_segment(&db_path, &batch, FsyncPolicy::Off)
+            .expect_err("segment write must reject mixed-epoch records");
+        assert!(
+            error
+                .to_string()
+                .contains("segment epoch 5 contains record from epoch 4"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_list_segments() {
         use tempfile::tempdir;
 
@@ -1329,6 +1450,54 @@ mod tests {
 
         // Cleanup
         cleanup_segments(&db_path).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn test_recover_segments_rejects_header_filename_epoch_mismatch() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("rename.db");
+        let batch = EpochFlushBatch {
+            epoch: 5,
+            records: vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(1).unwrap(),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch: 5,
+                page_id: PageNumber::new(1).unwrap(),
+                begin_seq: CommitSeq::new(100),
+                end_seq: Some(CommitSeq::new(100)),
+                before_image: Vec::new(),
+                after_image: vec![0xAA; 8],
+            }],
+            records_per_core: vec![1],
+        };
+        write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+
+        let original = segment_path(&db_path, 5);
+        let renamed = segment_path(&db_path, 3);
+        std::fs::rename(&original, &renamed).expect("rename should succeed");
+
+        let error = recover_segments(&db_path, SegmentRecoveryOptions::default())
+            .expect_err("recovery must fail closed on mismatched epoch metadata");
+        assert!(
+            error.to_string().contains("mismatched epoch"),
+            "unexpected error: {error}"
+        );
+
+        let (result, records) = recover_segments(
+            &db_path,
+            SegmentRecoveryOptions {
+                skip_corrupt: true,
+                ..Default::default()
+            },
+        )
+        .expect("skip_corrupt should ignore the bad segment");
+        assert_eq!(result.segments_recovered, 0);
+        assert_eq!(result.partial_segments, vec![renamed]);
+        assert!(records.is_empty());
     }
 
     #[test]

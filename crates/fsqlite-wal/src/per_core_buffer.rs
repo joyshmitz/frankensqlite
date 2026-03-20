@@ -581,6 +581,7 @@ struct EpochWaitState {
 pub struct EpochOrderCoordinator {
     pool: Arc<PerCoreWalBufferPool>,
     current_epoch: AtomicU64,
+    append_epoch: AtomicU64,
     wait_state: Mutex<EpochWaitState>,
     wait_cv: Condvar,
     config: EpochConfig,
@@ -596,6 +597,7 @@ impl EpochOrderCoordinator {
         Self {
             pool,
             current_epoch: AtomicU64::new(0),
+            append_epoch: AtomicU64::new(0),
             wait_state: Mutex::new(wait_state),
             wait_cv: Condvar::new(),
             config,
@@ -604,6 +606,10 @@ impl EpochOrderCoordinator {
 
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn current_append_epoch(&self) -> u64 {
+        self.append_epoch.load(Ordering::SeqCst)
     }
 
     pub fn durable_epoch(&self) -> Option<u64> {
@@ -643,7 +649,7 @@ impl EpochOrderCoordinator {
         payload_len: usize,
     ) -> Result<AppendOutcome, String> {
         let mut record = make_record(core_id, begin_seq, payload_len);
-        record.epoch = self.current_epoch();
+        record.epoch = self.current_append_epoch();
         self.pool.append_to_core(core_id, record)
     }
 
@@ -707,6 +713,7 @@ impl EpochOrderCoordinator {
 
         drop(guard);
         self.pool.seal_active_for_epoch(previous_epoch)?;
+        self.append_epoch.store(next_epoch, Ordering::SeqCst);
         Ok(next_epoch)
     }
 
@@ -1047,6 +1054,75 @@ fn bd_ncivz_2_epoch_fence_waits_for_active_core_observation() {
 
     assert_eq!(next_epoch, 1);
     assert_eq!(coordinator.current_epoch(), 1);
+}
+
+#[test]
+fn bd_ncivz_2_append_during_epoch_fence_stays_in_previous_epoch_lane() {
+    let coordinator = Arc::new(EpochOrderCoordinator::new(
+        1,
+        BufferConfig::default(),
+        EpochConfig::default(),
+    ));
+    coordinator
+        .observe_epoch(0)
+        .expect("core 0 observation should succeed");
+    coordinator
+        .append_to_core(0, 1, 64)
+        .expect("initial append should succeed");
+
+    let runtime = test_runtime();
+    let handle = runtime.handle();
+
+    runtime.block_on(async {
+        let advance_ref = Arc::clone(&coordinator);
+        let advance = handle
+            .try_spawn(async move {
+                spawn_blocking(move || {
+                    advance_ref.advance_epoch_and_wait(&[0], Duration::from_millis(200))
+                })
+                .await
+            })
+            .expect("advance task should spawn");
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while coordinator.current_epoch() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "advance should publish epoch 1 before timing out"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            coordinator.current_append_epoch(),
+            0,
+            "writers must keep appending to the previous epoch until sealing completes"
+        );
+
+        coordinator
+            .append_to_core(0, 2, 64)
+            .expect("append during fence window should still succeed");
+        coordinator
+            .observe_epoch(0)
+            .expect("core 0 observation should release the fence");
+
+        let next_epoch = advance.await.expect("advance should complete");
+        assert_eq!(next_epoch, 1);
+    });
+
+    let batch = coordinator
+        .flush_epoch(0)
+        .expect("flush should not see an epoch straddle");
+    assert_eq!(batch.total_records(), 2);
+    assert_eq!(batch.records_per_core, vec![2]);
+    assert!(
+        batch.records.iter().all(|record| record.epoch == 0),
+        "records appended during the fence window must stay in epoch 0: {:?}",
+        batch
+            .records
+            .iter()
+            .map(|record| record.epoch)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
