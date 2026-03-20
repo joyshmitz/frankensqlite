@@ -2729,55 +2729,6 @@ where
 
         Ok(())
     }
-    /// Commit using the WAL protocol (append frames to WAL file).
-    fn commit_wal(
-        cx: &Cx,
-        inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, StagedPage>,
-        write_pages_sorted: &[PageNumber],
-    ) -> Result<()> {
-        if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
-        {
-            let mut prepared_batch = {
-                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
-                    FrankenError::internal("WAL mode active but no WAL backend installed")
-                })?;
-                wal.prepare_append_frames(&batch.frames)?
-            };
-            if let Some(prepared_batch) = prepared_batch.as_mut() {
-                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
-                    FrankenError::internal("WAL mode active but no WAL backend installed")
-                })?;
-                wal.finalize_prepared_frames(cx, prepared_batch)?;
-            }
-
-            // Escalate to EXCLUSIVE before writing WAL frames.
-            // This prevents concurrent processes from appending to the WAL
-            // simultaneously, which would cause corruption.
-            inner.db_file.lock(cx, LockLevel::Exclusive)?;
-
-            let wal = inner.wal_backend.as_mut().ok_or_else(|| {
-                FrankenError::internal("WAL mode active but no WAL backend installed")
-            })?;
-            if let Some(prepared_batch) = prepared_batch.as_mut() {
-                wal.append_prepared_frames(cx, prepared_batch)?;
-            } else {
-                wal.append_frames(cx, &batch.frames)?;
-            }
-
-            if inner.wal_commit_sync_policy.should_sync_on_commit() {
-                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
-                    FrankenError::internal("WAL backend disappeared during commit")
-                })?;
-                wal.sync(cx)?;
-            }
-
-            // Update db_size for any new pages.
-            inner.db_size = batch.new_db_size;
-        }
-
-        Ok(())
-    }
 
     /// Commit using the WAL protocol with group commit batching.
     ///
