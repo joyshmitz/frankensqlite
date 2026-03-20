@@ -9,8 +9,8 @@ rust-version.workspace = true
 
 [features]
 default = ["native"]
-native = ["fsqlite-pager/native", "fsqlite-wal/native"]
-wasm = ["fsqlite-pager/wasm", "fsqlite-wal/wasm"]
+native = ["fsqlite-btree/native", "fsqlite-pager/native", "fsqlite-wal/native"]
+wasm = ["fsqlite-btree/wasm", "fsqlite-pager/wasm", "fsqlite-wal/wasm"]
 linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
 
 [dependencies]
