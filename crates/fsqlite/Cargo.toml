@@ -19,6 +19,7 @@ fsqlite-ext-rtree = { workspace = true, optional = true }
 fsqlite-ext-session = { workspace = true, optional = true }
 fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
+fsqlite-parser = { workspace = true }
 
 [features]
 default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]
@@ -37,7 +38,6 @@ mvcc = []
 
 [dev-dependencies]
 fsqlite-ast = { workspace = true }
-fsqlite-parser = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }

@@ -1,5 +1,7 @@
 //! Connection open flags, analogous to `rusqlite::OpenFlags`.
 
+use std::path::Path;
+
 use fsqlite_error::FrankenError;
 use fsqlite_types::flags::VfsOpenFlags;
 
@@ -10,6 +12,13 @@ use crate::Connection;
 /// Under the hood these map to `VfsOpenFlags`.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenFlags(u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessMode {
+    ReadOnly,
+    ReadWrite,
+    ReadWriteCreate,
+}
 
 impl OpenFlags {
     /// Open the database in read-only mode.
@@ -41,8 +50,7 @@ impl OpenFlags {
         let mut flags = VfsOpenFlags::MAIN_DB;
         if self.contains(Self::SQLITE_OPEN_READ_ONLY) {
             flags |= VfsOpenFlags::READONLY;
-        }
-        if self.contains(Self::SQLITE_OPEN_READ_WRITE) {
+        } else if self.contains(Self::SQLITE_OPEN_READ_WRITE) {
             flags |= VfsOpenFlags::READWRITE;
         }
         if self.contains(Self::SQLITE_OPEN_CREATE) {
@@ -50,6 +58,33 @@ impl OpenFlags {
         }
         flags
     }
+}
+
+fn classify_access_mode(flags: OpenFlags) -> Result<AccessMode, FrankenError> {
+    let read_only = flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY);
+    let read_write = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
+    let create = flags.contains(OpenFlags::SQLITE_OPEN_CREATE);
+
+    match (read_only, read_write, create) {
+        (true, false, false) => Ok(AccessMode::ReadOnly),
+        (false, true, false) => Ok(AccessMode::ReadWrite),
+        (false, true, true) => Ok(AccessMode::ReadWriteCreate),
+        _ => Err(FrankenError::TypeMismatch {
+            expected:
+                "one of SQLITE_OPEN_READ_ONLY, SQLITE_OPEN_READ_WRITE, or SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE"
+                    .into(),
+            actual: format!("open flags 0x{:x}", flags.0),
+        }),
+    }
+}
+
+fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
+    if path == ":memory:" {
+        return Err(FrankenError::NotImplemented(
+            "read-only :memory: connections are not supported".to_owned(),
+        ));
+    }
+    Connection::open_schema_only(path)
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -77,10 +112,15 @@ impl std::ops::BitOr for OpenFlags {
 /// let conn = open_with_flags("my.db", OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 /// ```
 pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
-    if flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Connection::open_schema_only(path)
-    } else {
-        Connection::open(path)
+    match classify_access_mode(flags)? {
+        AccessMode::ReadOnly => open_read_only_connection(path),
+        AccessMode::ReadWrite => {
+            if path != ":memory:" && !Path::new(path).exists() {
+                return Err(FrankenError::CannotOpen { path: path.into() });
+            }
+            Connection::open(path)
+        }
+        AccessMode::ReadWriteCreate => Connection::open(path),
     }
 }
 
@@ -123,5 +163,45 @@ mod tests {
         assert!(vfs.contains(VfsOpenFlags::READONLY));
         assert!(!vfs.contains(VfsOpenFlags::READWRITE));
         assert!(vfs.contains(VfsOpenFlags::MAIN_DB));
+    }
+
+    #[test]
+    fn vfs_flags_conversion_prefers_read_only_when_both_are_present() {
+        let vfs =
+            (OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_READ_WRITE).to_vfs_flags();
+        assert!(vfs.contains(VfsOpenFlags::READONLY));
+        assert!(!vfs.contains(VfsOpenFlags::READWRITE));
+    }
+
+    #[test]
+    fn open_with_flags_read_write_without_create_missing_db_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.db");
+        let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .expect_err("READ_WRITE without CREATE should not create a missing database");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn classify_access_mode_rejects_create_without_read_write() {
+        let error = classify_access_mode(OpenFlags::SQLITE_OPEN_CREATE)
+            .expect_err("CREATE alone is not a valid sqlite3_open_v2 access mode");
+        assert!(matches!(error, FrankenError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn classify_access_mode_rejects_read_only_create_combo() {
+        let error =
+            classify_access_mode(OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_CREATE)
+                .expect_err("READ_ONLY | CREATE is not a valid sqlite3_open_v2 access mode");
+        assert!(matches!(error, FrankenError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn open_with_flags_read_only_in_memory_is_rejected() {
+        let error = open_with_flags(":memory:", OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect_err("compat open must not return a writable connection for READ_ONLY");
+        assert!(matches!(error, FrankenError::NotImplemented(_)));
     }
 }

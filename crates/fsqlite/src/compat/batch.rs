@@ -28,14 +28,14 @@ pub trait BatchExt {
 
 impl BatchExt for Connection {
     fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        if batch_is_noop(sql) {
+        if batch_is_noop(sql)? {
             return Ok(());
         }
         self.execute(sql).map(|_| ())
     }
 }
 
-fn batch_is_noop(sql: &str) -> bool {
+fn batch_is_noop(sql: &str) -> Result<bool, FrankenError> {
     let bytes = sql.as_bytes();
     let mut i = 0;
 
@@ -51,20 +51,29 @@ fn batch_is_noop(sql: &str) -> bool {
                 }
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let comment_start = i;
                 i += 2;
+                let mut terminated = false;
                 while i + 1 < bytes.len() {
                     if bytes[i] == b'*' && bytes[i + 1] == b'/' {
                         i += 2;
+                        terminated = true;
                         break;
                     }
                     i += 1;
                 }
+                if !terminated {
+                    return Err(FrankenError::ParseError {
+                        offset: comment_start,
+                        detail: "unterminated block comment".to_owned(),
+                    });
+                }
             }
-            _ => return false,
+            _ => return Ok(false),
         }
     }
 
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -152,9 +161,24 @@ mod tests {
 
     #[test]
     fn batch_is_noop_handles_whitespace_semicolons_and_comments() {
-        assert!(batch_is_noop(""));
-        assert!(batch_is_noop("  ;\n\t; "));
-        assert!(batch_is_noop("-- comment only\n/* and block */ ;"));
-        assert!(!batch_is_noop("SELECT 1"));
+        assert!(batch_is_noop("").unwrap());
+        assert!(batch_is_noop("  ;\n\t; ").unwrap());
+        assert!(batch_is_noop("-- comment only\n/* and block */ ;").unwrap());
+        assert!(!batch_is_noop("SELECT 1").unwrap());
+    }
+
+    #[test]
+    fn execute_batch_rejects_unterminated_block_comment() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .execute_batch("/* unterminated")
+            .expect_err("unterminated block comments should not be treated as empty batches");
+        assert!(matches!(error, FrankenError::ParseError { .. }));
+    }
+
+    #[test]
+    fn batch_is_noop_rejects_unterminated_block_comment() {
+        let error = batch_is_noop("/*").expect_err("unterminated block comments are not no-ops");
+        assert!(matches!(error, FrankenError::ParseError { offset: 0, .. }));
     }
 }
