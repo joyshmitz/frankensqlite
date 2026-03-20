@@ -2793,23 +2793,31 @@ where
         // such pages would cause corruption when the B-tree layer interprets
         // them as valid pages (page type 0x00 is invalid). Return BusySnapshot
         // so the caller can retry with a fresh transaction if needed.
+        //
+        // Exception: pages allocated by THIS transaction (in allocated_from_eof
+        // or allocated_from_freelist) are allowed even if beyond published_db_size.
         if page_no.get() > self.published_db_size {
-            tracing::trace!(
-                target: "fsqlite.snapshot_publication",
-                trace_id = cx.trace_id(),
-                run_id = "pager-publication",
-                scenario_id = "page_beyond_snapshot_db_size",
-                page_no = page_no.get(),
-                published_db_size = self.published_db_size,
-                "page beyond transaction's snapshot db_size"
-            );
-            return Err(FrankenError::BusySnapshot {
-                conflicting_pages: format!(
-                    "page {} > snapshot db_size {}",
-                    page_no.get(),
-                    self.published_db_size
-                ),
-            });
+            let page_allocated_by_this_txn = self.allocated_from_eof.contains(&page_no)
+                || self.allocated_from_freelist.contains(&page_no)
+                || self.page_lease.contains(&page_no);
+            if !page_allocated_by_this_txn {
+                tracing::trace!(
+                    target: "fsqlite.snapshot_publication",
+                    trace_id = cx.trace_id(),
+                    run_id = "pager-publication",
+                    scenario_id = "page_beyond_snapshot_db_size",
+                    page_no = page_no.get(),
+                    published_db_size = self.published_db_size,
+                    "page beyond transaction's snapshot db_size"
+                );
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: format!(
+                        "page {} > snapshot db_size {}",
+                        page_no.get(),
+                        self.published_db_size
+                    ),
+                });
+            }
         }
 
         let read_start = Instant::now();
@@ -3390,6 +3398,7 @@ where
             self.savepoint_stack.clear();
             self.original_db_size = committed_db_size;
             self.published_visible_commit_seq = publish_update.visible_commit_seq;
+            self.published_db_size = publish_update.db_size;
             // Transaction stays active — committed/finished remain false.
             Ok(true)
         } else {
