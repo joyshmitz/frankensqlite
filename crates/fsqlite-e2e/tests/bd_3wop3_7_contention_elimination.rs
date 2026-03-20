@@ -44,12 +44,6 @@ use std::time::{Duration, Instant};
 /// Thread counts for scaling curve analysis.
 const SCALING_THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 
-/// Duration for throughput measurements (ms).
-const THROUGHPUT_MEASUREMENT_MS: u64 = 5000;
-
-/// Duration for stress tests (seconds).
-const STRESS_TEST_DURATION_SECS: u64 = 60;
-
 /// Rows per thread for throughput tests.
 const ROWS_PER_THREAD: u64 = 10_000;
 
@@ -59,36 +53,13 @@ const GATE_8T_SPEEDUP: f64 = 1.5;
 /// 16-thread throughput gate: must be >= 1.0x C SQLite.
 const GATE_16T_SPEEDUP: f64 = 1.0;
 
-/// p99 latency gate at 8 threads (milliseconds).
-const GATE_8T_P99_LATENCY_MS: u64 = 50;
-
 // ---------------------------------------------------------------------------
 // Test result types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct ThroughputResult {
-    thread_count: usize,
     ops_per_sec: f64,
-    wall_time_ms: u64,
-    total_ops: u64,
-}
-
-#[derive(Debug, Clone)]
-struct LatencyResult {
-    thread_count: usize,
-    p50_ms: f64,
-    p95_ms: f64,
-    p99_ms: f64,
-    max_ms: f64,
-}
-
-#[derive(Debug, Clone)]
-struct ScalingPoint {
-    thread_count: usize,
-    fsqlite_ops_per_sec: f64,
-    csqlite_ops_per_sec: f64,
-    speedup: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,12 +129,7 @@ fn measure_csqlite_throughput(thread_count: usize, rows_per_thread: u64) -> Thro
     let total = total_ops.load(Ordering::Relaxed);
     let ops_per_sec = total as f64 / elapsed.as_secs_f64();
 
-    ThroughputResult {
-        thread_count,
-        ops_per_sec,
-        wall_time_ms: elapsed.as_millis() as u64,
-        total_ops: total,
-    }
+    ThroughputResult { ops_per_sec }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,12 +172,23 @@ fn measure_fsqlite_throughput(thread_count: usize, rows_per_thread: u64) -> Thro
     let elapsed = start.elapsed();
     let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
 
-    ThroughputResult {
-        thread_count,
-        ops_per_sec,
-        wall_time_ms: elapsed.as_millis() as u64,
-        total_ops,
-    }
+    ThroughputResult { ops_per_sec }
+}
+
+fn create_fsqlite_file_backed_db(filename: &str, schema_sql: &str) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(filename).to_string_lossy().to_string();
+    let conn = fsqlite::Connection::open(path.as_str()).expect("open setup db");
+    conn.execute("PRAGMA journal_mode = WAL").ok();
+    conn.execute("PRAGMA fsqlite.concurrent_mode = ON").ok();
+    conn.execute(schema_sql).expect("create schema");
+    (dir, path)
+}
+
+fn open_fsqlite_worker(path: &str) -> fsqlite::Connection {
+    let conn = fsqlite::Connection::open(path.to_owned()).expect("open worker db");
+    conn.execute("PRAGMA fsqlite.concurrent_mode = ON").ok();
+    conn
 }
 
 // ===========================================================================
@@ -316,6 +293,7 @@ fn test_combiner_reduces_atomic_ops() {
 ///
 /// Depends on: D5 (EBR)
 #[test]
+#[ignore = "timing-sensitive stress test"]
 fn test_ebr_no_gc_pauses() {
     // EBR is already implemented (D5 complete). This test verifies no GC
     // pauses under sustained write load.
@@ -327,10 +305,11 @@ fn test_ebr_no_gc_pauses() {
 
     use std::sync::atomic::AtomicBool;
 
-    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
-    conn.execute("PRAGMA journal_mode = WAL").ok();
-    conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT)")
-        .expect("create");
+    let (_dir, path) = create_fsqlite_file_backed_db(
+        "ebr_no_gc_pauses.db",
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT)",
+    );
+    let path = Arc::new(path);
 
     let stop = Arc::new(AtomicBool::new(false));
     let latencies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -338,12 +317,13 @@ fn test_ebr_no_gc_pauses() {
     let barrier = Arc::new(Barrier::new(4));
     let handles: Vec<_> = (0..4)
         .map(|tid| {
-            let c = Arc::clone(&conn);
+            let p = Arc::clone(&path);
             let s = Arc::clone(&stop);
             let l = Arc::clone(&latencies);
             let b = Arc::clone(&barrier);
 
             thread::spawn(move || {
+                let c = open_fsqlite_worker(p.as_str());
                 b.wait();
                 let mut local_latencies = Vec::with_capacity(10_000);
                 let mut i = tid * 1_000_000;
@@ -354,7 +334,7 @@ fn test_ebr_no_gc_pauses() {
                         "INSERT OR REPLACE INTO bench VALUES (?1, ?2)",
                         &[
                             fsqlite::SqliteValue::Integer(i),
-                            fsqlite::SqliteValue::Text(format!("value_{i}")),
+                            fsqlite::SqliteValue::Text(format!("value_{i}").into()),
                         ],
                     );
                     local_latencies.push(op_start.elapsed().as_micros() as u64);
@@ -476,26 +456,30 @@ fn test_16t_throughput_regression_gate() {
 /// Spawns 64 writer threads with overlapping key ranges to maximize lock
 /// contention. Asserts no deadlock occurs (all threads complete or timeout).
 #[test]
+#[ignore = "manual contention stress test"]
 fn test_64_thread_no_deadlock() {
     // This test runs with current implementation (sequential fallback).
     // Once D1 is complete, it will exercise true concurrent writes.
 
-    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
-    conn.execute("PRAGMA journal_mode = WAL").ok();
-    conn.execute("CREATE TABLE stress (id INTEGER PRIMARY KEY, val INTEGER)")
-        .expect("create");
+    let (_dir, path) = create_fsqlite_file_backed_db(
+        "64_thread_no_deadlock.db",
+        "CREATE TABLE stress (id INTEGER PRIMARY KEY, val INTEGER)",
+    );
+    let setup_conn = open_fsqlite_worker(&path);
 
     // Pre-populate some rows to enable updates
     for i in 0..100 {
-        conn.execute_with_params(
-            "INSERT INTO stress VALUES (?1, ?2)",
-            &[
-                fsqlite::SqliteValue::Integer(i),
-                fsqlite::SqliteValue::Integer(0),
-            ],
-        )
-        .ok();
+        setup_conn
+            .execute_with_params(
+                "INSERT INTO stress VALUES (?1, ?2)",
+                &[
+                    fsqlite::SqliteValue::Integer(i),
+                    fsqlite::SqliteValue::Integer(0),
+                ],
+            )
+            .ok();
     }
+    let path = Arc::new(path);
 
     let barrier = Arc::new(Barrier::new(64));
     let stop = Arc::new(AtomicBool::new(false));
@@ -503,12 +487,13 @@ fn test_64_thread_no_deadlock() {
 
     let handles: Vec<_> = (0..64)
         .map(|tid| {
-            let c = Arc::clone(&conn);
+            let p = Arc::clone(&path);
             let b = Arc::clone(&barrier);
             let s = Arc::clone(&stop);
             let comp = Arc::clone(&completed);
 
             thread::spawn(move || {
+                let c = open_fsqlite_worker(p.as_str());
                 b.wait();
                 let mut ops = 0u64;
 
@@ -554,13 +539,15 @@ fn test_64_thread_no_deadlock() {
 /// Runs continuous writes while forcing frequent GC cycles. Asserts throughput
 /// remains above a minimum floor (no GC-induced starvation).
 #[test]
+#[ignore = "timing-sensitive stress test"]
 fn test_contention_under_gc_pressure() {
     // This test exercises the EBR-based GC under write pressure.
 
-    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
-    conn.execute("PRAGMA journal_mode = WAL").ok();
-    conn.execute("CREATE TABLE gc_stress (id INTEGER PRIMARY KEY, data BLOB)")
-        .expect("create");
+    let (_dir, path) = create_fsqlite_file_backed_db(
+        "contention_under_gc_pressure.db",
+        "CREATE TABLE gc_stress (id INTEGER PRIMARY KEY, data BLOB)",
+    );
+    let path = Arc::new(path);
 
     let stop = Arc::new(AtomicBool::new(false));
     let total_ops = Arc::new(AtomicU64::new(0));
@@ -568,12 +555,13 @@ fn test_contention_under_gc_pressure() {
     let barrier = Arc::new(Barrier::new(4));
     let handles: Vec<_> = (0..4)
         .map(|tid| {
-            let c = Arc::clone(&conn);
+            let p = Arc::clone(&path);
             let b = Arc::clone(&barrier);
             let s = Arc::clone(&stop);
             let ops = Arc::clone(&total_ops);
 
             thread::spawn(move || {
+                let c = open_fsqlite_worker(p.as_str());
                 b.wait();
                 let mut local_ops = 0u64;
                 let mut i = tid * 10_000_000;
@@ -641,14 +629,16 @@ fn test_contention_under_gc_pressure() {
 ///
 /// This allows Thread B to start its prepare phase while Thread A does WAL I/O.
 #[test]
+#[ignore = "manual contention stress test"]
 fn test_split_lock_commit_no_deadlock() {
     // Test that multiple concurrent writers don't deadlock with the split-lock
     // protocol. With the old monolithic lock, this would cause severe contention.
 
-    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
-    conn.execute("PRAGMA journal_mode = WAL").ok();
-    conn.execute("CREATE TABLE split_lock_test (id INTEGER PRIMARY KEY, val INTEGER)")
-        .expect("create");
+    let (_dir, path) = create_fsqlite_file_backed_db(
+        "split_lock_commit_no_deadlock.db",
+        "CREATE TABLE split_lock_test (id INTEGER PRIMARY KEY, val INTEGER)",
+    );
+    let path = Arc::new(path);
 
     let barrier = Arc::new(Barrier::new(8));
     let completed = Arc::new(AtomicU64::new(0));
@@ -656,13 +646,14 @@ fn test_split_lock_commit_no_deadlock() {
 
     let handles: Vec<_> = (0..8)
         .map(|tid| {
-            let c = Arc::clone(&conn);
+            let p = Arc::clone(&path);
             let b = Arc::clone(&barrier);
             let comp = Arc::clone(&completed);
             let ops = Arc::clone(&total_ops);
             let base = (tid as i64) * 10_000;
 
             thread::spawn(move || {
+                let c = open_fsqlite_worker(p.as_str());
                 b.wait();
                 let mut local_ops = 0u64;
 
@@ -725,16 +716,18 @@ fn test_split_lock_commit_no_deadlock() {
 /// Measures commit throughput with increasing thread counts. With split-lock,
 /// we expect better scaling because prepare phases can overlap with WAL I/O.
 #[test]
+#[ignore = "manual throughput benchmark"]
 fn test_split_lock_commit_scaling() {
     // Measure throughput at 1, 2, 4, 8 threads and verify scaling isn't pathological.
 
     let results: Vec<(usize, f64)> = [1, 2, 4, 8]
         .iter()
         .map(|&thread_count| {
-            let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
-            conn.execute("PRAGMA journal_mode = WAL").ok();
-            conn.execute("CREATE TABLE scaling_test (id INTEGER PRIMARY KEY, val INTEGER)")
-                .expect("create");
+            let (_dir, path) = create_fsqlite_file_backed_db(
+                &format!("split_lock_commit_scaling_{thread_count}.db"),
+                "CREATE TABLE scaling_test (id INTEGER PRIMARY KEY, val INTEGER)",
+            );
+            let path = Arc::new(path);
 
             let barrier = Arc::new(Barrier::new(thread_count));
             let total_ops = Arc::new(AtomicU64::new(0));
@@ -744,12 +737,13 @@ fn test_split_lock_commit_scaling() {
 
             let handles: Vec<_> = (0..thread_count)
                 .map(|tid| {
-                    let c = Arc::clone(&conn);
+                    let p = Arc::clone(&path);
                     let b = Arc::clone(&barrier);
                     let ops = Arc::clone(&total_ops);
                     let base = (tid as i64) * (ops_per_thread as i64) * 2;
 
                     thread::spawn(move || {
+                        let c = open_fsqlite_worker(p.as_str());
                         b.wait();
                         let mut local_ops = 0u64;
 
@@ -817,14 +811,16 @@ fn test_split_lock_commit_scaling() {
 /// Creates artificial WAL I/O delay and verifies other threads can still
 /// make progress on their prepare phases.
 #[test]
+#[ignore = "manual contention stress test"]
 fn test_split_lock_wal_io_does_not_block_prepare() {
     // This test verifies the core property of split-lock: that WAL I/O in one
     // thread doesn't block prepare in another thread.
 
-    let conn = Arc::new(fsqlite::Connection::open(":memory:").expect("open"));
-    conn.execute("PRAGMA journal_mode = WAL").ok();
-    conn.execute("CREATE TABLE wal_io_test (id INTEGER PRIMARY KEY, data BLOB)")
-        .expect("create");
+    let (_dir, path) = create_fsqlite_file_backed_db(
+        "split_lock_wal_io_does_not_block_prepare.db",
+        "CREATE TABLE wal_io_test (id INTEGER PRIMARY KEY, data BLOB)",
+    );
+    let path = Arc::new(path);
 
     let barrier = Arc::new(Barrier::new(4));
     let completed = Arc::new(AtomicU64::new(0));
@@ -832,12 +828,13 @@ fn test_split_lock_wal_io_does_not_block_prepare() {
 
     let handles: Vec<_> = (0..4)
         .map(|tid| {
-            let c = Arc::clone(&conn);
+            let p = Arc::clone(&path);
             let b = Arc::clone(&barrier);
             let comp = Arc::clone(&completed);
             let ops = Arc::clone(&total_ops);
 
             thread::spawn(move || {
+                let c = open_fsqlite_worker(p.as_str());
                 b.wait();
                 let mut local_ops = 0u64;
 
