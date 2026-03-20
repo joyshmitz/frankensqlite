@@ -1122,6 +1122,10 @@ impl VersionStore {
             for idx in &result.pruned_indices {
                 ranges.remove(idx);
             }
+
+            let current_epoch = self.gc_epoch.load(Ordering::Relaxed);
+            self.retire_queue
+                .retire_batch(result.pruned_indices.iter().copied(), current_epoch);
         }
 
         usize::try_from(result.freed).unwrap_or(usize::MAX)
@@ -1137,8 +1141,10 @@ impl std::fmt::Debug for VersionStore {
             .field("page_count", &self.chain_heads.page_count())
             .field("visibility_range_count", &ranges.len())
             .field("arena_high_water", &arena.high_water())
+            .field("pending_recycle_count", &self.pending_recycle_count())
+            .field("gc_epoch", &self.gc_epoch.load(Ordering::Relaxed))
             .field("guard_registry", &self.guard_registry)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -2230,6 +2236,32 @@ mod tests {
             .count();
         assert_eq!(reclaimable, 31, "all non-head versions are reclaimable");
         assert_eq!(chain[0].commit_seq, CommitSeq::new(32));
+    }
+
+    #[test]
+    fn test_prune_page_chain_eager_enqueues_slots_for_ebr_recycling() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(16).unwrap();
+
+        store.publish(make_version(16, 1, None));
+        store.publish(make_version(16, 2, None));
+        store.publish(make_version(16, 3, None));
+
+        assert_eq!(store.chain_length(pgno), 3);
+        assert_eq!(store.pending_recycle_count(), 0);
+
+        let freed = store.prune_page_chain_eager(pgno, CommitSeq::new(2));
+        assert_eq!(freed, 1, "horizon=2 should prune only the oldest version");
+        assert_eq!(store.chain_length(pgno), 2);
+        assert_eq!(
+            store.pending_recycle_count(),
+            1,
+            "eager prune must queue retired slots for later EBR recycling"
+        );
+
+        assert_eq!(store.try_recycle_retired_slots(1), 0);
+        assert_eq!(store.try_recycle_retired_slots(2), 1);
+        assert_eq!(store.pending_recycle_count(), 0);
     }
 
     proptest! {

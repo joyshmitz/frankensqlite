@@ -152,17 +152,15 @@ impl Sqlite3 {
     }
 
     fn set_error_message_and_code(&self, message: &str, code: c_int) {
-        if let Ok(c) = CString::new(message) {
-            if let Ok(mut guard) = self.last_error.lock() {
-                *guard = c;
-            }
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = c_string_truncate_on_nul(message);
         }
         self.last_error_code.store(code, Ordering::Relaxed);
     }
 
     fn clear_error(&self) {
         if let Ok(mut guard) = self.last_error.lock() {
-            *guard = CString::new(DEFAULT_ERROR_MESSAGE).expect("static");
+            *guard = c_string_truncate_on_nul(DEFAULT_ERROR_MESSAGE);
         }
         self.last_error_code.store(SQLITE_OK, Ordering::Relaxed);
     }
@@ -248,6 +246,17 @@ fn i64_to_c_int_saturating(value: i64) -> c_int {
     } else {
         value as c_int
     }
+}
+
+fn c_string_truncate_on_nul(value: &str) -> CString {
+    let bytes = value.as_bytes();
+    let nul_index = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+
+    // SAFETY: the prefix before the first NUL byte contains no interior NULs.
+    unsafe { CString::from_vec_unchecked(bytes[..nul_index].to_vec()) }
 }
 
 fn can_prepare_statement(statement: &Statement) -> bool {
@@ -367,7 +376,7 @@ unsafe fn emit_exec_callback_rows(
                 .and_then(|names| names.get(i))
                 .cloned()
                 .unwrap_or_else(|| format!("column{i}"));
-            let cname = CString::new(col_name).expect("col name");
+            let cname = c_string_truncate_on_nul(&col_name);
             c_names.push(cname.as_ptr().cast_mut());
             owned_names.push(cname);
 
@@ -514,13 +523,12 @@ unsafe fn write_error_message(errmsg: *mut *mut c_char, message: &str) {
     if errmsg.is_null() {
         return;
     }
-    if let Ok(cmsg) = CString::new(message) {
-        let len = cmsg.as_bytes_with_nul().len();
-        let buf = libc_malloc(len);
-        if !buf.is_null() {
-            std::ptr::copy_nonoverlapping(cmsg.as_ptr(), buf.cast(), len);
-            *errmsg = buf.cast();
-        }
+    let cmsg = c_string_truncate_on_nul(message);
+    let len = cmsg.as_bytes_with_nul().len();
+    let buf = libc_malloc(len);
+    if !buf.is_null() {
+        std::ptr::copy_nonoverlapping(cmsg.as_ptr(), buf.cast(), len);
+        *errmsg = buf.cast();
     }
 }
 
@@ -1268,6 +1276,12 @@ mod tests {
             let rc = sqlite3_close(db);
             assert_eq!(rc, SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn test_c_string_truncate_on_nul_discards_suffix() {
+        let value = c_string_truncate_on_nul("alpha\0beta");
+        assert_eq!(value.as_bytes(), b"alpha");
     }
 
     #[test]

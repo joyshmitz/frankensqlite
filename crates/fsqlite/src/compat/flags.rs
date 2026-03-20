@@ -14,10 +14,10 @@ use crate::Connection;
 pub struct OpenFlags(u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AccessMode {
+enum OpenDisposition {
     ReadOnly,
-    ReadWrite,
-    ReadWriteCreate,
+    WriteExisting,
+    WriteCreate,
 }
 
 impl OpenFlags {
@@ -60,15 +60,15 @@ impl OpenFlags {
     }
 }
 
-fn classify_access_mode(flags: OpenFlags) -> Result<AccessMode, FrankenError> {
+fn classify_access_mode(flags: OpenFlags) -> Result<OpenDisposition, FrankenError> {
     let read_only = flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY);
     let read_write = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
     let create = flags.contains(OpenFlags::SQLITE_OPEN_CREATE);
 
     match (read_only, read_write, create) {
-        (true, false, false) => Ok(AccessMode::ReadOnly),
-        (false, true, false) => Ok(AccessMode::ReadWrite),
-        (false, true, true) => Ok(AccessMode::ReadWriteCreate),
+        (true, false, false) => Ok(OpenDisposition::ReadOnly),
+        (false, true, false) => Ok(OpenDisposition::WriteExisting),
+        (false, true, true) => Ok(OpenDisposition::WriteCreate),
         _ => Err(FrankenError::TypeMismatch {
             expected:
                 "one of SQLITE_OPEN_READ_ONLY, SQLITE_OPEN_READ_WRITE, or SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE"
@@ -113,14 +113,14 @@ impl std::ops::BitOr for OpenFlags {
 /// ```
 pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
     match classify_access_mode(flags)? {
-        AccessMode::ReadOnly => open_read_only_connection(path),
-        AccessMode::ReadWrite => {
+        OpenDisposition::ReadOnly => open_read_only_connection(path),
+        OpenDisposition::WriteExisting => {
             if path != ":memory:" && !Path::new(path).exists() {
                 return Err(FrankenError::CannotOpen { path: path.into() });
             }
             Connection::open(path)
         }
-        AccessMode::ReadWriteCreate => Connection::open(path),
+        OpenDisposition::WriteCreate => Connection::open(path),
     }
 }
 

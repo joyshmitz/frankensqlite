@@ -40327,6 +40327,69 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_fts5_match_preserves_bm25_rank_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'rust rust rust is great')")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO docs(rowid, content) VALUES (2, 'rust is a programming language')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' LIMIT 5")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+        assert_eq!(rows[1].get(0), Some(&SqliteValue::Integer(2)));
+    }
+
+    #[test]
+    fn test_sql_fts5_match_can_join_regular_message_metadata() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, idx INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at,
+                message_id
+             )",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO messages(id, idx) VALUES (7, 2)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES (1, 'auth token failure', 'Auth failure', 'codex', '/ws', '/tmp/session.jsonl', 42, 7)",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT fts_messages.title, messages.idx
+                 FROM fts_messages
+                 LEFT JOIN messages ON fts_messages.message_id = messages.id
+                 WHERE fts_messages MATCH 'auth'
+                 LIMIT 5",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("Auth failure".into()))
+        );
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(2)));
+    }
+
+    #[test]
     fn test_query_comparison_expression() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT 3 > 2, 1 = 1, 5 < 3;").unwrap();

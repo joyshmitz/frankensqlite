@@ -201,10 +201,10 @@ impl CommitSequenceCombiner {
         let mut pending_count = 0u64;
         let mut pending_slots = [false; MAX_COMMIT_THREADS];
 
-        for i in 0..MAX_COMMIT_THREADS {
-            let state = self.slots[i].state.load(Ordering::Acquire);
+        for (slot, is_pending) in self.slots.iter().zip(pending_slots.iter_mut()) {
+            let state = slot.state.load(Ordering::Acquire);
             if state == SLOT_PENDING {
-                pending_slots[i] = true;
+                *is_pending = true;
                 pending_count += 1;
             }
         }
@@ -220,15 +220,15 @@ impl CommitSequenceCombiner {
 
         // Assign sequences to each pending slot.
         let mut assigned = 0u64;
-        for i in 0..MAX_COMMIT_THREADS {
-            if pending_slots[i] {
+        for (slot, is_pending) in self.slots.iter().zip(pending_slots.iter()) {
+            if *is_pending {
                 let seq = base_seq + assigned;
                 assigned += 1;
 
                 // Store result first, then mark as DONE.
                 // The slot owner reads only after observing state == DONE.
-                self.slots[i].result.store(seq, Ordering::Release);
-                self.slots[i].state.store(SLOT_DONE, Ordering::Release);
+                slot.result.store(seq, Ordering::Release);
+                slot.state.store(SLOT_DONE, Ordering::Release);
             }
         }
 
