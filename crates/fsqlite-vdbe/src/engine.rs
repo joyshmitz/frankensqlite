@@ -18143,7 +18143,9 @@ mod tests {
             b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
 
             // r1=10, r2=50 → MemMax(r1, r2) → r2 stays 50
+            // Note: ResultRow clears registers, so r2 must be re-initialized.
             b.emit_op(Opcode::Integer, 10, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 50, r2, 0, P4::None, 0);
             b.emit_op(Opcode::MemMax, r1, r2, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
 

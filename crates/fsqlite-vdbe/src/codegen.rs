@@ -16652,7 +16652,10 @@ mod tests {
     fn test_codegen_select_covering_order_by_skips_table_lookup() {
         let stmt = select_col_order_by("t", "b", "b", false);
         let schema = test_schema_with_index();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
