@@ -31,7 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use fsqlite::SqliteValue;
+use fsqlite::{FrankenError, SqliteValue};
 
 const ROWS_PER_THREAD: i64 = 1000;
 /// Maximum retries before giving up on a transaction (applies to both engines).
@@ -65,6 +65,27 @@ fn apply_session_pragmas_fsqlite(conn: &fsqlite::Connection) {
     ] {
         run_fsqlite_pragma(conn, pragma);
     }
+}
+
+fn is_retryable_fsqlite_error(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. }
+    )
+}
+
+fn is_duplicate_insert_after_retry(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }
+    )
+}
+
+fn is_corruption_error(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::DatabaseCorrupt { .. } | FrankenError::WalCorrupt { .. }
+    )
 }
 
 fn create_table_sql(table_id: usize) -> String {
@@ -274,8 +295,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                         match conn.execute("BEGIN CONCURRENT") {
                                             Ok(_) => break,
                                             Err(e) => {
-                                                let msg = format!("{e:?}");
-                                                if msg.contains("Busy") || msg.contains("busy") {
+                                                if is_retryable_fsqlite_error(&e) {
                                                     conflicts.fetch_add(1, Ordering::Relaxed);
                                                     retry_count += 1;
                                                     if retry_count >= MAX_TXN_RETRIES {
@@ -295,13 +315,14 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
 
                                     // INSERT
                                     if let Err(e) = stmt.execute_with_params(&[SqliteValue::Integer(row_id)]) {
-                                        let msg = format!("{e:?}");
-                                        if msg.contains("constraint") {
+                                        if is_duplicate_insert_after_retry(&e) {
                                             // Row already exists (from previous retry that actually committed)
                                             let _ = conn.execute("ROLLBACK");
                                             break 'txn;
                                         }
-                                        if msg.contains("BusySnapshot") || msg.contains("Busy") || msg.contains("conflict") {
+                                        if is_retryable_fsqlite_error(&e)
+                                            || matches!(e, FrankenError::SerializationFailure { .. })
+                                        {
                                             // Snapshot conflict — rollback and retry
                                             conflicts.fetch_add(1, Ordering::Relaxed);
                                             let _ = conn.execute("ROLLBACK");
@@ -312,7 +333,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             std::thread::sleep(Duration::from_micros(100 * u64::from(retry_count)));
                                             continue 'txn;
                                         }
-                                        if msg.contains("Corrupt") || msg.contains("malformed") {
+                                        if is_corruption_error(&e) {
                                             let _ = conn.execute("ROLLBACK");
                                             panic!("CORRUPTION DETECTED: {e:?}");
                                         }
@@ -323,8 +344,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                     match conn.execute("COMMIT") {
                                         Ok(_) => break 'txn,
                                         Err(e) => {
-                                            let msg = format!("{e:?}");
-                                            if msg.contains("Busy") || msg.contains("busy") || msg.contains("conflict") {
+                                            if is_retryable_fsqlite_error(&e)
+                                                || matches!(e, FrankenError::SerializationFailure { .. })
+                                            {
                                                 conflicts.fetch_add(1, Ordering::Relaxed);
                                                 let _ = conn.execute("ROLLBACK");
                                                 retry_count += 1;
