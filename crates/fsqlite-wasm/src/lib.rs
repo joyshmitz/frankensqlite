@@ -672,6 +672,15 @@ fn describe_js_value(value: &JsValue) -> String {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn host_connection_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static HOST_CONNECTION_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        HOST_CONNECTION_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
 
     #[test]
     fn parse_select() {
@@ -695,6 +704,7 @@ mod tests {
 
     #[test]
     fn core_connection_roundtrip_for_wasm_wrapper() {
+        let _guard = host_connection_test_guard();
         let conn = open_core_connection(":memory:").expect("in-memory connection should open");
         conn.execute("CREATE TABLE wasm_rt (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("schema create should succeed");
@@ -716,6 +726,7 @@ mod tests {
 
     #[test]
     fn core_prepared_statement_exposes_inferred_column_names() {
+        let _guard = host_connection_test_guard();
         let conn = open_core_connection(":memory:").expect("in-memory connection should open");
         conn.execute("CREATE TABLE wasm_cols (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("schema create should succeed");
@@ -730,6 +741,7 @@ mod tests {
 
     #[test]
     fn franken_db_prepare_and_execute_batch_work_on_host() {
+        let _guard = host_connection_test_guard();
         let db = FrankenDb::new(None).expect("db should open");
         db.execute_batch(
             "CREATE TABLE wasm_batch (id INTEGER PRIMARY KEY, name TEXT);\
