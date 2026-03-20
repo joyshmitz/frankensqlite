@@ -75,10 +75,23 @@ fn is_retryable_fsqlite_error(error: &FrankenError) -> bool {
 }
 
 fn is_duplicate_insert_after_retry(error: &FrankenError) -> bool {
-    matches!(
+    // Check for proper constraint errors
+    if matches!(
         error,
         FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }
-    )
+    ) {
+        return true;
+    }
+    // Also check for VDBE constraint errors (code 19) wrapped as Internal
+    if let FrankenError::Internal(msg) = error {
+        if msg.contains("code 19:") && msg.contains("PRIMARY KEY") {
+            return true;
+        }
+        if msg.contains("code 19:") && msg.contains("UNIQUE") {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_corruption_error(error: &FrankenError) -> bool {
