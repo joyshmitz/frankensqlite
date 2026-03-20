@@ -1107,7 +1107,9 @@ where
             inner.active_transactions += 1;
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
-            let published_visible_commit_seq = self.published.snapshot().visible_commit_seq;
+            let published_snapshot = self.published.snapshot();
+            let published_visible_commit_seq = published_snapshot.visible_commit_seq;
+            let published_db_size = published_snapshot.db_size;
             let pool = self.pool.clone();
             let cleanup_cx = cx.clone();
             return Ok(SimpleTransaction {
@@ -1118,6 +1120,7 @@ where
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
                 published_visible_commit_seq,
+                published_db_size,
                 write_set: HashMap::new(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
@@ -1289,7 +1292,9 @@ where
         let original_db_size = inner.db_size;
         let journal_mode = inner.journal_mode;
         let pool = self.pool.clone();
-        let published_visible_commit_seq = self.published.snapshot().visible_commit_seq;
+        let published_snapshot = self.published.snapshot();
+        let published_visible_commit_seq = published_snapshot.visible_commit_seq;
+        let published_db_size = published_snapshot.db_size;
         let cleanup_cx = cleanup_child_cx(cx);
         drop(inner);
 
@@ -1301,6 +1306,7 @@ where
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
             published_visible_commit_seq,
+            published_db_size,
             write_set: HashMap::new(),
             write_pages_sorted: Vec::new(),
             freed_pages: Vec::new(),
@@ -2238,6 +2244,11 @@ pub struct SimpleTransaction<V: Vfs> {
     cache: Arc<Mutex<PageCache>>,
     published: Arc<PublishedPagerState>,
     published_visible_commit_seq: CommitSeq,
+    /// Database size at transaction start. Used for MVCC visibility: pages
+    /// beyond this bound didn't exist when this transaction started and must
+    /// not be returned as valid data (they would contain zeros, causing
+    /// corruption when interpreted as B-tree pages).
+    published_db_size: u32,
     write_set: HashMap<PageNumber, StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
@@ -2775,6 +2786,30 @@ where
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         if let Some(staged) = self.write_set.get(&page_no) {
             return Ok(staged.published_page());
+        }
+
+        // MVCC db_size guard: pages beyond the transaction's snapshot db_size
+        // did not exist when this transaction started. Returning zeros for
+        // such pages would cause corruption when the B-tree layer interprets
+        // them as valid pages (page type 0x00 is invalid). Return BusySnapshot
+        // so the caller can retry with a fresh transaction if needed.
+        if page_no.get() > self.published_db_size {
+            tracing::trace!(
+                target: "fsqlite.snapshot_publication",
+                trace_id = cx.trace_id(),
+                run_id = "pager-publication",
+                scenario_id = "page_beyond_snapshot_db_size",
+                page_no = page_no.get(),
+                published_db_size = self.published_db_size,
+                "page beyond transaction's snapshot db_size"
+            );
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: format!(
+                    "page {} > snapshot db_size {}",
+                    page_no.get(),
+                    self.published_db_size
+                ),
+            });
         }
 
         let read_start = Instant::now();
