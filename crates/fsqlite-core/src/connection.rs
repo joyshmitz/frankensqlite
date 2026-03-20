@@ -34457,9 +34457,17 @@ fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<
     if entry_type == "index" && is_implicit_autoindex_name(&name) {
         return Ok(true);
     }
+    // Detect virtual tables by either of two patterns (same logic as the
+    // schema-reload paths fixed in a1cee5a8 and 72e43013):
+    //   1. rootpage=0 — stock SQLite convention (FTS5, rtree, etc.)
+    //   2. CREATE SQL starts with CREATE VIRTUAL TABLE — FrankenSQLite-native
+    //      virtual tables with a positive rootpage number.
+    // Using AND was the same bug: a positive-rootpage virtual table would
+    // fail condition 1, appear in actual_signatures but not in
+    // expected_signatures (since the schema loader already skips it), and
+    // trigger a false "unexpected entry" integrity error.
     if entry_type == "table"
-        && root_page == 0
-        && sqlite_master_sql_text(row)?.is_some_and(is_virtual_table_sql)
+        && (root_page == 0 || sqlite_master_sql_text(row)?.is_some_and(is_virtual_table_sql))
     {
         return Ok(true);
     }
