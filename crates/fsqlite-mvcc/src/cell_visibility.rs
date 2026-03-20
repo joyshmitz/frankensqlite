@@ -2863,4 +2863,195 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // 3. Property-Based Tests (proptest)
+    // -------------------------------------------------------------------------
+
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Property: snapshot isolation
+        /// Given: N concurrent txns, each inserting M unique cells
+        /// Property: every committed txn's reads are consistent with its snapshot
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(50))]
+
+            #[test]
+            fn prop_snapshot_isolation(
+                n_txns in 2usize..20,
+                cells_per_txn in 1usize..10,
+            ) {
+                let log = CellVisibilityLog::new(100 * 1024 * 1024);
+                let btree = BtreeRef::Table(TableId::new(1));
+                let page_number = PageNumber::new(42).unwrap();
+
+                // Each txn inserts unique cells and commits at a unique commit_seq
+                let mut committed_at: Vec<(u64, Vec<i64>)> = Vec::new();
+
+                for txn_idx in 0..n_txns {
+                    let token = TxnToken::new(
+                        TxnId::new((txn_idx + 1) as u64).unwrap(),
+                        TxnEpoch::new(1),
+                    );
+                    let commit_seq = (txn_idx + 1) as u64;
+                    let mut cells = Vec::new();
+
+                    for cell_idx in 0..cells_per_txn {
+                        let rowid = (txn_idx * 1000 + cell_idx) as i64;
+                        let cell_key = CellKey::table_row(btree, rowid);
+                        let data = vec![txn_idx as u8, cell_idx as u8];
+
+                        let idx = log
+                            .record_insert(cell_key, page_number, data, token)
+                            .expect("insert should succeed");
+                        log.commit_delta(idx, CommitSeq::new(commit_seq));
+                        cells.push(rowid);
+                    }
+                    committed_at.push((commit_seq, cells));
+                }
+
+                // Property: at snapshot S, exactly the cells from txns with commit_seq <= S are visible
+                for check_snapshot in 1u64..=(n_txns as u64 + 5) {
+                    for (commit_seq, cells) in &committed_at {
+                        for &rowid in cells {
+                            let cell_key = CellKey::table_row(btree, rowid);
+                            let result = log.resolve(page_number, &cell_key, CommitSeq::new(check_snapshot));
+
+                            if *commit_seq <= check_snapshot {
+                                // Should be visible
+                                prop_assert!(
+                                    result.is_some(),
+                                    "cell {} committed at {} should be visible at snapshot {}",
+                                    rowid, commit_seq, check_snapshot
+                                );
+                            } else {
+                                // Should NOT be visible
+                                prop_assert!(
+                                    result.is_none(),
+                                    "cell {} committed at {} should NOT be visible at snapshot {}",
+                                    rowid, commit_seq, check_snapshot
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Property: conflict detection completeness
+        /// Given: random interleaving of cell-level operations on same page
+        /// Property: if two txns write the same cell, at most one commits without retry
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            #[test]
+            fn prop_conflict_detection(
+                n_txns in 2usize..8,
+                target_cell in 0i64..100,
+            ) {
+                let log = CellVisibilityLog::new(100 * 1024 * 1024);
+                let btree = BtreeRef::Table(TableId::new(1));
+                let page_number = PageNumber::new(42).unwrap();
+                let cell_key = CellKey::table_row(btree, target_cell);
+
+                // All txns try to insert the same cell
+                let mut tokens = Vec::new();
+                for txn_idx in 0..n_txns {
+                    let token = TxnToken::new(
+                        TxnId::new((txn_idx + 1) as u64).unwrap(),
+                        TxnEpoch::new(1),
+                    );
+                    let data = vec![txn_idx as u8];
+
+                    log.record_insert(cell_key, page_number, data, token)
+                        .expect("insert should succeed");
+                    tokens.push(token);
+                }
+
+                // Property: every pair of txns that wrote the same cell should conflict
+                for i in 0..n_txns {
+                    for j in (i + 1)..n_txns {
+                        let conflict = log.check_conflict(tokens[i], tokens[j]);
+                        prop_assert!(
+                            matches!(conflict, CellConflict::Conflict { .. }),
+                            "txn {} and {} both wrote cell {} but no conflict detected",
+                            i, j, target_cell
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Property: GC safety
+        /// Given: random sequence of insert/update/delete + GC advances
+        /// Property: no visible version is ever reclaimed
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(50))]
+
+            #[test]
+            fn prop_gc_safety(
+                n_versions in 5usize..50,
+                gc_horizon_offset in 1usize..10,
+            ) {
+                let log = CellVisibilityLog::new(100 * 1024 * 1024);
+                let btree = BtreeRef::Table(TableId::new(1));
+                let cell_key = CellKey::table_row(btree, 1);
+                let page_number = PageNumber::new(42).unwrap();
+
+                // Create n versions of the same cell
+                for i in 1u64..=(n_versions as u64) {
+                    let token = TxnToken::new(TxnId::new(i).unwrap(), TxnEpoch::new(1));
+
+                    let idx = if i == 1 {
+                        log.record_insert(cell_key, page_number, vec![i as u8], token)
+                            .expect("insert should succeed")
+                    } else {
+                        log.record_update(cell_key, page_number, vec![i as u8], token)
+                            .expect("update should succeed")
+                    };
+                    log.commit_delta(idx, CommitSeq::new(i));
+                }
+
+                // Run GC with horizon that should keep the latest visible version
+                let gc_horizon = n_versions.saturating_sub(gc_horizon_offset) as u64;
+                log.gc(CommitSeq::new(gc_horizon));
+
+                // Property: the version visible at snapshot = n_versions should still be correct
+                let final_snapshot = n_versions as u64;
+                let result = log.resolve(page_number, &cell_key, CommitSeq::new(final_snapshot));
+
+                prop_assert!(
+                    result.is_some(),
+                    "GC should not reclaim the version visible at snapshot {}",
+                    final_snapshot
+                );
+
+                // The visible version should be the latest committed version
+                let expected_data = vec![n_versions as u8];
+                prop_assert_eq!(
+                    result.as_ref(),
+                    Some(&expected_data),
+                    "visible version at snapshot {} should be {}",
+                    final_snapshot, n_versions
+                );
+
+                // Also verify that at least one version above horizon is still present
+                let above_horizon_snapshot = gc_horizon + 1;
+                if above_horizon_snapshot <= final_snapshot {
+                    let above_result = log.resolve(
+                        page_number,
+                        &cell_key,
+                        CommitSeq::new(above_horizon_snapshot),
+                    );
+                    prop_assert!(
+                        above_result.is_some(),
+                        "version at snapshot {} (above GC horizon {}) should be visible",
+                        above_horizon_snapshot, gc_horizon
+                    );
+                }
+            }
+        }
+    }
 }
