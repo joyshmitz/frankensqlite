@@ -2906,7 +2906,8 @@ where
                         "refreshed snapshot to include requested page"
                     );
                     self.published_db_size.set(fresh_snapshot.db_size);
-                    self.published_visible_commit_seq.set(fresh_snapshot.visible_commit_seq);
+                    self.published_visible_commit_seq
+                        .set(fresh_snapshot.visible_commit_seq);
                     // Fall through to continue with the read using the refreshed snapshot
                 } else {
                     // Page is still beyond the latest snapshot — genuinely doesn't exist yet.
@@ -2934,7 +2935,9 @@ where
 
         let read_start = Instant::now();
         let mut published_retry_count = 0_usize;
-        while self.published.snapshot().visible_commit_seq == self.published_visible_commit_seq.get() {
+        while self.published.snapshot().visible_commit_seq
+            == self.published_visible_commit_seq.get()
+        {
             let snapshot = self.published.snapshot();
             if page_no.get() > snapshot.db_size {
                 let confirm = self.published.snapshot();
@@ -3021,8 +3024,8 @@ where
             freelist_count: inner.freelist.len(),
             checkpoint_active: inner.checkpoint_active,
         };
-        let publish_page =
-            page_no.get() <= inner.db_size && inner.commit_seq == self.published_visible_commit_seq.get();
+        let publish_page = page_no.get() <= inner.db_size
+            && inner.commit_seq == self.published_visible_commit_seq.get();
         drop(inner);
         if publish_page {
             self.published
@@ -3490,7 +3493,8 @@ where
             self.allocated_from_eof.clear();
             self.savepoint_stack.clear();
             self.original_db_size = committed_db_size;
-            self.published_visible_commit_seq.set(publish_update.visible_commit_seq);
+            self.published_visible_commit_seq
+                .set(publish_update.visible_commit_seq);
             self.published_db_size.set(publish_update.db_size);
             // Transaction stays active — committed/finished remain false.
             Ok(true)
