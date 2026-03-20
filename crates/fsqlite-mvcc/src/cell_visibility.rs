@@ -720,25 +720,8 @@ impl CellVisibilityLog {
     ) -> Option<CellDeltaIdx> {
         let shard_idx = Self::shard_index(page_number);
         let shard = &self.shards[shard_idx];
-        let data_len = cell_data.len() as u64;
 
-        // Check per-transaction budget
-        {
-            let tracker = self.txn_tracker.lock();
-            let current_txn_bytes = tracker.txn_bytes(created_by);
-            if current_txn_bytes + data_len > self.per_txn_budget_bytes {
-                debug!(
-                    txn_id = created_by.id.get(),
-                    current_bytes = current_txn_bytes,
-                    requested_bytes = data_len,
-                    budget = self.per_txn_budget_bytes,
-                    "cell_delta_txn_budget_exceeded"
-                );
-                return None;
-            }
-        }
-
-        // Look up existing head
+        // Look up existing head (can release this lock early)
         let lookup_key = (page_number, cell_key.key_digest);
         let prev_idx = {
             let heads = shard.heads.read();
@@ -758,10 +741,32 @@ impl CellVisibilityLog {
 
         let delta_memory = delta.memory_size() as u64;
 
-        // Allocate in arena
+        // CRITICAL FIX: Hold tracker lock through budget check AND recording
+        // to prevent TOCTOU race where multiple threads for same txn could
+        // each pass budget check before either records, exceeding total budget.
         let new_idx = {
-            let mut arena = self.arena.lock();
-            arena.alloc(delta)
+            let mut tracker = self.txn_tracker.lock();
+            let current_txn_bytes = tracker.txn_bytes(created_by);
+            if current_txn_bytes + delta_memory > self.per_txn_budget_bytes {
+                debug!(
+                    txn_id = created_by.id.get(),
+                    current_bytes = current_txn_bytes,
+                    requested_bytes = delta_memory,
+                    budget = self.per_txn_budget_bytes,
+                    "cell_delta_txn_budget_exceeded"
+                );
+                return None;
+            }
+
+            // Allocate in arena while holding tracker lock
+            let idx = {
+                let mut arena = self.arena.lock();
+                arena.alloc(delta)
+            };
+
+            // Record atomically with budget check
+            tracker.record(created_by, idx, delta_memory);
+            idx
         };
 
         // Update head
@@ -778,12 +783,6 @@ impl CellVisibilityLog {
 
         // C7 (bd-l9k8e.7): Increment per-page delta count for batch visibility.
         shard.increment_page_count(page_number);
-
-        // Track this delta for the transaction
-        {
-            let mut tracker = self.txn_tracker.lock();
-            tracker.record(created_by, new_idx, delta_memory);
-        }
 
         self.delta_count.fetch_add(1, Ordering::Relaxed);
 
@@ -2093,23 +2092,26 @@ mod tests {
 
     #[test]
     fn test_per_txn_budget_exceeded() {
-        // Create log with tiny per-txn budget
-        let log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 100);
+        // Create log with per-txn budget that allows one delta but not two.
+        // CellDelta has ~100 bytes fixed overhead (struct fields) plus cell_data.
+        // With 50 bytes of cell_data, each delta uses ~150 bytes total.
+        // Budget of 200 bytes allows 1 delta but not 2.
+        let log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 200);
         let btree = BtreeRef::Table(TableId::new(1));
         let page_number = PageNumber::new(42).unwrap();
         let token = txn_token_n(1);
 
-        // First insert should succeed
+        // First insert should succeed (delta_memory ~150 bytes < 200 budget)
         let cell_key1 = CellKey::table_row(btree, 1);
         assert!(
             log.record_insert(cell_key1, page_number, vec![0; 50], token)
                 .is_some()
         );
 
-        // Second insert should fail (budget exceeded)
+        // Second insert should fail (cumulative ~300 bytes > 200 budget)
         let cell_key2 = CellKey::table_row(btree, 2);
         assert!(
-            log.record_insert(cell_key2, page_number, vec![0; 100], token)
+            log.record_insert(cell_key2, page_number, vec![0; 50], token)
                 .is_none()
         );
     }

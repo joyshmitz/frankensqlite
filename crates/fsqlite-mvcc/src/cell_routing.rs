@@ -327,8 +327,18 @@ impl PageTrackingState {
 /// This bundles all the state needed by the routing predicate:
 /// - Current MVCC mode (PRAGMA setting)
 /// - Cell visibility log (for delta counts and memory tracking)
-/// - Page tracking state (for detecting mixed tracking)
-/// - Transaction escalation state
+/// - Page tracking state (for detecting mixed cross-transaction tracking)
+///
+/// # Important Usage Note
+///
+/// This context does NOT include the per-transaction [`TxnEscalationTracker`].
+/// The caller MUST check `TxnEscalationTracker::is_escalated(page)` BEFORE
+/// calling [`should_use_cell_path`]. If the page is already escalated for this
+/// transaction, use page-level directly without calling the routing predicate.
+///
+/// The two-level check is:
+/// 1. Per-transaction: `TxnEscalationTracker::is_escalated()` (caller's responsibility)
+/// 2. Cross-transaction: `PageTrackingState` (handled by `should_use_cell_path`)
 #[derive(Debug)]
 pub struct RoutingContext<'a> {
     /// Current cell MVCC mode.
@@ -357,6 +367,13 @@ pub struct RoutingContext<'a> {
 /// 4. Is another txn using page-level on this page? If so, use page-level.
 /// 5. Has this page hit the materialization threshold? If so, use page-level.
 /// 6. Would this txn exceed its memory budget? If so, use page-level.
+///
+/// # Prerequisites
+///
+/// **The caller MUST check `TxnEscalationTracker::is_escalated(page)` BEFORE
+/// calling this function.** If the page is already escalated for this transaction,
+/// use page-level directly. This function only checks cross-transaction state,
+/// not per-transaction escalation.
 ///
 /// # Arguments
 ///
@@ -588,6 +605,24 @@ pub fn escalate_to_page_level(
 /// Global cell MVCC mode.
 ///
 /// This is set by `PRAGMA fsqlite.cell_mvcc = ON|OFF|AUTO`.
+///
+/// # WARNING: Process-Wide Global
+///
+/// This is a **process-wide static**, not per-connection state. In a multi-database
+/// scenario (multiple connections to different databases in the same process), ALL
+/// connections share this mode setting. Changing the mode in one connection affects
+/// all other connections in the process.
+///
+/// # TODO: Per-Connection Mode (Track D)
+///
+/// This should be refactored to per-connection state stored in `ConnectionHandle`.
+/// The current design was chosen for simplicity during initial Track C implementation.
+/// A proper fix requires:
+/// 1. Adding `cell_mvcc_mode: CellMvccMode` field to `ConnectionHandle`
+/// 2. Threading the connection through the routing predicate
+/// 3. Updating PRAGMA handling to modify connection state, not global state
+///
+/// Until then, be aware that this setting is process-global, not per-database.
 static GLOBAL_CELL_MVCC_MODE: AtomicCellMvccMode = AtomicCellMvccMode::new(CellMvccMode::Auto);
 
 /// Atomic wrapper for [`CellMvccMode`].
@@ -1050,33 +1085,48 @@ mod tests {
     fn test_route_memory_budget_exceeded_forces_page() {
         use fsqlite_types::TableId;
 
-        // Create a cell log with a small per-txn budget (200 bytes).
-        // Note: CellDelta has ~100 byte fixed overhead, so each delta with 10 bytes
-        // of cell_data uses ~110 bytes of tracked memory. After 2 inserts, we'll
-        // exceed the 200 byte budget.
-        let cell_log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 200);
-        let page_tracking = PageTrackingState::new();
+        // CellDelta has ~100 byte fixed overhead + cell_data.
+        // We use a budget of 120 bytes so exactly one delta fits (~114 bytes).
+        // After one insert, txn_bytes will be ~114, and we set budget to 114
+        // so the routing predicate sees txn_bytes >= budget.
+        //
+        // Actually, we need to first measure the exact delta size, then set
+        // budget = delta_size so routing sees txn_bytes >= budget.
+        let btree = BtreeRef::Table(TableId::new(1));
         let txn = test_txn(1);
+
+        // First, measure delta memory size with a separate log
+        let measure_log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 10_000);
+        let cell_key = CellKey::table_row(btree, 0);
+        let _ = measure_log.record_insert(
+            cell_key,
+            PageNumber::new(99).unwrap(),
+            vec![0u8; 10],
+            txn,
+        );
+        let delta_size = measure_log.txn_bytes(txn);
+
+        // Now create the real log with budget = delta_size so after one insert,
+        // txn_bytes == budget, triggering the routing check.
+        let cell_log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, delta_size);
+        let page_tracking = PageTrackingState::new();
         let page = leaf_table_page(PageNumber::new(2).unwrap(), 10, 1000);
 
-        // Fill up the txn's budget by recording multiple deltas
-        let btree = BtreeRef::Table(TableId::new(1));
-        for i in 0i64..10 {
-            let cell_key = CellKey::table_row(btree, i);
-            // Some inserts will fail after budget is exceeded; that's expected
-            let _ = cell_log.record_insert(
-                cell_key,
-                PageNumber::new(99).unwrap(), // Different page
-                vec![0u8; 10],                // Small cell data
-                txn,
-            );
-        }
+        // Insert one delta - should succeed and bring us exactly to budget
+        let cell_key1 = CellKey::table_row(btree, 1);
+        let result = cell_log.record_insert(
+            cell_key1,
+            PageNumber::new(99).unwrap(),
+            vec![0u8; 10],
+            txn,
+        );
+        assert!(result.is_some(), "First insert should succeed");
 
-        // Verify we've accumulated some bytes
+        // Verify we're at the budget limit
         let tracked_bytes = cell_log.txn_bytes(txn);
-        assert!(
-            tracked_bytes >= 200,
-            "Expected txn_bytes >= 200, got {tracked_bytes}"
+        assert_eq!(
+            tracked_bytes, delta_size,
+            "txn_bytes should equal budget after one insert"
         );
 
         let ctx = RoutingContext {

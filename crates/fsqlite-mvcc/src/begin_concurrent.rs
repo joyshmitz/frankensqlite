@@ -777,9 +777,10 @@ impl ConcurrentRegistry {
         self.committed_writers
             .retain(|writer| writer.commit_seq > min_active_begin);
 
-        // Safety bound: prevent unbounded memory growth if a long-running
-        // transaction pins the horizon.
-        const MAX_HISTORY_ENTRIES: usize = 16384;
+        // C7 (bd-l9k8e.7): Safety bound for SSI history memory.
+        // Reduced from 16384 to 4096 for tighter memory control.
+        // Each entry is ~128 bytes, so 4096 entries = ~512KB max SSI history.
+        const MAX_HISTORY_ENTRIES: usize = 4096;
         while self.committed_readers.len() + self.committed_writers.len() > MAX_HISTORY_ENTRIES {
             // Find the oldest active transaction and mark it for abort to unpin the horizon.
             let mut oldest_id = None;
@@ -827,6 +828,19 @@ impl ConcurrentRegistry {
                 self.committed_writers_with_global_keys.clear();
                 break;
             }
+        }
+
+        // C7 (bd-l9k8e.7): Log SSI history size for observability.
+        let reader_count = self.committed_readers.len();
+        let writer_count = self.committed_writers.len();
+        if reader_count + writer_count > 0 {
+            tracing::debug!(
+                reader_entries = reader_count,
+                writer_entries = writer_count,
+                total = reader_count + writer_count,
+                active_txns = self.active.len(),
+                "ssi_history_status"
+            );
         }
 
         self.rebuild_committed_history_indexes();

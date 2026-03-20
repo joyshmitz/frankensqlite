@@ -1018,6 +1018,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "crossbeam-epoch",
+ "fsqlite-btree",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-pager",
