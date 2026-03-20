@@ -1239,10 +1239,17 @@ impl InProcessPageLockTable {
             }
         }
         drop(map);
-        // Also bump epoch + notify_one on condvar as a fallback for edge cases
-        // (e.g., threads that registered between our remove and their park).
+        // Bump epoch and notify condvar as fallback for WASM (no thread::park)
+        // and edge cases (threads that registered between remove and park).
+        // Must use notify_all on WASM: multiple pages may have waiters, and
+        // notify_one could wake a thread waiting for a different page, causing
+        // the intended waiter to starve. On native, notify_one suffices since
+        // we use targeted Thread::unpark() above.
         let _gate = self.change_gate.lock();
         self.change_epoch.fetch_add(1, Ordering::Release);
+        #[cfg(target_arch = "wasm32")]
+        self.change_cv.notify_all();
+        #[cfg(not(target_arch = "wasm32"))]
         self.change_cv.notify_one();
     }
 
