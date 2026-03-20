@@ -25628,15 +25628,14 @@ impl Connection {
             };
             new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
 
-            // Stock SQLite virtual tables (FTS5, rtree, etc.) have
-            // rootpage=0 in sqlite_master and CREATE SQL beginning with
-            // "CREATE VIRTUAL TABLE".  Those cannot be loaded as regular
-            // B-tree tables, so skip them gracefully.  Do NOT skip entries
-            // merely because the SQL text starts with CREATE VIRTUAL TABLE:
-            // FrankenSQLite currently materializes its own virtual tables as
-            // ordinary row tables with a real root page and preserves the
-            // original SQL text for introspection.
-            let is_virtual = root_page_num == 0 && is_virtual_table_sql(&create_sql);
+            // Detect virtual tables by either of two patterns:
+            //   1. rootpage=0 — the stock SQLite convention (FTS5, rtree, etc.)
+            //   2. CREATE SQL starts with CREATE VIRTUAL TABLE — FrankenSQLite-native
+            //      virtual tables that are assigned a positive rootpage number.
+            // Using AND here was the same bug as PR #33 (fixed in compat_persist.rs):
+            // a positive-rootpage virtual table would fail condition 1, fall through,
+            // and be reloaded as an ordinary B-tree table, silently breaking FTS5 etc.
+            let is_virtual = root_page_num == 0 || is_virtual_table_sql(&create_sql);
             if is_virtual {
                 tracing::warn!(
                     table = %name,
