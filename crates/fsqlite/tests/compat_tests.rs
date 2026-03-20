@@ -340,7 +340,7 @@ fn transaction_commit_persists_data() {
     conn.execute("CREATE TABLE t(val TEXT)").unwrap();
 
     {
-        let tx = conn.transaction().unwrap();
+        let mut tx = conn.transaction().unwrap();
         tx.execute("INSERT INTO t VALUES ('committed')").unwrap();
         tx.commit().unwrap();
     }
@@ -373,7 +373,7 @@ fn transaction_explicit_rollback() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(val TEXT)").unwrap();
 
-    let tx = conn.transaction().unwrap();
+    let mut tx = conn.transaction().unwrap();
     tx.execute("INSERT INTO t VALUES ('rolled_back')").unwrap();
     tx.rollback().unwrap();
 
@@ -388,7 +388,7 @@ fn transaction_execute_with_params() {
         .unwrap();
 
     {
-        let tx = conn.transaction().unwrap();
+        let mut tx = conn.transaction().unwrap();
         tx.execute_with_params(
             "INSERT INTO t VALUES (?1, ?2)",
             &[SqliteValue::Integer(1), SqliteValue::Text("in_tx".into())],
@@ -407,7 +407,7 @@ fn transaction_query_within() {
     conn.execute("CREATE TABLE t(val INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (42)").unwrap();
 
-    let tx = conn.transaction().unwrap();
+    let mut tx = conn.transaction().unwrap();
     let rows = tx.query("SELECT val FROM t").unwrap();
     assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(42));
     tx.commit().unwrap();
@@ -419,7 +419,7 @@ fn transaction_execute_params_compat() {
     conn.execute("CREATE TABLE t(id INTEGER, val TEXT)")
         .unwrap();
 
-    let tx = conn.transaction().unwrap();
+    let mut tx = conn.transaction().unwrap();
     tx.execute_compat(
         "INSERT INTO t VALUES (?1, ?2)",
         params![1_i64, "via_params"],
@@ -429,6 +429,66 @@ fn transaction_execute_params_compat() {
 
     let row = conn.query_row("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(row.get(0).unwrap(), &SqliteValue::Text("via_params".into()));
+}
+
+#[test]
+fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("compat_failed_commit_keeps_tx_open.db");
+    let db = db_path.to_string_lossy().to_string();
+
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 0);").unwrap();
+    }
+
+    let conn_a = Connection::open(&db).unwrap();
+    let conn_b = Connection::open(&db).unwrap();
+    for conn in [&conn_a, &conn_b] {
+        conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+    }
+
+    let mut tx_a = conn_a.transaction().unwrap();
+    let mut tx_b = conn_b.transaction().unwrap();
+
+    tx_a.execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+        .unwrap();
+
+    let loser_err = match tx_b.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
+        Ok(changes) => {
+            assert_eq!(changes, 1);
+            tx_a.commit().unwrap();
+            tx_b.commit().expect_err(
+                "second compat transaction should fail transiently once the stale snapshot resolves",
+            )
+        }
+        Err(err) => {
+            tx_a.commit().unwrap();
+            err
+        }
+    };
+
+    assert!(
+        loser_err.is_transient(),
+        "losing compat transaction should fail transiently, got {loser_err:?}"
+    );
+    assert!(
+        conn_b.in_transaction(),
+        "failed compat commit must leave the underlying transaction open for caller-directed recovery"
+    );
+
+    tx_b.rollback().unwrap();
+    assert!(
+        !conn_b.in_transaction(),
+        "explicit rollback should close the failed compat transaction"
+    );
+
+    let row = conn_a.query_row("SELECT v FROM t WHERE id = 1").unwrap();
+    assert_eq!(row.get(0).unwrap(), &SqliteValue::Integer(1));
 }
 
 // ===========================================================================
@@ -649,7 +709,7 @@ fn full_compat_round_trip() {
 
     // Transaction: insert + commit
     {
-        let tx = conn.transaction().unwrap();
+        let mut tx = conn.transaction().unwrap();
         tx.execute_compat(
             "INSERT INTO users (id, name) VALUES (?1, ?2)",
             params![3_i64, "Charlie"],

@@ -28,72 +28,29 @@ pub trait BatchExt {
 
 impl BatchExt for Connection {
     fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        for stmt in split_sql_statements(sql) {
-            let trimmed = stmt.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Add semicolon back for the parser.
-            let full_stmt = format!("{trimmed};");
-            self.execute(&full_stmt)?;
+        if batch_is_noop(sql) {
+            return Ok(());
         }
-        Ok(())
+        self.execute(sql).map(|_| ())
     }
 }
 
-/// Split SQL text into individual statements on unquoted semicolons.
-///
-/// Respects single-quoted string literals (`'...'`) including escaped quotes
-/// (`''`), double-quoted identifiers, and SQL comments. This prevents
-/// incorrect splitting on semicolons embedded in strings or comments.
-fn split_sql_statements(sql: &str) -> Vec<&str> {
-    let mut stmts = Vec::new();
-    let mut start = 0;
+fn batch_is_noop(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' => {
-                // Skip past the closing single quote (handle '' escapes).
+            b';' | b' ' | b'\t' | b'\r' | b'\n' => {
                 i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        i += 1;
-                        // '' is an escaped quote, continue scanning.
-                        if i < bytes.len() && bytes[i] == b'\'' {
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'"' => {
-                // Skip past the closing double quote (identifiers).
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'"' {
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
             }
             b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                // Line comment: skip to end of line.
                 i += 2;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                // Block comment: skip to closing */.
                 i += 2;
                 while i + 1 < bytes.len() {
                     if bytes[i] == b'*' && bytes[i + 1] == b'/' {
@@ -103,23 +60,11 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
                     i += 1;
                 }
             }
-            b';' => {
-                stmts.push(&sql[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => {
-                i += 1;
-            }
+            _ => return false,
         }
     }
 
-    // Remaining text after the last semicolon.
-    if start < sql.len() {
-        stmts.push(&sql[start..]);
-    }
-
-    stmts
+    true
 }
 
 #[cfg(test)]
@@ -158,6 +103,8 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute_batch("").unwrap();
         conn.execute_batch("   ;  ;  ").unwrap();
+        conn.execute_batch("  -- nothing here\n/* still empty */ ; ")
+            .unwrap();
     }
 
     #[test]
@@ -179,26 +126,35 @@ mod tests {
     }
 
     #[test]
-    fn split_sql_statements_basic() {
-        let stmts = split_sql_statements("SELECT 1; SELECT 2;");
-        // Two statements + trailing empty (which execute_batch skips).
-        assert!(stmts.len() >= 2);
-        assert_eq!(stmts[0], "SELECT 1");
-        assert_eq!(stmts[1].trim(), "SELECT 2");
+    fn execute_batch_allows_triggers_with_internal_semicolons() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+            CREATE TABLE item_audit (item_id INTEGER, seen_value TEXT);
+            CREATE TRIGGER audit_items
+            AFTER INSERT ON items
+            BEGIN
+                INSERT INTO item_audit (item_id, seen_value) VALUES (NEW.id, NEW.value);
+            END;
+            INSERT INTO items (id, value) VALUES (1, 'alpha');
+        ",
+        )
+        .unwrap();
+
+        let audit_rows = conn
+            .query("SELECT item_id, seen_value FROM item_audit")
+            .unwrap();
+        assert_eq!(audit_rows.len(), 1);
+        assert_eq!(audit_rows[0].get_typed::<i64>(0).unwrap(), 1);
+        assert_eq!(audit_rows[0].get_typed::<String>(1).unwrap(), "alpha");
     }
 
     #[test]
-    fn split_sql_statements_quoted_semicolons() {
-        let stmts = split_sql_statements("INSERT INTO t VALUES ('a;b'); SELECT 1;");
-        assert!(stmts.len() >= 2);
-        assert_eq!(stmts[0], "INSERT INTO t VALUES ('a;b')");
-        assert_eq!(stmts[1].trim(), "SELECT 1");
-    }
-
-    #[test]
-    fn split_sql_statements_comments() {
-        let stmts = split_sql_statements("SELECT 1; -- comment with ; inside\nSELECT 2;");
-        assert_eq!(stmts[0], "SELECT 1");
-        assert!(stmts[1].contains("SELECT 2"));
+    fn batch_is_noop_handles_whitespace_semicolons_and_comments() {
+        assert!(batch_is_noop(""));
+        assert!(batch_is_noop("  ;\n\t; "));
+        assert!(batch_is_noop("-- comment only\n/* and block */ ;"));
+        assert!(!batch_is_noop("SELECT 1"));
     }
 }

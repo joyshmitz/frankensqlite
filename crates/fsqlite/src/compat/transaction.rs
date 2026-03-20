@@ -18,13 +18,13 @@ use super::params::ParamValue;
 /// ```ignore
 /// use fsqlite::compat::TransactionExt;
 ///
-/// let tx = conn.transaction()?;
+/// let mut tx = conn.transaction()?;
 /// tx.execute("INSERT INTO users (name) VALUES ('alice')")?;
 /// tx.commit()?; // Without this, the insert is rolled back on drop.
 /// ```
 pub struct Transaction<'a> {
     conn: &'a Connection,
-    committed: bool,
+    finalized: bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -32,21 +32,27 @@ impl<'a> Transaction<'a> {
         conn.execute("BEGIN")?;
         Ok(Self {
             conn,
-            committed: false,
+            finalized: false,
         })
     }
 
     /// Commit the transaction.
-    pub fn commit(mut self) -> Result<(), FrankenError> {
+    ///
+    /// If `COMMIT` fails, the transaction remains active so the caller can
+    /// inspect the error and choose whether to retry or roll back.
+    pub fn commit(&mut self) -> Result<(), FrankenError> {
         self.conn.execute("COMMIT")?;
-        self.committed = true;
+        self.finalized = true;
         Ok(())
     }
 
     /// Rollback the transaction explicitly.
-    pub fn rollback(mut self) -> Result<(), FrankenError> {
+    ///
+    /// If `ROLLBACK` fails, the transaction remains active and drop will make a
+    /// best-effort rollback later.
+    pub fn rollback(&mut self) -> Result<(), FrankenError> {
         self.conn.execute("ROLLBACK")?;
-        self.committed = true; // Prevent double-rollback in drop
+        self.finalized = true;
         Ok(())
     }
 
@@ -98,7 +104,7 @@ impl<'a> Transaction<'a> {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.finalized {
             // Best-effort rollback; ignore errors since we're in drop.
             let _ = self.conn.execute("ROLLBACK");
         }
@@ -129,7 +135,7 @@ mod tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
 
-        let tx = conn.transaction().unwrap();
+        let mut tx = conn.transaction().unwrap();
         tx.execute("INSERT INTO t (val) VALUES ('committed')")
             .unwrap();
         tx.commit().unwrap();
@@ -162,7 +168,7 @@ mod tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
 
-        let tx = conn.transaction().unwrap();
+        let mut tx = conn.transaction().unwrap();
         tx.execute("INSERT INTO t (val) VALUES ('rolled_back')")
             .unwrap();
         tx.rollback().unwrap();

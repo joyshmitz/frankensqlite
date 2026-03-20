@@ -39,6 +39,9 @@ impl OpenFlags {
     /// Convert to `VfsOpenFlags`.
     pub fn to_vfs_flags(self) -> VfsOpenFlags {
         let mut flags = VfsOpenFlags::MAIN_DB;
+        if self.contains(Self::SQLITE_OPEN_READ_ONLY) {
+            flags |= VfsOpenFlags::READONLY;
+        }
         if self.contains(Self::SQLITE_OPEN_READ_WRITE) {
             flags |= VfsOpenFlags::READWRITE;
         }
@@ -111,6 +114,14 @@ mod tests {
         let vfs = flags.to_vfs_flags();
         assert!(vfs.contains(VfsOpenFlags::READWRITE));
         assert!(vfs.contains(VfsOpenFlags::CREATE));
+        assert!(vfs.contains(VfsOpenFlags::MAIN_DB));
+    }
+
+    #[test]
+    fn vfs_flags_conversion_preserves_read_only() {
+        let vfs = OpenFlags::SQLITE_OPEN_READ_ONLY.to_vfs_flags();
+        assert!(vfs.contains(VfsOpenFlags::READONLY));
+        assert!(!vfs.contains(VfsOpenFlags::READWRITE));
         assert!(vfs.contains(VfsOpenFlags::MAIN_DB));
     }
 }
