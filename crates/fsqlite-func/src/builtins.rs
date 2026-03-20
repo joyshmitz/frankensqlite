@@ -1530,7 +1530,7 @@ impl ScalarFunction for LikeFunc {
         let pattern = args[0].to_text();
         let string = args[1].to_text();
         let escape = if args.len() > 2 && !args[2].is_null() {
-            args[2].to_text().chars().next()
+            Some(single_char_escape(args[2].to_text().as_str())?)
         } else {
             None
         };
@@ -1544,6 +1544,16 @@ impl ScalarFunction for LikeFunc {
 
     fn name(&self) -> &str {
         "like"
+    }
+}
+
+fn single_char_escape(escape: &str) -> Result<char> {
+    let mut chars = escape.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Ok(ch),
+        _ => Err(FrankenError::function_error(
+            "ESCAPE expression must be a single character",
+        )),
     }
 }
 
@@ -3308,6 +3318,36 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_like_escape_rejects_empty_string() {
+        let err = LikeFunc
+            .invoke(&[
+                SqliteValue::Text(Arc::from("a")),
+                SqliteValue::Text(Arc::from("a")),
+                SqliteValue::Text(Arc::from("")),
+            ])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ESCAPE expression must be a single character")
+        );
+    }
+
+    #[test]
+    fn test_like_escape_rejects_multi_character_string() {
+        let err = LikeFunc
+            .invoke(&[
+                SqliteValue::Text(Arc::from("a")),
+                SqliteValue::Text(Arc::from("a")),
+                SqliteValue::Text(Arc::from("xx")),
+            ])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ESCAPE expression must be a single character")
+        );
     }
 
     #[test]
