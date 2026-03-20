@@ -5747,4 +5747,160 @@ mod tests {
             "bead_id={BEAD_T6SV2_1} case=reset_clears_log"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // D4 (bd-3wop3.4): Per-waiter targeted notification tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_thundering_herd_8t() {
+        // bd-3wop3.4: 8 threads each wait for a different page. Release one page.
+        // Only the thread waiting for that page should wake quickly; others
+        // should remain parked (or wake much later via spurious wakeup).
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const NUM_THREADS: usize = 8;
+        let table = Arc::new(InProcessPageLockTable::new());
+        let holder = TxnId::new(999).unwrap();
+
+        // Acquire locks on pages 1..=8.
+        for i in 1..=NUM_THREADS {
+            let page = PageNumber::new(i as u32).unwrap();
+            table.try_acquire(page, holder).unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let target_page_idx = 1_usize; // We'll release page 1.
+
+        let mut handles = Vec::with_capacity(NUM_THREADS);
+        for i in 1..=NUM_THREADS {
+            let t = Arc::clone(&table);
+            let b = Arc::clone(&barrier);
+            let wc = Arc::clone(&wake_count);
+            let page = PageNumber::new(i as u32).unwrap();
+            handles.push(std::thread::spawn(move || {
+                b.wait(); // Sync all threads to start waiting simultaneously.
+                let woke = t.wait_for_holder_change(page, holder, Duration::from_millis(200));
+                if woke {
+                    wc.fetch_add(1, Ordering::SeqCst);
+                }
+                (i, woke)
+            }));
+        }
+
+        // Sync and then release only page 1.
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(10)); // Let waiters register.
+        let target_page = PageNumber::new(target_page_idx as u32).unwrap();
+        table.release(target_page, holder);
+
+        // Collect results.
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().unwrap());
+        }
+
+        // The thread waiting for page 1 should have woken (woke=true).
+        let (_, page1_woke) = results.iter().find(|(i, _)| *i == target_page_idx).unwrap();
+        assert!(
+            *page1_woke,
+            "bd-3wop3.4: thread waiting for released page should wake"
+        );
+
+        // Count how many woke within the timeout (should be 1, maybe 2 with spurious).
+        // Definitely NOT all 8 — that would be thundering herd.
+        let total_woke = wake_count.load(Ordering::SeqCst);
+        assert!(
+            total_woke < NUM_THREADS,
+            "bd-3wop3.4: thundering herd detected: {total_woke}/{NUM_THREADS} woke, expected ~1"
+        );
+    }
+
+    #[test]
+    fn test_targeted_wake_correct_thread() {
+        // bd-3wop3.4: Two threads wait for different pages. Release one.
+        // Only the thread waiting for the released page should wake.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let table = Arc::new(InProcessPageLockTable::new());
+        let holder = TxnId::new(100).unwrap();
+        let page_a = PageNumber::new(42).unwrap();
+        let page_b = PageNumber::new(43).unwrap();
+
+        table.try_acquire(page_a, holder).unwrap();
+        table.try_acquire(page_b, holder).unwrap();
+
+        let thread_a_woke = Arc::new(AtomicBool::new(false));
+        let thread_b_woke = Arc::new(AtomicBool::new(false));
+
+        let t = Arc::clone(&table);
+        let a_woke = Arc::clone(&thread_a_woke);
+        let handle_a = std::thread::spawn(move || {
+            let result = t.wait_for_holder_change(page_a, holder, Duration::from_millis(150));
+            a_woke.store(result, Ordering::SeqCst);
+        });
+
+        let t = Arc::clone(&table);
+        let b_woke = Arc::clone(&thread_b_woke);
+        let handle_b = std::thread::spawn(move || {
+            let result = t.wait_for_holder_change(page_b, holder, Duration::from_millis(150));
+            b_woke.store(result, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(20)); // Let waiters register.
+
+        // Release only page_a.
+        table.release(page_a, holder);
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        assert!(
+            thread_a_woke.load(Ordering::SeqCst),
+            "bd-3wop3.4: thread A (waiting for page_a) should wake when page_a released"
+        );
+        assert!(
+            !thread_b_woke.load(Ordering::SeqCst),
+            "bd-3wop3.4: thread B (waiting for page_b) should NOT wake when page_a released"
+        );
+    }
+
+    #[test]
+    fn test_no_spurious_wakes() {
+        // bd-3wop3.4: Waiter should only wake from targeted notification or timeout,
+        // not spuriously from unrelated activity.
+        let table = Arc::new(InProcessPageLockTable::new());
+        let holder = TxnId::new(200).unwrap();
+        let page_wait = PageNumber::new(50).unwrap();
+        let page_other = PageNumber::new(51).unwrap();
+
+        table.try_acquire(page_wait, holder).unwrap();
+        table.try_acquire(page_other, holder).unwrap();
+
+        let t = Arc::clone(&table);
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            let woke = t.wait_for_holder_change(page_wait, holder, Duration::from_millis(100));
+            (woke, started.elapsed())
+        });
+
+        // Release a DIFFERENT page — should NOT wake the waiter.
+        std::thread::sleep(Duration::from_millis(10));
+        table.release(page_other, holder);
+
+        let (woke, elapsed) = handle.join().unwrap();
+
+        // Waiter should have timed out (woke=false) and taken ~100ms.
+        assert!(
+            !woke,
+            "bd-3wop3.4: waiter should NOT wake from unrelated page release"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "bd-3wop3.4: waiter should have waited near-full timeout, got {:?}",
+            elapsed
+        );
+    }
 }

@@ -184,8 +184,9 @@ impl FrankenDb {
     pub fn pragma(&self, pragma: &str) -> Result<JsValue, JsValue> {
         let sql = format!("PRAGMA {pragma}");
         self.with_connection(|conn| {
-            let rows = conn.query(&sql)?;
-            query_result_to_js(rows, &[], 0)
+            let stmt = conn.prepare(&sql)?;
+            let rows = stmt.query()?;
+            query_result_to_js(rows, stmt.column_names(), stmt.column_count())
         })
     }
 
@@ -1307,7 +1308,7 @@ mod wasm_tests {
             .expect("columns field should exist")
             .unchecked_into::<Array>();
         assert_eq!(columns.length(), 1);
-        assert_eq!(columns.get(0).as_string().as_deref(), Some("_c0"));
+        assert_eq!(columns.get(0).as_string().as_deref(), Some("user_version"));
 
         let rows = Reflect::get(&result, &JsValue::from_str("rows"))
             .expect("rows field should exist")
@@ -1315,8 +1316,8 @@ mod wasm_tests {
         assert_eq!(rows.length(), 1);
         let row = rows.get(0).unchecked_into::<Object>();
         assert_eq!(
-            Reflect::get(&row, &JsValue::from_str("_c0"))
-                .expect("_c0 field should exist")
+            Reflect::get(&row, &JsValue::from_str("user_version"))
+                .expect("user_version field should exist")
                 .as_f64(),
             Some(0.0)
         );

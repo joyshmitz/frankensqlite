@@ -222,9 +222,10 @@ pub struct Sqlite3Stmt {
     last_step_code: c_int,
     /// Column count from the most recent result set.
     column_count: c_int,
-    /// Cached CString values for text column accessors (kept alive until
-    /// next step or finalize to satisfy C lifetime expectations).
-    text_cache: Vec<Option<CString>>,
+    /// Cached NUL-terminated text buffers for text accessors (kept alive until
+    /// next step or finalize to satisfy C lifetime expectations, including
+    /// values that contain embedded NUL bytes).
+    text_cache: Vec<Option<Vec<u8>>>,
 }
 
 type ExecCallback = unsafe extern "C" fn(
@@ -358,7 +359,7 @@ unsafe fn emit_exec_callback_rows(
 
         let mut c_values: Vec<*mut c_char> = Vec::with_capacity(vals.len());
         let mut c_names: Vec<*mut c_char> = Vec::with_capacity(vals.len());
-        let mut owned_vals: Vec<CString> = Vec::with_capacity(vals.len());
+        let mut owned_vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(vals.len());
         let mut owned_names: Vec<CString> = Vec::with_capacity(vals.len());
 
         for (i, v) in vals.iter().enumerate() {
@@ -371,28 +372,17 @@ unsafe fn emit_exec_callback_rows(
             c_names.push(cname.as_ptr().cast_mut());
             owned_names.push(cname);
 
-            let text = match v {
+            match v {
                 SqliteValue::Null => {
                     c_values.push(std::ptr::null_mut());
-                    owned_vals.push(CString::default());
+                    owned_vals.push(None);
                     continue;
                 }
-                SqliteValue::Integer(n) => n.to_string(),
-                v @ SqliteValue::Float(_) => v.to_text(),
-                SqliteValue::Text(s) => s.to_string(),
-                SqliteValue::Blob(b) => {
-                    let mut hex = String::with_capacity(2 + b.len() * 2);
-                    hex.push_str("X'");
-                    for byte in b.iter() {
-                        let _ = write!(hex, "{byte:02X}");
-                    }
-                    hex.push('\'');
-                    hex
-                }
-            };
-            let cval = CString::new(text).unwrap_or_else(|_| CString::new("").expect(""));
-            c_values.push(cval.as_ptr().cast_mut());
-            owned_vals.push(cval);
+                _ => {}
+            }
+            let mut text = sqlite_value_to_callback_bytes(v);
+            c_values.push(text.as_mut_ptr().cast());
+            owned_vals.push(Some(text));
         }
 
         debug_assert_eq!(owned_vals.len(), c_values.len());
@@ -406,6 +396,28 @@ unsafe fn emit_exec_callback_rows(
         }
     }
     SQLITE_OK
+}
+
+fn sqlite_value_to_callback_bytes(value: &SqliteValue) -> Vec<u8> {
+    let mut bytes = sqlite_value_to_text_bytes(value);
+    bytes.push(0);
+    bytes
+}
+
+fn sqlite_value_to_text_bytes(value: &SqliteValue) -> Vec<u8> {
+    match value {
+        SqliteValue::Null => Vec::new(),
+        SqliteValue::Integer(number) => number.to_string().into_bytes(),
+        value @ SqliteValue::Float(_) => value.to_text().into_bytes(),
+        SqliteValue::Text(text) => text.as_bytes().to_vec(),
+        SqliteValue::Blob(bytes) => {
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for byte in bytes.iter() {
+                let _ = write!(hex, "{byte:02X}");
+            }
+            hex.into_bytes()
+        }
+    }
 }
 
 unsafe fn execute_exec_batch(
@@ -1094,40 +1106,27 @@ pub unsafe extern "C" fn sqlite3_column_text(
     }
 
     let text = match current_value_ref(stmt, i_col) {
-        Some(SqliteValue::Text(s)) => s.to_string(),
-        Some(SqliteValue::Integer(n)) => n.to_string(),
-        Some(v @ SqliteValue::Float(_)) => v.to_text(),
-        Some(SqliteValue::Blob(b)) => {
-            // Return blob as hex string for text accessor.
-            let mut hex = String::with_capacity(b.len() * 2);
-            for byte in b.iter() {
-                let _ = write!(hex, "{byte:02X}");
-            }
-            hex
-        }
         Some(SqliteValue::Null) | None => return std::ptr::null(),
+        Some(value) => sqlite_value_to_callback_bytes(value),
     };
 
     let s = &mut *stmt;
-    let Ok(cstr) = CString::new(text) else {
-        return std::ptr::null();
-    };
-    // Cache the CString so the pointer stays valid.
+    // Cache the NUL-terminated bytes so the pointer stays valid.
     if (i_col as usize) < s.text_cache.len() {
-        s.text_cache[i_col as usize] = Some(cstr);
+        s.text_cache[i_col as usize] = Some(text);
         // Re-read the pointer from the cached location.
         return s.text_cache[i_col as usize]
             .as_ref()
-            .map_or(std::ptr::null(), |c| c.as_ptr());
+            .map_or(std::ptr::null(), |bytes| bytes.as_ptr().cast());
     }
     // Fallback: extend cache.
     while s.text_cache.len() <= i_col as usize {
         s.text_cache.push(None);
     }
-    s.text_cache[i_col as usize] = Some(cstr);
+    s.text_cache[i_col as usize] = Some(text);
     s.text_cache[i_col as usize]
         .as_ref()
-        .map_or(std::ptr::null(), |c| c.as_ptr())
+        .map_or(std::ptr::null(), |bytes| bytes.as_ptr().cast())
 }
 
 /// Get a blob pointer from column `i_col`.
@@ -1184,7 +1183,7 @@ pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_i
         return 0;
     }
     if let Some(Some(text)) = s.text_cache.get(i_col as usize) {
-        return c_int::try_from(text.as_bytes().len()).unwrap_or(c_int::MAX);
+        return c_int::try_from(text.len().saturating_sub(1)).unwrap_or(c_int::MAX);
     }
 
     match current_value_ref(stmt, i_col) {
@@ -2055,6 +2054,83 @@ mod tests {
             );
 
             sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_column_text_preserves_embedded_nul_bytes() {
+        unsafe {
+            let db = open_memory();
+            (*db).conn.execute("CREATE TABLE t(v TEXT)").unwrap();
+            (*db)
+                .conn
+                .execute_with_params(
+                    "INSERT INTO t(v) VALUES (?)",
+                    &[SqliteValue::Text(std::sync::Arc::from("a\0b"))],
+                )
+                .unwrap();
+
+            let sql = CString::new("SELECT v FROM t;").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(
+                !text.is_null(),
+                "embedded NUL text should still expose a buffer"
+            );
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), 4);
+            assert_eq!(bytes, b"a\0b\0");
+            assert_eq!(sqlite3_column_bytes(stmt, 0), 3);
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_exec_callback_preserves_embedded_nul_bytes() {
+        unsafe {
+            unsafe extern "C" fn capture_bytes_cb(
+                parg: *mut c_void,
+                _ncols: c_int,
+                values: *mut *mut c_char,
+                _names: *mut *mut c_char,
+            ) -> c_int {
+                let out = &mut *parg.cast::<Vec<u8>>();
+                let value_ptr = *values;
+                let bytes = std::slice::from_raw_parts(value_ptr.cast::<u8>(), 4);
+                out.extend_from_slice(bytes);
+                SQLITE_OK
+            }
+
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE t(v TEXT)").unwrap();
+            conn.execute_with_params(
+                "INSERT INTO t(v) VALUES (?)",
+                &[SqliteValue::Text(std::sync::Arc::from("a\0b"))],
+            )
+            .unwrap();
+            let rows = conn.query("SELECT v FROM t").unwrap();
+            let handle = Sqlite3::new(conn);
+            let mut captured: Vec<u8> = Vec::new();
+
+            assert_eq!(
+                emit_exec_callback_rows(
+                    &handle,
+                    "SELECT v FROM t",
+                    &rows,
+                    capture_bytes_cb,
+                    std::ptr::from_mut(&mut captured).cast(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(captured, b"a\0b\0");
         }
     }
 
