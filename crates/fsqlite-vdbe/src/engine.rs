@@ -9976,59 +9976,26 @@ impl VdbeEngine {
         // The only acceptable writable "bootstrap" case is a truly
         // zero-initialized root page that we can initialize in-place.
         let txn_cx = self.derive_execution_cx();
-        // Flag to skip the pager path and use MemDatabase directly.
-        // Set when pager read fails but MemDatabase has the table (e.g., view materialization
-        // where MemDatabase allocates root pages beyond the pager's db_size).
-        let mut skip_pager_for_mem_fallback = false;
-
         if let Some(ref mut page_io) = self.txn_page_io {
-            // If the pager read itself fails, check if MemDatabase has this table.
+            // If the pager read itself fails, fail cursor open instead of
+            // treating it as an uninitialized page.
             let page_data = match page_io.read_page(&txn_cx, root_pgno) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    // Check if MemDatabase can serve this table before failing.
-                    let has_mem_table = self
-                        .db
-                        .as_ref()
-                        .is_some_and(|db| db.get_table(root_page).is_some());
-                    if has_mem_table && !self.reject_mem_fallback {
-                        tracing::debug!(
-                            cursor_id,
-                            page_id = root_page,
-                            writable,
-                            has_txn,
-                            mode,
-                            backend_kind = "mem",
-                            decision_reason = "pager_read_failed_mem_fallback",
-                            error = %err,
-                            "open_storage_cursor: pager read failed, falling through to MemDatabase"
-                        );
-                        // Skip the rest of this pager block, use MemDatabase path instead.
-                        skip_pager_for_mem_fallback = true;
-                        vec![]
-                    } else {
-                        tracing::warn!(
-                            cursor_id,
-                            page_id = root_page,
-                            writable,
-                            has_txn,
-                            mode,
-                            backend_kind = "txn",
-                            decision_reason = "pager_read_failed",
-                            error = %err,
-                            has_mem_table,
-                            reject_mem_fallback = self.reject_mem_fallback,
-                            "open_storage_cursor: failed to read root page from pager"
-                        );
-                        return false;
-                    }
+                    tracing::warn!(
+                        cursor_id,
+                        page_id = root_page,
+                        writable,
+                        has_txn,
+                        mode,
+                        backend_kind = "txn",
+                        decision_reason = "pager_read_failed",
+                        error = %err,
+                        "open_storage_cursor: failed to read root page from pager"
+                    );
+                    return false;
                 }
             };
-
-            // If we're skipping to MemDatabase fallback, exit this block early.
-            if skip_pager_for_mem_fallback {
-                // Fall through to MemDatabase path below.
-            } else {
             let hdr_offset = header_offset_for_page(root_pgno);
             let parsed_header = BtreePageHeader::parse(&page_data, hdr_offset).ok();
             // A page is a valid B-tree if the header parses successfully.
