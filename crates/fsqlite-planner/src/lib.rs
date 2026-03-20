@@ -7278,7 +7278,7 @@ mod tests {
     }
 }
 #[test]
-fn debug_test_join_order() {
+fn test_join_order_returns_each_table_once() {
     let tables = vec![
         TableStats {
             name: "nation".to_owned(),
@@ -7318,5 +7318,10 @@ fn debug_test_join_order() {
         },
     ];
     let plan = order_joins(&tables, &[], &[], None, &[]);
-    println!("Join order: {:?}", plan.join_order);
+    assert_eq!(plan.join_order.len(), tables.len());
+    let join_order: HashSet<_> = plan.join_order.iter().collect();
+    assert_eq!(join_order.len(), tables.len());
+    for table in &tables {
+        assert!(plan.join_order.iter().any(|name| name == &table.name));
+    }
 }
