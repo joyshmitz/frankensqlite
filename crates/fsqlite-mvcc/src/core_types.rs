@@ -1237,6 +1237,15 @@ pub struct Transaction {
     /// stale-reader detection and provides `defer_retire` for safe deferred
     /// reclamation of superseded page versions (§14.10, bd-2y306.1).
     pub version_guard: Option<VersionGuardTicket>,
+    /// Pages that have undergone structural B-tree mutations (splits, merges,
+    /// overflow chain modifications, interior page changes) OR raw page writes
+    /// that bypass cell-level tracking.
+    ///
+    /// These pages must use page-level MVCC versioning (VersionStore.publish()).
+    /// Pages in the write set but NOT in this set are candidates for cell-level
+    /// MVCC (CellVisibilityLog). This enables concurrent writers to modify
+    /// different rows on the same page without conflict (C4: bd-l9k8e.4).
+    pub structural_pages: HashSet<PageNumber>,
 }
 
 impl Transaction {
@@ -1275,6 +1284,7 @@ impl Transaction {
             has_out_rw: false,
             started_at_ms: logical_now_millis(),
             version_guard: None,
+            structural_pages: HashSet::new(),
         }
     }
 
@@ -1412,6 +1422,13 @@ impl Transaction {
         if let Some(bloom) = self.read_set_bloom.as_mut() {
             bloom.clear();
         }
+    }
+
+    /// Clear structural pages tracking (C4: bd-l9k8e.4).
+    ///
+    /// Called after commit/abort to reset tracking for potential reuse.
+    pub fn clear_structural_pages(&mut self) {
+        self.structural_pages.clear();
     }
 
     /// Transition to committed state. Panics if not active.
