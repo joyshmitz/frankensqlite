@@ -9965,15 +9965,21 @@ impl VdbeEngine {
         };
 
         let has_txn = self.txn_page_io.is_some();
+        let mut mem_decision_reason = "no_pager_transaction";
 
         // Phase 5C.1 (bd-35my): Route through pager when available.
         //
         // Critical safety rule:
-        // If a pager transaction exists, NEVER fall back to MemPageStore. A
-        // fallback can silently route writes to a non-durable in-memory copy
-        // and create divergence/corruption under concurrency.
+        // If a pager transaction exists, writable cursors must NEVER fall back
+        // to MemPageStore. A writable fallback can silently route writes to a
+        // non-durable in-memory copy and create divergence/corruption under
+        // concurrency.
         //
-        // The only acceptable writable "bootstrap" case is a truly
+        // Read-only fallback remains allowed when parity-cert is disabled and
+        // MemDatabase owns the root page (for example, materialized view /
+        // sqlite_master snapshots that were never pager-backed).
+        //
+        // The only acceptable writable pager "bootstrap" case is a truly
         // zero-initialized root page that we can initialize in-place.
         let txn_cx = self.derive_execution_cx();
         // Use a labeled block so we can break out to the MemDatabase fallback path
@@ -9991,7 +9997,8 @@ impl VdbeEngine {
                             .db
                             .as_ref()
                             .is_some_and(|db| db.get_table(root_page).is_some());
-                        if has_mem_table && !self.reject_mem_fallback {
+                        if has_mem_table && !self.reject_mem_fallback && !writable {
+                            mem_decision_reason = "pager_read_failed_mem_fallback";
                             tracing::debug!(
                                 cursor_id,
                                 page_id = root_page,
@@ -10186,13 +10193,14 @@ impl VdbeEngine {
                 }
 
                 // If the page is zero/invalid but MemDatabase has this table
-                // (e.g., materialized sqlite_master virtual table), fall through
-                // to the MemDatabase path below instead of refusing.
+                // (e.g., materialized sqlite_master virtual table), read-only
+                // cursors may fall through to the MemDatabase path below when
+                // parity-cert is disabled. Writable cursors must still refuse.
                 let has_mem_table = self
                     .db
                     .as_ref()
                     .is_some_and(|db| db.get_table(root_page).is_some());
-                if !has_mem_table {
+                if !has_mem_table || writable {
                     // No MemDatabase fallback available — refuse to open.
                     tracing::warn!(
                         cursor_id,
@@ -10204,11 +10212,13 @@ impl VdbeEngine {
                         decision_reason = "invalid_page_no_mem_fallback",
                         first_byte = page_data.first().copied().unwrap_or_default(),
                         is_zero_page,
+                        has_mem_table,
                         "open_storage_cursor: refusing on invalid transaction-backed root page"
                     );
                     return false;
                 }
                 // else: fall through to MemDatabase path
+                mem_decision_reason = "txn_page_invalid_mem_fallback";
                 tracing::debug!(
                     cursor_id,
                     page_id = root_page,
@@ -10297,7 +10307,7 @@ impl VdbeEngine {
             has_txn,
             mode,
             backend_kind = "mem",
-            decision_reason = "no_pager_transaction",
+            decision_reason = mem_decision_reason,
             is_table_btree,
             "open_storage_cursor: routed through MemPageStore fallback"
         );
@@ -16189,6 +16199,39 @@ mod tests {
     }
 
     #[test]
+    fn test_open_storage_cursor_write_read_failure_does_not_fallback_to_mem() {
+        use std::path::PathBuf;
+
+        use fsqlite_pager::{MvccPager as _, SimplePager, TransactionMode};
+        use fsqlite_vfs::MemoryVfs;
+
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/vdbe_write_read_failure_no_mem_fallback.db");
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN).unwrap();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let root = 2;
+        db.create_table_at(root, 1);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(Box::new(txn));
+        engine.set_reject_mem_fallback(false);
+
+        let opened = engine.open_storage_cursor(0, root, true);
+        assert!(
+            !opened,
+            "writable cursor opens must fail when pager reads error instead of falling back to Mem"
+        );
+        assert!(
+            !engine.storage_cursors.contains_key(&0),
+            "failed open must not leave a cursor installed"
+        );
+    }
+
+    #[test]
     fn test_open_storage_cursor_falls_back_to_mem_without_txn() {
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
@@ -16224,6 +16267,34 @@ mod tests {
         assert!(
             !opened,
             "transaction-backed opens must not silently fall back to MemPageStore"
+        );
+        assert!(
+            !engine.storage_cursors.contains_key(&0),
+            "failed open must not leave a cursor installed"
+        );
+    }
+
+    #[test]
+    fn test_open_storage_cursor_write_invalid_page_does_not_fallback_to_mem() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let root = 256;
+        db.create_table_at(root, 1);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(Box::new(txn));
+        engine.set_reject_mem_fallback(false);
+
+        let opened = engine.open_storage_cursor(0, root, true);
+        assert!(
+            !opened,
+            "writable cursor opens must fail on invalid pager pages instead of falling back to Mem"
         );
         assert!(
             !engine.storage_cursors.contains_key(&0),
