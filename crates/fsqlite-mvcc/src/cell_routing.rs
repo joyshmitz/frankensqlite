@@ -1098,12 +1098,8 @@ mod tests {
         // First, measure delta memory size with a separate log
         let measure_log = CellVisibilityLog::with_per_txn_budget(1024 * 1024, 10_000);
         let cell_key = CellKey::table_row(btree, 0);
-        let _ = measure_log.record_insert(
-            cell_key,
-            PageNumber::new(99).unwrap(),
-            vec![0u8; 10],
-            txn,
-        );
+        let _ =
+            measure_log.record_insert(cell_key, PageNumber::new(99).unwrap(), vec![0u8; 10], txn);
         let delta_size = measure_log.txn_bytes(txn);
 
         // Now create the real log with budget = delta_size so after one insert,
@@ -1114,12 +1110,8 @@ mod tests {
 
         // Insert one delta - should succeed and bring us exactly to budget
         let cell_key1 = CellKey::table_row(btree, 1);
-        let result = cell_log.record_insert(
-            cell_key1,
-            PageNumber::new(99).unwrap(),
-            vec![0u8; 10],
-            txn,
-        );
+        let result =
+            cell_log.record_insert(cell_key1, PageNumber::new(99).unwrap(), vec![0u8; 10], txn);
         assert!(result.is_some(), "First insert should succeed");
 
         // Verify we're at the budget limit
