@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -14,17 +14,47 @@ const DEFAULT_OVERFLOW_FALLBACK_BYTES: usize = 8 * 1024 * 1024;
 const RECORD_FIXED_OVERHEAD_BYTES: usize = 48;
 const DEFAULT_EPOCH_ADVANCE_INTERVAL_MS: u64 = 10;
 
+/// Default number of buffer slots. With 128 slots, 16 threads have only
+/// 12.5% probability of two threads landing on the same slot.
+pub const DEFAULT_BUFFER_SLOT_COUNT: usize = 128;
+
+/// Global counter for assigning thread-local buffer slot indices.
+/// Each thread gets a unique slot on first access via `thread_buffer_slot()`.
+static NEXT_BUFFER_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+std::thread_local! {
+    /// Each thread's assigned buffer slot index. Assigned on first access
+    /// via atomic increment of `NEXT_BUFFER_SLOT`, then modulo slot count.
+    static THREAD_BUFFER_SLOT: usize =
+        NEXT_BUFFER_SLOT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Returns the current thread's assigned buffer slot index, modulo `slot_count`.
+///
+/// This slot is stable for the lifetime of the thread. Different threads
+/// get different slots (until wrap-around at `slot_count`).
+#[inline]
+pub fn thread_buffer_slot(slot_count: usize) -> usize {
+    THREAD_BUFFER_SLOT.with(|&slot| slot % slot_count)
+}
+
+/// Resets the global slot counter. Only for testing.
+#[cfg(test)]
+pub fn reset_slot_counter() {
+    NEXT_BUFFER_SLOT.store(0, Ordering::SeqCst);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OverflowPolicy {
+pub enum OverflowPolicy {
     BlockWriter,
     AllocateOverflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BufferConfig {
-    capacity_bytes: usize,
-    overflow_policy: OverflowPolicy,
-    overflow_fallback_bytes: usize,
+pub struct BufferConfig {
+    pub capacity_bytes: usize,
+    pub overflow_policy: OverflowPolicy,
+    pub overflow_fallback_bytes: usize,
 }
 
 impl Default for BufferConfig {
@@ -38,34 +68,34 @@ impl Default for BufferConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BufferState {
+pub enum BufferState {
     Writable,
     Sealed { epoch: u64 },
     Flushing { epoch: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppendOutcome {
+pub enum AppendOutcome {
     Appended,
     QueuedOverflow,
     Blocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FallbackDecision {
+pub enum FallbackDecision {
     ContinueParallel,
     ForceSerializedDrain,
 }
 
 #[derive(Debug, Clone)]
-struct WalRecord {
-    txn_token: TxnToken,
-    epoch: u64,
-    page_id: PageNumber,
-    begin_seq: CommitSeq,
-    end_seq: Option<CommitSeq>,
-    before_image: Vec<u8>,
-    after_image: Vec<u8>,
+pub struct WalRecord {
+    pub txn_token: TxnToken,
+    pub epoch: u64,
+    pub page_id: PageNumber,
+    pub begin_seq: CommitSeq,
+    pub end_seq: Option<CommitSeq>,
+    pub before_image: Vec<u8>,
+    pub after_image: Vec<u8>,
 }
 
 impl WalRecord {
@@ -107,7 +137,7 @@ impl BufferLane {
 }
 
 #[derive(Debug)]
-struct PerCoreWalBuffer {
+pub struct PerCoreWalBuffer {
     config: BufferConfig,
     active: BufferLane,
     flush_lane: BufferLane,
@@ -117,7 +147,7 @@ struct PerCoreWalBuffer {
 }
 
 impl PerCoreWalBuffer {
-    fn new(_core_id: usize, config: BufferConfig) -> Self {
+    pub fn new(_core_id: usize, config: BufferConfig) -> Self {
         Self {
             config,
             active: BufferLane::new_writable(),
@@ -128,7 +158,7 @@ impl PerCoreWalBuffer {
         }
     }
 
-    fn append(&mut self, record: WalRecord) -> AppendOutcome {
+    pub fn append(&mut self, record: WalRecord) -> AppendOutcome {
         if self.active.state != BufferState::Writable {
             return AppendOutcome::Blocked;
         }
@@ -158,7 +188,7 @@ impl PerCoreWalBuffer {
         }
     }
 
-    fn seal_active(&mut self, epoch: u64) -> Result<(), &'static str> {
+    pub fn seal_active(&mut self, epoch: u64) -> Result<(), &'static str> {
         if self.active.state != BufferState::Writable {
             return Err("active lane is not writable");
         }
@@ -166,7 +196,7 @@ impl PerCoreWalBuffer {
         Ok(())
     }
 
-    fn begin_flush(&mut self) -> Result<usize, &'static str> {
+    pub fn begin_flush(&mut self) -> Result<usize, &'static str> {
         let BufferState::Sealed { epoch } = self.active.state else {
             return Err("active lane must be sealed before flush");
         };
@@ -183,7 +213,7 @@ impl PerCoreWalBuffer {
         Ok(self.flush_lane.records.len())
     }
 
-    fn complete_flush(&mut self) -> Result<(), &'static str> {
+    pub fn complete_flush(&mut self) -> Result<(), &'static str> {
         if !matches!(self.flush_lane.state, BufferState::Flushing { .. }) {
             return Err("flush lane is not in flushing state");
         }
@@ -195,7 +225,7 @@ impl PerCoreWalBuffer {
         Ok(())
     }
 
-    fn fallback_decision(&self) -> FallbackDecision {
+    pub fn fallback_decision(&self) -> FallbackDecision {
         if self.fallback_latched {
             FallbackDecision::ForceSerializedDrain
         } else {
@@ -203,7 +233,7 @@ impl PerCoreWalBuffer {
         }
     }
 
-    fn force_serialized_drain(&mut self) -> Vec<WalRecord> {
+    pub fn force_serialized_drain(&mut self) -> Vec<WalRecord> {
         let mut drained = Vec::with_capacity(
             self.active
                 .records
@@ -226,23 +256,23 @@ impl PerCoreWalBuffer {
         drained
     }
 
-    fn active_state(&self) -> BufferState {
+    pub fn active_state(&self) -> BufferState {
         self.active.state
     }
 
-    fn flush_state(&self) -> BufferState {
+    pub fn flush_state(&self) -> BufferState {
         self.flush_lane.state
     }
 
-    fn active_len(&self) -> usize {
+    pub fn active_len(&self) -> usize {
         self.active.records.len()
     }
 
-    fn flush_len(&self) -> usize {
+    pub fn flush_len(&self) -> usize {
         self.flush_lane.records.len()
     }
 
-    fn overflow_len(&self) -> usize {
+    pub fn overflow_len(&self) -> usize {
         self.overflow.len()
     }
 
@@ -309,12 +339,12 @@ impl BufferCell {
 }
 
 #[derive(Debug)]
-struct PerCoreWalBufferPool {
+pub struct PerCoreWalBufferPool {
     cells: Vec<BufferCell>,
 }
 
 impl PerCoreWalBufferPool {
-    fn new(core_count: usize, config: BufferConfig) -> Self {
+    pub fn new(core_count: usize, config: BufferConfig) -> Self {
         assert!(core_count > 0, "core_count must be > 0");
         let mut cells = Vec::with_capacity(core_count);
         for core_id in 0..core_count {
@@ -323,7 +353,11 @@ impl PerCoreWalBufferPool {
         Self { cells }
     }
 
-    fn append_to_core(&self, core_id: usize, record: WalRecord) -> Result<AppendOutcome, String> {
+    pub fn append_to_core(
+        &self,
+        core_id: usize,
+        record: WalRecord,
+    ) -> Result<AppendOutcome, String> {
         let Some(cell) = self.cells.get(core_id) else {
             return Err(format!(
                 "invalid core_id={core_id}; available cores={}",
@@ -333,18 +367,18 @@ impl PerCoreWalBufferPool {
         Ok(cell.append(record))
     }
 
-    fn contention_events_total(&self) -> u64 {
+    pub fn contention_events_total(&self) -> u64 {
         self.cells
             .iter()
             .map(BufferCell::contention_events)
             .sum::<u64>()
     }
 
-    fn core_count(&self) -> usize {
+    pub fn core_count(&self) -> usize {
         self.cells.len()
     }
 
-    fn seal_active_for_epoch(&self, epoch: u64) -> Result<usize, String> {
+    pub fn seal_active_for_epoch(&self, epoch: u64) -> Result<usize, String> {
         let mut sealed_lanes = 0_usize;
 
         for (core_id, cell) in self.cells.iter().enumerate() {
@@ -373,7 +407,7 @@ impl PerCoreWalBufferPool {
         Ok(sealed_lanes)
     }
 
-    fn flush_epoch_batches(&self, epoch: u64) -> Result<(Vec<WalRecord>, Vec<usize>), String> {
+    pub fn flush_epoch_batches(&self, epoch: u64) -> Result<(Vec<WalRecord>, Vec<usize>), String> {
         let mut all_records = Vec::new();
         let mut records_per_core = Vec::with_capacity(self.cells.len());
 
@@ -443,8 +477,8 @@ impl PerCoreWalBufferPool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EpochConfig {
-    advance_interval_ms: u64,
+pub struct EpochConfig {
+    pub advance_interval_ms: u64,
 }
 
 impl Default for EpochConfig {
@@ -456,14 +490,14 @@ impl Default for EpochConfig {
 }
 
 #[derive(Debug, Clone)]
-struct EpochFlushBatch {
-    epoch: u64,
-    records: Vec<WalRecord>,
-    records_per_core: Vec<usize>,
+pub struct EpochFlushBatch {
+    pub epoch: u64,
+    pub records: Vec<WalRecord>,
+    pub records_per_core: Vec<usize>,
 }
 
 impl EpochFlushBatch {
-    fn total_records(&self) -> usize {
+    pub fn total_records(&self) -> usize {
         self.records.len()
     }
 }
@@ -475,7 +509,7 @@ struct EpochWaitState {
 }
 
 #[derive(Debug)]
-struct EpochOrderCoordinator {
+pub struct EpochOrderCoordinator {
     pool: Arc<PerCoreWalBufferPool>,
     current_epoch: AtomicU64,
     wait_state: Mutex<EpochWaitState>,
@@ -484,7 +518,7 @@ struct EpochOrderCoordinator {
 }
 
 impl EpochOrderCoordinator {
-    fn new(core_count: usize, buffer_config: BufferConfig, config: EpochConfig) -> Self {
+    pub fn new(core_count: usize, buffer_config: BufferConfig, config: EpochConfig) -> Self {
         let pool = Arc::new(PerCoreWalBufferPool::new(core_count, buffer_config));
         let wait_state = EpochWaitState {
             observed_epochs: vec![0; core_count],
@@ -499,11 +533,11 @@ impl EpochOrderCoordinator {
         }
     }
 
-    fn current_epoch(&self) -> u64 {
+    pub fn current_epoch(&self) -> u64 {
         self.current_epoch.load(Ordering::SeqCst)
     }
 
-    fn durable_epoch(&self) -> Option<u64> {
+    pub fn durable_epoch(&self) -> Option<u64> {
         let guard = self
             .wait_state
             .lock()
@@ -511,11 +545,11 @@ impl EpochOrderCoordinator {
         guard.durable_epoch
     }
 
-    fn epoch_advance_interval(&self) -> Duration {
+    pub fn epoch_advance_interval(&self) -> Duration {
         Duration::from_millis(self.config.advance_interval_ms)
     }
 
-    fn observe_epoch(&self, core_id: usize) -> Result<u64, String> {
+    pub fn observe_epoch(&self, core_id: usize) -> Result<u64, String> {
         let observed_epoch = self.current_epoch();
         let mut guard = self
             .wait_state
@@ -533,7 +567,7 @@ impl EpochOrderCoordinator {
         Ok(observed_epoch)
     }
 
-    fn append_to_core(
+    pub fn append_to_core(
         &self,
         core_id: usize,
         begin_seq: u64,
@@ -544,7 +578,7 @@ impl EpochOrderCoordinator {
         self.pool.append_to_core(core_id, record)
     }
 
-    fn advance_epoch_and_wait(
+    pub fn advance_epoch_and_wait(
         &self,
         active_cores: &[usize],
         timeout: Duration,
@@ -599,7 +633,7 @@ impl EpochOrderCoordinator {
         Ok(next_epoch)
     }
 
-    fn flush_epoch(&self, epoch: u64) -> Result<EpochFlushBatch, String> {
+    pub fn flush_epoch(&self, epoch: u64) -> Result<EpochFlushBatch, String> {
         let (records, records_per_core) = self.pool.flush_epoch_batches(epoch)?;
         let mut guard = self
             .wait_state
@@ -620,7 +654,7 @@ impl EpochOrderCoordinator {
         })
     }
 
-    fn wait_until_epoch_durable(&self, epoch: u64, timeout: Duration) -> Result<(), String> {
+    pub fn wait_until_epoch_durable(&self, epoch: u64, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let mut guard = self
             .wait_state
@@ -651,7 +685,7 @@ impl EpochOrderCoordinator {
         Ok(())
     }
 
-    fn recovery_order(records: &[WalRecord]) -> Vec<WalRecord> {
+    pub fn recovery_order(records: &[WalRecord]) -> Vec<WalRecord> {
         let mut ordered = records.to_vec();
         ordered.sort_by_key(|record| {
             (

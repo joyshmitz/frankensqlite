@@ -10,8 +10,8 @@ pub mod checksum;
 pub mod group_commit;
 pub mod metrics;
 pub mod native_commit;
-#[cfg(test)]
-mod per_core_buffer;
+pub mod parallel_wal;
+pub mod per_core_buffer;
 pub mod recovery_compaction;
 pub mod telemetry;
 pub mod wal;
@@ -60,6 +60,15 @@ pub use metrics::{
     GLOBAL_WAL_RECOVERY_METRICS, GroupCommitMetrics, GroupCommitMetricsSnapshot,
     WalFecRepairCounters, WalFecRepairCountersSnapshot, WalMetrics, WalMetricsSnapshot,
     WalRecoveryCounters, WalRecoveryCountersSnapshot,
+};
+pub use parallel_wal::{
+    ParallelWalBatch, ParallelWalConfig, ParallelWalCoordinator, ParallelWalFrame,
+    parallel_wal_coordinator_for_path, remove_parallel_wal_coordinator,
+};
+pub use per_core_buffer::{
+    AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,
+    EpochFlushBatch, EpochOrderCoordinator, FallbackDecision, OverflowPolicy, PerCoreWalBuffer,
+    PerCoreWalBufferPool, WalRecord, thread_buffer_slot,
 };
 pub use telemetry::{
     NoOpWalObserver, WalTelemetryEvent, WalTelemetryObserver, WalTelemetryRingBuffer,
