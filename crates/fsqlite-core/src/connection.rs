@@ -19870,7 +19870,44 @@ impl Connection {
             needed_columns.as_deref(),
         );
 
-        let (access_kind, index_name, index_column, covering) = match access_path.kind {
+        // The planner's `classify_where_term` only recognises the hidden rowid
+        // aliases (rowid / _rowid_ / oid) as rowid-equality terms.  A
+        // user-declared `INTEGER PRIMARY KEY` column (e.g. `id INTEGER PRIMARY
+        // KEY`) is semantically a rowid alias but the planner has no schema
+        // context to detect this, so it classifies `WHERE id = ?` as a plain
+        // column Equality term and returns FullTableScan.
+        //
+        // Post-process: if the planner chose FullTableScan, check whether any
+        // WHERE equality term refers to the table's IPK column by name.  If so,
+        // upgrade to RowidLookup so the VDBE codegen emits SeekRowid instead of
+        // a linear scan.  This is always safe because an INTEGER PRIMARY KEY is
+        // guaranteed to be unique and maps 1:1 with the B-tree rowid.
+        let effective_access_kind =
+            if matches!(access_path.kind, PlannerAccessPathKind::FullTableScan) {
+                let ipk_col = table.columns.iter().find(|c| c.is_ipk);
+                let has_ipk_eq = ipk_col.is_some_and(|ipk| {
+                    where_terms.iter().any(|wt| {
+                        matches!(wt.kind, WhereTermKind::Equality)
+                            && wt.column.as_ref().is_some_and(|wc| {
+                                wc.column.eq_ignore_ascii_case(&ipk.name)
+                                    && wc.table.as_deref().is_none_or(|qt| {
+                                        qt.eq_ignore_ascii_case(&table.name)
+                                            || table_alias
+                                                .is_some_and(|a| qt.eq_ignore_ascii_case(a))
+                                    })
+                            })
+                    })
+                });
+                if has_ipk_eq {
+                    PlannerAccessPathKind::RowidLookup
+                } else {
+                    access_path.kind
+                }
+            } else {
+                access_path.kind
+            };
+
+        let (access_kind, index_name, index_column, covering) = match effective_access_kind {
             PlannerAccessPathKind::FullTableScan => {
                 (PlannerSelectAccessKind::FullTableScan, None, None, false)
             }
