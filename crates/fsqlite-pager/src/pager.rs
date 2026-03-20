@@ -4,6 +4,7 @@
 //! VFS-backed database file and a zero-copy [`PageCache`].
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
@@ -1169,8 +1170,6 @@ where
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
             let published_snapshot = self.published.snapshot();
-            let published_visible_commit_seq = published_snapshot.visible_commit_seq;
-            let published_db_size = published_snapshot.db_size;
             let pool = self.pool.clone();
             let cleanup_cx = cx.clone();
             return Ok(SimpleTransaction {
@@ -1180,8 +1179,8 @@ where
                 inner: Arc::clone(&self.inner),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
-                published_visible_commit_seq,
-                published_db_size,
+                published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
+                published_db_size: Cell::new(published_snapshot.db_size),
                 write_set: HashMap::new(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
@@ -1347,8 +1346,6 @@ where
         let journal_mode = inner.journal_mode;
         let pool = self.pool.clone();
         let published_snapshot = self.published.snapshot();
-        let published_visible_commit_seq = published_snapshot.visible_commit_seq;
-        let published_db_size = published_snapshot.db_size;
         let cleanup_cx = cleanup_child_cx(cx);
         drop(inner);
 
@@ -1359,8 +1356,8 @@ where
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
-            published_visible_commit_seq,
-            published_db_size,
+            published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
+            published_db_size: Cell::new(published_snapshot.db_size),
             write_set: HashMap::new(),
             write_pages_sorted: Vec::new(),
             freed_pages: Vec::new(),
@@ -2279,12 +2276,15 @@ pub struct SimpleTransaction<V: Vfs> {
     inner: Arc<Mutex<PagerInner<V::File>>>,
     cache: Arc<ShardedPageCache>,
     published: Arc<PublishedPagerState>,
-    published_visible_commit_seq: CommitSeq,
-    /// Database size at transaction start. Used for MVCC visibility: pages
-    /// beyond this bound didn't exist when this transaction started and must
-    /// not be returned as valid data (they would contain zeros, causing
-    /// corruption when interpreted as B-tree pages).
-    published_db_size: u32,
+    /// Visible commit sequence at snapshot capture. Uses `Cell` for interior
+    /// mutability so `get_page` (which takes `&self`) can refresh the snapshot
+    /// when encountering pages beyond the current db_size boundary.
+    published_visible_commit_seq: Cell<CommitSeq>,
+    /// Database size at snapshot capture. Used for MVCC visibility: pages
+    /// beyond this bound didn't exist when this snapshot was taken. Uses
+    /// `Cell` so the snapshot can be refreshed during reads when concurrent
+    /// writers commit new pages.
+    published_db_size: Cell<u32>,
     write_set: HashMap<PageNumber, StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
@@ -2875,40 +2875,66 @@ where
         }
 
         // MVCC db_size guard: pages beyond the transaction's snapshot db_size
-        // did not exist when this transaction started. Returning zeros for
-        // such pages would cause corruption when the B-tree layer interprets
-        // them as valid pages (page type 0x00 is invalid). Return BusySnapshot
-        // so the caller can retry with a fresh transaction if needed.
+        // did not exist when this snapshot was taken. Instead of immediately
+        // returning BusySnapshot, we refresh the snapshot to see if concurrent
+        // commits have advanced the db_size to include this page. This allows
+        // read-only transactions to observe newly-committed pages without
+        // requiring a full transaction restart.
         //
         // Exception: pages allocated by THIS transaction (in allocated_from_eof
         // or allocated_from_freelist) are allowed even if beyond published_db_size.
-        if page_no.get() > self.published_db_size {
+        if page_no.get() > self.published_db_size.get() {
             let page_allocated_by_this_txn = self.allocated_from_eof.contains(&page_no)
                 || self.allocated_from_freelist.contains(&page_no)
                 || self.page_lease.contains(&page_no);
             if !page_allocated_by_this_txn {
-                tracing::trace!(
-                    target: "fsqlite.snapshot_publication",
-                    trace_id = cx.trace_id(),
-                    run_id = "pager-publication",
-                    scenario_id = "page_beyond_snapshot_db_size",
-                    page_no = page_no.get(),
-                    published_db_size = self.published_db_size,
-                    "page beyond transaction's snapshot db_size"
-                );
-                return Err(FrankenError::BusySnapshot {
-                    conflicting_pages: format!(
-                        "page {} > snapshot db_size {}",
-                        page_no.get(),
-                        self.published_db_size
-                    ),
-                });
+                // Snapshot refresh + retry: check if a newer snapshot includes this page.
+                let fresh_snapshot = self.published.snapshot();
+                if page_no.get() <= fresh_snapshot.db_size {
+                    // The page now exists in a more recent snapshot. Advance our
+                    // snapshot boundary to include it and continue with the read.
+                    tracing::trace!(
+                        target: "fsqlite.snapshot_publication",
+                        trace_id = cx.trace_id(),
+                        run_id = "pager-publication",
+                        scenario_id = "snapshot_refresh_success",
+                        page_no = page_no.get(),
+                        old_db_size = self.published_db_size.get(),
+                        new_db_size = fresh_snapshot.db_size,
+                        old_commit_seq = self.published_visible_commit_seq.get().get(),
+                        new_commit_seq = fresh_snapshot.visible_commit_seq.get(),
+                        "refreshed snapshot to include requested page"
+                    );
+                    self.published_db_size.set(fresh_snapshot.db_size);
+                    self.published_visible_commit_seq.set(fresh_snapshot.visible_commit_seq);
+                    // Fall through to continue with the read using the refreshed snapshot
+                } else {
+                    // Page is still beyond the latest snapshot — genuinely doesn't exist yet.
+                    tracing::trace!(
+                        target: "fsqlite.snapshot_publication",
+                        trace_id = cx.trace_id(),
+                        run_id = "pager-publication",
+                        scenario_id = "page_beyond_snapshot_db_size",
+                        page_no = page_no.get(),
+                        published_db_size = self.published_db_size.get(),
+                        latest_db_size = fresh_snapshot.db_size,
+                        "page beyond transaction's snapshot db_size (even after refresh)"
+                    );
+                    return Err(FrankenError::BusySnapshot {
+                        conflicting_pages: format!(
+                            "page {} > snapshot db_size {} (latest: {})",
+                            page_no.get(),
+                            self.published_db_size.get(),
+                            fresh_snapshot.db_size
+                        ),
+                    });
+                }
             }
         }
 
         let read_start = Instant::now();
         let mut published_retry_count = 0_usize;
-        while self.published.snapshot().visible_commit_seq == self.published_visible_commit_seq {
+        while self.published.snapshot().visible_commit_seq == self.published_visible_commit_seq.get() {
             let snapshot = self.published.snapshot();
             if page_no.get() > snapshot.db_size {
                 let confirm = self.published.snapshot();
@@ -2973,7 +2999,7 @@ where
         }
 
         let committed_snapshot = self.published.snapshot();
-        if committed_snapshot.visible_commit_seq == self.published_visible_commit_seq
+        if committed_snapshot.visible_commit_seq == self.published_visible_commit_seq.get()
             && committed_snapshot.journal_mode != JournalMode::Wal
             && page_no.get() <= committed_snapshot.db_size
         {
@@ -2996,7 +3022,7 @@ where
             checkpoint_active: inner.checkpoint_active,
         };
         let publish_page =
-            page_no.get() <= inner.db_size && inner.commit_seq == self.published_visible_commit_seq;
+            page_no.get() <= inner.db_size && inner.commit_seq == self.published_visible_commit_seq.get();
         drop(inner);
         if publish_page {
             self.published
@@ -3464,8 +3490,8 @@ where
             self.allocated_from_eof.clear();
             self.savepoint_stack.clear();
             self.original_db_size = committed_db_size;
-            self.published_visible_commit_seq = publish_update.visible_commit_seq;
-            self.published_db_size = publish_update.db_size;
+            self.published_visible_commit_seq.set(publish_update.visible_commit_seq);
+            self.published_db_size.set(publish_update.db_size);
             // Transaction stays active — committed/finished remain false.
             Ok(true)
         } else {

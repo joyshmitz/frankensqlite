@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use crate::cache_aligned::{
@@ -350,6 +351,13 @@ const FAST_LOCK_ARRAY_SIZE: usize = 65536;
 /// A single cache-line-aligned lock table shard.
 type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHasher>>>;
 
+/// Per-page waiter queue for targeted wakeups (D4, bd-3wop3.4).
+/// `SmallVec<[Thread; 2]>` avoids heap allocation for typical 1-2 waiters/page.
+type WaiterQueue = SmallVec<[Thread; 2]>;
+
+/// Sharded waiter registry indexed by page number.
+type WaiterShard = CacheAligned<Mutex<HashMap<PageNumber, WaiterQueue, PageNumberBuildHasher>>>;
+
 /// In-process page-level exclusive write locks.
 ///
 /// **Hekaton-style fast path (§8.10):** For page numbers 1..=65536, locks are
@@ -385,6 +393,10 @@ pub struct InProcessPageLockTable {
     /// retries while still handling missed wakeups correctly.
     change_gate: Mutex<()>,
     change_cv: Condvar,
+    /// Per-page waiter queues for targeted notification (D4, bd-3wop3.4).
+    /// Eliminates thundering herd: releasing page P only wakes threads waiting
+    /// for page P, not all waiters. Sharded the same way as `shards`.
+    waiter_shards: Box<[WaiterShard; LOCK_TABLE_SHARDS]>,
     /// Optional conflict observer for MVCC analytics (bd-t6sv2.1).
     /// When `None`, conflict emission is a no-op branch (zero cost).
     observer: Option<std::sync::Arc<dyn fsqlite_observability::ConflictObserver>>,
@@ -464,6 +476,15 @@ impl InProcessPageLockTable {
         v.into_boxed_slice()
     }
 
+    /// Allocate sharded waiter queues (D4, bd-3wop3.4).
+    fn alloc_waiter_shards() -> Box<[WaiterShard; LOCK_TABLE_SHARDS]> {
+        Box::new(std::array::from_fn(|_| {
+            CacheAligned::new(Mutex::new(HashMap::with_hasher(
+                PageNumberBuildHasher::default(),
+            )))
+        }))
+    }
+
     /// Create a new empty lock table with no observer.
     #[must_use]
     pub fn new() -> Self {
@@ -479,6 +500,7 @@ impl InProcessPageLockTable {
             change_epoch: AtomicU64::new(0),
             change_gate: Mutex::new(()),
             change_cv: Condvar::new(),
+            waiter_shards: Self::alloc_waiter_shards(),
             observer: None,
         }
     }
@@ -500,6 +522,7 @@ impl InProcessPageLockTable {
             change_epoch: AtomicU64::new(0),
             change_gate: Mutex::new(()),
             change_cv: Condvar::new(),
+            waiter_shards: Self::alloc_waiter_shards(),
             observer: Some(observer),
         }
     }
@@ -605,6 +628,9 @@ impl InProcessPageLockTable {
     /// Pages above `FAST_LOCK_ARRAY_SIZE` also consult the draining shard
     /// table during rolling rebuilds. Returns `true` if the lock was released
     /// from either location.
+    ///
+    /// **D4 (bd-3wop3.4):** Uses targeted notification — only threads waiting
+    /// for this specific page are woken, eliminating thundering herd.
     pub fn release(&self, page: PageNumber, txn: TxnId) -> bool {
         let pgno = page.get() as usize;
 
@@ -617,7 +643,7 @@ impl InProcessPageLockTable {
                 .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                self.notify_waiters();
+                self.notify_waiters_for_page(page);
                 return true;
             }
             // Not held by us — fast-array pages never live in draining.
@@ -632,7 +658,7 @@ impl InProcessPageLockTable {
             if map.get(&page) == Some(&txn) {
                 map.remove(&page);
                 drop(map);
-                self.notify_waiters();
+                self.notify_waiters_for_page(page);
                 return true;
             }
             drop(map);
@@ -650,7 +676,7 @@ impl InProcessPageLockTable {
                     drain_map.remove(&page);
                     drop(drain_map);
                     drop(draining_guard);
-                    self.notify_waiters();
+                    self.notify_waiters_for_page(page);
                     return true;
                 }
                 drop(drain_map);
@@ -695,7 +721,7 @@ impl InProcessPageLockTable {
         }
 
         if released_any {
-            self.notify_waiters();
+            self.notify_all_waiters();
         }
     }
 
@@ -744,7 +770,7 @@ impl InProcessPageLockTable {
         drop(draining_guard);
 
         if released_any {
-            self.notify_waiters();
+            self.notify_all_waiters();
         }
     }
 
@@ -799,6 +825,10 @@ impl InProcessPageLockTable {
     ///
     /// Returns `true` if the holder changed (including becoming unlocked)
     /// before `timeout`, or `false` if the deadline elapsed first.
+    ///
+    /// **D4 (bd-3wop3.4):** Uses per-page waiter registration with targeted
+    /// `Thread::unpark()` notification. Only threads waiting for the released
+    /// page are woken, eliminating thundering herd.
     #[must_use]
     pub fn wait_for_holder_change(
         &self,
@@ -809,6 +839,7 @@ impl InProcessPageLockTable {
         let started = Instant::now();
 
         loop {
+            // Check if holder changed before parking.
             match self.holder(page) {
                 Some(holder) if holder == observed_holder => {}
                 _ => return true,
@@ -819,23 +850,39 @@ impl InProcessPageLockTable {
                 return false;
             }
 
-            let observed_epoch = self.change_epoch.load(Ordering::Acquire);
-            let mut gate = self.change_gate.lock();
-            if self.change_epoch.load(Ordering::Acquire) != observed_epoch {
-                drop(gate);
-                continue;
+            // Register as waiter for this specific page.
+            self.register_waiter(page);
+
+            // Double-check after registration (holder may have released between
+            // our check and registration — avoid missed wakeup).
+            match self.holder(page) {
+                Some(holder) if holder == observed_holder => {}
+                _ => {
+                    self.unregister_waiter(page);
+                    return true;
+                }
             }
 
+            // Park with timeout. We'll be woken by notify_waiters_for_page(page)
+            // when the holder releases, or spuriously (safe due to loop).
             #[cfg(not(target_arch = "wasm32"))]
-            self.change_cv.wait_for(&mut gate, remaining);
+            thread::park_timeout(remaining);
 
             #[cfg(target_arch = "wasm32")]
             {
+                // WASM doesn't support park_timeout; fall back to condvar.
                 let _ = remaining;
-                self.change_cv.wait(&mut gate);
+                let observed_epoch = self.change_epoch.load(Ordering::Acquire);
+                let mut gate = self.change_gate.lock();
+                if self.change_epoch.load(Ordering::Acquire) == observed_epoch {
+                    self.change_cv.wait(&mut gate);
+                }
+                drop(gate);
             }
 
-            drop(gate);
+            // Unregister after waking (may have been removed by notify already,
+            // but unregister_waiter handles that gracefully).
+            self.unregister_waiter(page);
         }
     }
 
@@ -1002,7 +1049,7 @@ impl InProcessPageLockTable {
 
         let elapsed = Duration::ZERO;
         if total_cleaned > 0 {
-            self.notify_waiters();
+            self.notify_all_waiters();
         }
         tracing::debug!(
             cleaned = total_cleaned,
@@ -1154,7 +1201,66 @@ impl InProcessPageLockTable {
         (page.get() as usize) & (LOCK_TABLE_SHARDS - 1)
     }
 
-    fn notify_waiters(&self) {
+    // -----------------------------------------------------------------------
+    // Per-page waiter registration (D4, bd-3wop3.4)
+    // -----------------------------------------------------------------------
+
+    /// Register the current thread as waiting for `page`.
+    fn register_waiter(&self, page: PageNumber) {
+        let shard_idx = Self::shard_index_static(page);
+        let mut map = self.waiter_shards[shard_idx].lock();
+        map.entry(page).or_default().push(thread::current());
+    }
+
+    /// Unregister the current thread from the waiter queue for `page`.
+    fn unregister_waiter(&self, page: PageNumber) {
+        let current = thread::current();
+        let shard_idx = Self::shard_index_static(page);
+        let mut map = self.waiter_shards[shard_idx].lock();
+        if let Some(queue) = map.get_mut(&page) {
+            queue.retain(|t| t.id() != current.id());
+            if queue.is_empty() {
+                map.remove(&page);
+            }
+        }
+    }
+
+    /// Wake only threads waiting for `page` (targeted notification).
+    ///
+    /// This is the primary notification method for single-page releases.
+    /// Eliminates thundering herd by waking only relevant waiters.
+    fn notify_waiters_for_page(&self, page: PageNumber) {
+        let shard_idx = Self::shard_index_static(page);
+        let mut map = self.waiter_shards[shard_idx].lock();
+        if let Some(queue) = map.remove(&page) {
+            // Unpark all threads waiting for this specific page.
+            for thread in queue {
+                thread.unpark();
+            }
+        }
+        drop(map);
+        // Also bump epoch + notify_one on condvar as a fallback for edge cases
+        // (e.g., threads that registered between our remove and their park).
+        let _gate = self.change_gate.lock();
+        self.change_epoch.fetch_add(1, Ordering::Release);
+        self.change_cv.notify_one();
+    }
+
+    /// Wake all waiters across all pages (bulk notification for release_all).
+    ///
+    /// Used for bulk operations like `release_all` and `release_set` where
+    /// iterating over every released page would be expensive or impractical.
+    fn notify_all_waiters(&self) {
+        // Wake all per-page waiters.
+        for shard in self.waiter_shards.iter() {
+            let mut map = shard.lock();
+            for (_, queue) in map.drain() {
+                for thread in queue {
+                    thread.unpark();
+                }
+            }
+        }
+        // Also signal the condvar for fallback compatibility.
         let _gate = self.change_gate.lock();
         self.change_epoch.fetch_add(1, Ordering::Release);
         self.change_cv.notify_all();
