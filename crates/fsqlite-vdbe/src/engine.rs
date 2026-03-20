@@ -10022,204 +10022,204 @@ impl VdbeEngine {
                         return false;
                     }
                 };
-            let hdr_offset = header_offset_for_page(root_pgno);
-            let parsed_header = BtreePageHeader::parse(&page_data, hdr_offset).ok();
-            // A page is a valid B-tree if the header parses successfully.
-            // Legacy fallback: synthetic test pages with non-zero first byte
-            // but unparseable header are also accepted, but we infer
-            // is_table from the raw page-type byte rather than defaulting
-            // to true (which was incorrect for index pages).
-            let is_valid_btree =
-                parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
-            let is_zero_page = page_data.iter().all(|&byte| byte == 0);
-
-            if is_valid_btree {
-                // Real B-tree backed by pager: infer table-vs-index from the
-                // parsed page header when available, falling back to the raw
-                // page-type byte for synthetic/legacy pages.
-                let (is_table_btree, detected_page_type) = if let Some(header) = parsed_header {
-                    (header.page_type.is_table(), Some(header.page_type))
-                } else {
-                    // Header parse failed but page has data. Use the raw
-                    // page-type flag byte at the header offset to infer
-                    // table vs index — do NOT blindly default to table.
-                    let type_byte = page_data.get(hdr_offset).copied().unwrap_or(0);
-                    let is_table = match type_byte {
-                        0x02 | 0x0A => false, // InteriorIndex / LeafIndex
-                        0x05 | 0x0D => true,  // InteriorTable / LeafTable
-                        _ => {
-                            tracing::warn!(
-                                cursor_id,
-                                page_id = root_page,
-                                type_byte,
-                                "open_storage_cursor: unparseable header with unknown page-type byte, defaulting to table"
-                            );
-                            true
-                        }
-                    };
-                    (is_table, None)
-                };
-                let cursor = BtCursor::new_with_index_desc(
-                    page_io.clone(),
-                    root_pgno,
-                    self.page_size.get(),
-                    is_table_btree,
-                    if is_table_btree {
-                        Vec::new()
+                let hdr_offset = header_offset_for_page(root_pgno);
+                let parsed_header = BtreePageHeader::parse(&page_data, hdr_offset).ok();
+                // A page is a valid B-tree if the header parses successfully.
+                // Legacy fallback: synthetic test pages with non-zero first byte
+                // but unparseable header are also accepted, but we infer
+                // is_table from the raw page-type byte rather than defaulting
+                // to true (which was incorrect for index pages).
+                let is_valid_btree =
+                    parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
+                let is_zero_page = page_data.iter().all(|&byte| byte == 0);
+    
+                if is_valid_btree {
+                    // Real B-tree backed by pager: infer table-vs-index from the
+                    // parsed page header when available, falling back to the raw
+                    // page-type byte for synthetic/legacy pages.
+                    let (is_table_btree, detected_page_type) = if let Some(header) = parsed_header {
+                        (header.page_type.is_table(), Some(header.page_type))
                     } else {
-                        self.index_desc_flags_for_root(root_page)
-                    },
-                );
-                self.storage_cursors.insert(
-                    cursor_id,
-                    StorageCursor {
-                        cursor: CursorBackend::Txn(cursor),
-                        cx: txn_cx,
-                        writable,
-                        last_alloc_rowid: 0,
-                        last_successful_insert_rowid: None,
-                        payload_buf: Vec::new(),
-                        target_vals_buf: Vec::new(),
-                        cur_vals_buf: Vec::new(),
-                        row_vals_buf: Vec::new(),
-                        header_offsets: Vec::new(),
-                        decoded_mask: 0,
-                        last_position_stamp: None,
-                    },
-                );
-                tracing::debug!(
-                    cursor_id,
-                    page_id = root_page,
-                    writable,
-                    has_txn,
-                    mode,
-                    backend_kind = "txn",
-                    decision_reason = "valid_btree_page",
-                    detected_page_type = ?detected_page_type,
-                    is_table_btree,
-                    "open_storage_cursor: routed through pager transaction"
-                );
-                return true;
-            }
-
-            // For writable cursors on truly zeroed pages (e.g., freshly
-            // allocated roots), initialize an empty root page.
-            if writable && is_zero_page {
-                // Infer root kind from MemDatabase when available; default to
-                // table for backwards compatibility if MemDatabase is absent.
-                let is_table_btree = self
-                    .db
-                    .as_ref()
-                    .is_none_or(|db| db.get_table(root_page).is_some());
-                let init_page_type = if is_table_btree {
-                    BtreePageType::LeafTable
-                } else {
-                    BtreePageType::LeafIndex
-                };
-                // Initialize empty leaf page for the inferred B-tree kind.
-                let mut page = vec![0u8; self.page_size.get() as usize];
-                page[0] = init_page_type as u8;
-                // Bytes 1-2: first freeblock offset = 0 (none).
-                // Bytes 3-4: cell count = 0.
-                // Bytes 5-6: content area offset = page_size (no cells yet).
-                #[allow(clippy::cast_possible_truncation)]
-                let content_offset = self.page_size.get() as u16; // self.page_size.get()=4096 fits in u16
-                page[5..7].copy_from_slice(&content_offset.to_be_bytes());
-                // Byte 7: fragmented free bytes = 0.
-
-                // Write the initialized page to pager.
-                if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
-                    tracing::warn!(
+                        // Header parse failed but page has data. Use the raw
+                        // page-type flag byte at the header offset to infer
+                        // table vs index — do NOT blindly default to table.
+                        let type_byte = page_data.get(hdr_offset).copied().unwrap_or(0);
+                        let is_table = match type_byte {
+                            0x02 | 0x0A => false, // InteriorIndex / LeafIndex
+                            0x05 | 0x0D => true,  // InteriorTable / LeafTable
+                            _ => {
+                                tracing::warn!(
+                                    cursor_id,
+                                    page_id = root_page,
+                                    type_byte,
+                                    "open_storage_cursor: unparseable header with unknown page-type byte, defaulting to table"
+                                );
+                                true
+                            }
+                        };
+                        (is_table, None)
+                    };
+                    let cursor = BtCursor::new_with_index_desc(
+                        page_io.clone(),
+                        root_pgno,
+                        self.page_size.get(),
+                        is_table_btree,
+                        if is_table_btree {
+                            Vec::new()
+                        } else {
+                            self.index_desc_flags_for_root(root_page)
+                        },
+                    );
+                    self.storage_cursors.insert(
+                        cursor_id,
+                        StorageCursor {
+                            cursor: CursorBackend::Txn(cursor),
+                            cx: txn_cx,
+                            writable,
+                            last_alloc_rowid: 0,
+                            last_successful_insert_rowid: None,
+                            payload_buf: Vec::new(),
+                            target_vals_buf: Vec::new(),
+                            cur_vals_buf: Vec::new(),
+                            row_vals_buf: Vec::new(),
+                            header_offsets: Vec::new(),
+                            decoded_mask: 0,
+                            last_position_stamp: None,
+                        },
+                    );
+                    tracing::debug!(
                         cursor_id,
                         page_id = root_page,
                         writable,
                         has_txn,
                         mode,
                         backend_kind = "txn",
-                        decision_reason = "zero_page_init_failed",
-                        error = %err,
-                        "open_storage_cursor: failed to initialize writable root page in pager"
+                        decision_reason = "valid_btree_page",
+                        detected_page_type = ?detected_page_type,
+                        is_table_btree,
+                        "open_storage_cursor: routed through pager transaction"
+                    );
+                    return true;
+                }
+    
+                // For writable cursors on truly zeroed pages (e.g., freshly
+                // allocated roots), initialize an empty root page.
+                if writable && is_zero_page {
+                    // Infer root kind from MemDatabase when available; default to
+                    // table for backwards compatibility if MemDatabase is absent.
+                    let is_table_btree = self
+                        .db
+                        .as_ref()
+                        .is_none_or(|db| db.get_table(root_page).is_some());
+                    let init_page_type = if is_table_btree {
+                        BtreePageType::LeafTable
+                    } else {
+                        BtreePageType::LeafIndex
+                    };
+                    // Initialize empty leaf page for the inferred B-tree kind.
+                    let mut page = vec![0u8; self.page_size.get() as usize];
+                    page[0] = init_page_type as u8;
+                    // Bytes 1-2: first freeblock offset = 0 (none).
+                    // Bytes 3-4: cell count = 0.
+                    // Bytes 5-6: content area offset = page_size (no cells yet).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let content_offset = self.page_size.get() as u16; // self.page_size.get()=4096 fits in u16
+                    page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+                    // Byte 7: fragmented free bytes = 0.
+    
+                    // Write the initialized page to pager.
+                    if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
+                        tracing::warn!(
+                            cursor_id,
+                            page_id = root_page,
+                            writable,
+                            has_txn,
+                            mode,
+                            backend_kind = "txn",
+                            decision_reason = "zero_page_init_failed",
+                            error = %err,
+                            "open_storage_cursor: failed to initialize writable root page in pager"
+                        );
+                        return false;
+                    }
+                    let cursor = BtCursor::new_with_index_desc(
+                        page_io.clone(),
+                        root_pgno,
+                        self.page_size.get(),
+                        is_table_btree,
+                        if is_table_btree {
+                            Vec::new()
+                        } else {
+                            self.index_desc_flags_for_root(root_page)
+                        },
+                    );
+                    self.storage_cursors.insert(
+                        cursor_id,
+                        StorageCursor {
+                            cursor: CursorBackend::Txn(cursor),
+                            cx: txn_cx,
+                            writable,
+                            last_alloc_rowid: 0,
+                            last_successful_insert_rowid: None,
+                            payload_buf: Vec::new(),
+                            target_vals_buf: Vec::new(),
+                            cur_vals_buf: Vec::new(),
+                            row_vals_buf: Vec::new(),
+                            header_offsets: Vec::new(),
+                            decoded_mask: 0,
+                            last_position_stamp: None,
+                        },
+                    );
+                    tracing::debug!(
+                        cursor_id,
+                        page_id = root_page,
+                        writable,
+                        has_txn,
+                        mode,
+                        backend_kind = "txn",
+                        decision_reason = "zero_page_initialized",
+                        initialized_page_type = ?init_page_type,
+                        is_table_btree,
+                        "open_storage_cursor: initialized empty root page via pager"
+                    );
+                    return true;
+                }
+    
+                // If the page is zero/invalid but MemDatabase has this table
+                // (e.g., materialized sqlite_master virtual table), fall through
+                // to the MemDatabase path below instead of refusing.
+                let has_mem_table = self
+                    .db
+                    .as_ref()
+                    .is_some_and(|db| db.get_table(root_page).is_some());
+                if !has_mem_table {
+                    // No MemDatabase fallback available — refuse to open.
+                    tracing::warn!(
+                        cursor_id,
+                        page_id = root_page,
+                        writable,
+                        has_txn,
+                        mode,
+                        backend_kind = "none",
+                        decision_reason = "invalid_page_no_mem_fallback",
+                        first_byte = page_data.first().copied().unwrap_or_default(),
+                        is_zero_page,
+                        "open_storage_cursor: refusing on invalid transaction-backed root page"
                     );
                     return false;
                 }
-                let cursor = BtCursor::new_with_index_desc(
-                    page_io.clone(),
-                    root_pgno,
-                    self.page_size.get(),
-                    is_table_btree,
-                    if is_table_btree {
-                        Vec::new()
-                    } else {
-                        self.index_desc_flags_for_root(root_page)
-                    },
-                );
-                self.storage_cursors.insert(
-                    cursor_id,
-                    StorageCursor {
-                        cursor: CursorBackend::Txn(cursor),
-                        cx: txn_cx,
-                        writable,
-                        last_alloc_rowid: 0,
-                        last_successful_insert_rowid: None,
-                        payload_buf: Vec::new(),
-                        target_vals_buf: Vec::new(),
-                        cur_vals_buf: Vec::new(),
-                        row_vals_buf: Vec::new(),
-                        header_offsets: Vec::new(),
-                        decoded_mask: 0,
-                        last_position_stamp: None,
-                    },
-                );
+                // else: fall through to MemDatabase path
                 tracing::debug!(
                     cursor_id,
                     page_id = root_page,
                     writable,
                     has_txn,
                     mode,
-                    backend_kind = "txn",
-                    decision_reason = "zero_page_initialized",
-                    initialized_page_type = ?init_page_type,
-                    is_table_btree,
-                    "open_storage_cursor: initialized empty root page via pager"
+                    backend_kind = "mem",
+                    decision_reason = "txn_page_invalid_mem_fallback",
+                    "open_storage_cursor: pager page invalid, falling through to MemDatabase"
                 );
-                return true;
-            }
-
-            // If the page is zero/invalid but MemDatabase has this table
-            // (e.g., materialized sqlite_master virtual table), fall through
-            // to the MemDatabase path below instead of refusing.
-            let has_mem_table = self
-                .db
-                .as_ref()
-                .is_some_and(|db| db.get_table(root_page).is_some());
-            if !has_mem_table {
-                // No MemDatabase fallback available — refuse to open.
-                tracing::warn!(
-                    cursor_id,
-                    page_id = root_page,
-                    writable,
-                    has_txn,
-                    mode,
-                    backend_kind = "none",
-                    decision_reason = "invalid_page_no_mem_fallback",
-                    first_byte = page_data.first().copied().unwrap_or_default(),
-                    is_zero_page,
-                    "open_storage_cursor: refusing on invalid transaction-backed root page"
-                );
-                return false;
-            }
-            // else: fall through to MemDatabase path
-            tracing::debug!(
-                cursor_id,
-                page_id = root_page,
-                writable,
-                has_txn,
-                mode,
-                backend_kind = "mem",
-                decision_reason = "txn_page_invalid_mem_fallback",
-                "open_storage_cursor: pager page invalid, falling through to MemDatabase"
-            );
-        }
+            } // end if let Some(ref mut page_io)
         } // end 'pager_block
 
         // bd-2ttd8.1: Parity-certification mode — reject MemPageStore fallback.
