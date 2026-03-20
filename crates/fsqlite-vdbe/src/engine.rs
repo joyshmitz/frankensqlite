@@ -10032,7 +10032,7 @@ impl VdbeEngine {
                 let is_valid_btree =
                     parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
                 let is_zero_page = page_data.iter().all(|&byte| byte == 0);
-    
+
                 if is_valid_btree {
                     // Real B-tree backed by pager: infer table-vs-index from the
                     // parsed page header when available, falling back to the raw
@@ -10101,7 +10101,7 @@ impl VdbeEngine {
                     );
                     return true;
                 }
-    
+
                 // For writable cursors on truly zeroed pages (e.g., freshly
                 // allocated roots), initialize an empty root page.
                 if writable && is_zero_page {
@@ -10126,7 +10126,7 @@ impl VdbeEngine {
                     let content_offset = self.page_size.get() as u16; // self.page_size.get()=4096 fits in u16
                     page[5..7].copy_from_slice(&content_offset.to_be_bytes());
                     // Byte 7: fragmented free bytes = 0.
-    
+
                     // Write the initialized page to pager.
                     if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
                         tracing::warn!(
@@ -10184,7 +10184,7 @@ impl VdbeEngine {
                     );
                     return true;
                 }
-    
+
                 // If the page is zero/invalid but MemDatabase has this table
                 // (e.g., materialized sqlite_master virtual table), fall through
                 // to the MemDatabase path below instead of refusing.
