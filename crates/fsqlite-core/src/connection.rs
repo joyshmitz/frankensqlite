@@ -16282,6 +16282,11 @@ impl Connection {
                     self.finalize_concurrent_commit(plan, committed_seq);
                 } else if is_concurrent_txn {
                     self.finalize_read_only_concurrent_commit();
+                } else if txn_has_pending_writes {
+                    // Non-concurrent explicit transaction with writes: advance
+                    // the commit clock so time-travel snapshots get a fresh
+                    // sequence number distinct from prior commits.
+                    self.advance_commit_clock();
                 }
             }
 
