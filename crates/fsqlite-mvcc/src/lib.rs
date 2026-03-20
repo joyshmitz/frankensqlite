@@ -14,6 +14,7 @@ pub mod cell_delta_wal;
 pub mod cell_mvcc_boundary;
 pub mod cell_routing;
 pub mod cell_visibility;
+pub mod commit_combiner;
 pub mod compat;
 pub mod conflict_model;
 pub mod conformal_martingale;
@@ -127,8 +128,8 @@ pub use differential_privacy::{
     reset_dp_metrics, sensitivity,
 };
 pub use ebr::{
-    EbrMetrics, EbrMetricsSnapshot, GLOBAL_EBR_METRICS, ReaderPinSnapshot, StaleReaderConfig,
-    VersionGuard, VersionGuardRegistry, VersionGuardTicket,
+    EbrMetrics, EbrMetricsSnapshot, EbrRetireQueue, GLOBAL_EBR_METRICS, ReaderPinSnapshot,
+    StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
 };
 pub use flat_combining::{
     FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_THREADS, OP_ADD, OP_READ,
