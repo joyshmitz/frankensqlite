@@ -34,14 +34,17 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::SqliteValue;
 
 const ROWS_PER_THREAD: i64 = 1000;
-/// Must be >= ROWS_PER_THREAD to avoid row ID collisions between threads.
-const ROW_ID_MULTIPLIER: i64 = 100_000;
 /// Maximum retries before giving up on a transaction (applies to both engines).
 const MAX_TXN_RETRIES: u32 = 100;
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
-fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
+fn run_fsqlite_pragma(conn: &fsqlite::Connection, pragma: &str) {
+    conn.execute(pragma)
+        .unwrap_or_else(|error| panic!("failed to execute benchmark pragma `{pragma}`: {error:?}"));
+}
+
+fn apply_setup_pragmas_fsqlite(conn: &fsqlite::Connection) {
     for pragma in [
         "PRAGMA page_size = 4096;",
         "PRAGMA journal_mode = WAL;",
@@ -49,7 +52,18 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA cache_size = -64000;",
         "PRAGMA fsqlite.concurrent_mode = ON;",
     ] {
-        let _ = conn.execute(pragma);
+        run_fsqlite_pragma(conn, pragma);
+    }
+}
+
+fn apply_session_pragmas_fsqlite(conn: &fsqlite::Connection) {
+    for pragma in [
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;",
+        "PRAGMA fsqlite.concurrent_mode = ON;",
+    ] {
+        run_fsqlite_pragma(conn, pragma);
     }
 }
 
@@ -218,7 +232,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 {
                     // Setup: create tables using a single connection
                     let setup = fsqlite::Connection::open(&path).unwrap();
-                    apply_pragmas_fsqlite(&setup);
+                    apply_setup_pragmas_fsqlite(&setup);
                     for tid in 0..n_threads {
                         setup.execute(&create_table_sql(tid)).unwrap();
                     }
@@ -242,18 +256,15 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let lat = latencies.clone();
                         thread::spawn(move || {
                             let conn = fsqlite::Connection::open(&p).unwrap();
-                            apply_pragmas_fsqlite(&conn);
+                            apply_session_pragmas_fsqlite(&conn);
                             let insert_stmt = insert_sql(tid);
                             let stmt = conn.prepare(&insert_stmt).unwrap();
                             bar.wait();
 
-                            // Each row is its own transaction for realistic commit latency.
-                            // Use globally unique row IDs: tid * ROW_ID_MULTIPLIER + i
-                            #[allow(clippy::cast_possible_wrap)]
-                            let base_id = tid as i64 * ROW_ID_MULTIPLIER;
-
                             for i in 0..ROWS_PER_THREAD {
-                                let row_id = base_id + i;
+                                // Each thread writes to its own table, so row IDs can match
+                                // the SQLite side exactly without cross-thread collisions.
+                                let row_id = i;
                                 let start = Instant::now();
                                 let mut retry_count = 0u32;
 
@@ -266,7 +277,15 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                 let msg = format!("{e:?}");
                                                 if msg.contains("Busy") || msg.contains("busy") {
                                                     conflicts.fetch_add(1, Ordering::Relaxed);
-                                                    std::thread::sleep(Duration::from_micros(100));
+                                                    retry_count += 1;
+                                                    if retry_count >= MAX_TXN_RETRIES {
+                                                        panic!(
+                                                            "BEGIN CONCURRENT failed after {MAX_TXN_RETRIES} retries: {e:?}"
+                                                        );
+                                                    }
+                                                    std::thread::sleep(Duration::from_micros(
+                                                        100 * u64::from(retry_count),
+                                                    ));
                                                 } else {
                                                     panic!("BEGIN CONCURRENT failed: {e:?}");
                                                 }
@@ -288,17 +307,14 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             let _ = conn.execute("ROLLBACK");
                                             retry_count += 1;
                                             if retry_count >= MAX_TXN_RETRIES {
-                                                eprintln!("[FrankenSQLite {tid}] INSERT gave up after {MAX_TXN_RETRIES} retries: {e:?}");
-                                                break 'txn;
+                                                panic!("INSERT failed after {MAX_TXN_RETRIES} retries: {e:?}");
                                             }
                                             std::thread::sleep(Duration::from_micros(100 * u64::from(retry_count)));
                                             continue 'txn;
                                         }
                                         if msg.contains("Corrupt") || msg.contains("malformed") {
-                                            // Database corruption — skip this row and continue
-                                            eprintln!("[FrankenSQLite {tid}] CORRUPTION DETECTED: {e:?}");
                                             let _ = conn.execute("ROLLBACK");
-                                            break 'txn;
+                                            panic!("CORRUPTION DETECTED: {e:?}");
                                         }
                                         panic!("INSERT failed: {e:?}");
                                     }
