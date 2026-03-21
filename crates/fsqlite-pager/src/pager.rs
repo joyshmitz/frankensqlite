@@ -84,7 +84,7 @@ impl GroupCommitQueue {
     fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError) {
         let mut failed_epochs = self
             .failed_epochs
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         failed_epochs.insert(epoch, error.to_string());
         drop(failed_epochs);
@@ -105,7 +105,7 @@ impl GroupCommitQueue {
         loop {
             let failed_detail = self
                 .failed_epochs
-                .write()
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&target_epoch)
                 .cloned();
@@ -193,7 +193,7 @@ static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>
 fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
     let queues = GROUP_COMMIT_QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut queues = queues
-        .write()
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         queues
@@ -1243,7 +1243,7 @@ impl PublishedPagerState {
     ) -> bool {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current_visible_commit_seq =
             CommitSeq::new(self.visible_commit_seq.load(AtomicOrdering::Acquire));
@@ -1270,7 +1270,7 @@ impl PublishedPagerState {
     fn publish_clear_if(&self, cx: &Cx, update: PublishedPagerUpdate, should_clear: bool) {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
@@ -1288,7 +1288,7 @@ impl PublishedPagerState {
     fn publish_remove_page(&self, cx: &Cx, update: PublishedPagerUpdate, page_no: PageNumber) {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
@@ -1304,7 +1304,7 @@ impl PublishedPagerState {
     fn publish_metadata_only(&self, cx: &Cx, update: PublishedPagerUpdate) {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
@@ -1319,7 +1319,7 @@ impl PublishedPagerState {
     fn publish_truncate_checkpoint(&self, cx: &Cx, update: PublishedPagerUpdate, max_page: u32) {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
@@ -1341,7 +1341,7 @@ impl PublishedPagerState {
     ) {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
@@ -1372,7 +1372,7 @@ impl PublishedPagerState {
     ) {
         let _publish_guard = self
             .publish_lock
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
@@ -1463,7 +1463,7 @@ impl PublishedPagerState {
     fn wait_for_sequence_change(&self, observed_sequence: u64, timeout: Duration) {
         let guard = self
             .sequence_gate
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_guard, _timeout) = self
             .sequence_cv
@@ -1532,7 +1532,7 @@ where
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
         if inner.checkpoint_active {
@@ -1811,7 +1811,7 @@ where
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
         if inner.journal_mode == mode {
@@ -1867,7 +1867,7 @@ where
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
         if inner.checkpoint_active {
             return Err(FrankenError::Busy);
@@ -1905,7 +1905,7 @@ where
     #[must_use]
     pub fn wal_commit_sync_policy(&self) -> WalCommitSyncPolicy {
         self.inner
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .wal_commit_sync_policy
     }
@@ -1914,7 +1914,7 @@ where
     pub fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
         inner.wal_commit_sync_policy = policy;
         Ok(())
@@ -1940,7 +1940,7 @@ where
         let journal_mode = {
             let inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
             if inner.active_transactions > 0 || inner.checkpoint_active {
                 return Err(FrankenError::Busy);
@@ -2021,7 +2021,7 @@ where
     pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
         if inner.active_transactions > 0 || inner.checkpoint_active {
@@ -2108,7 +2108,7 @@ where
     pub fn page_size(&self) -> PageSize {
         let inner = self
             .inner
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.page_size
     }
@@ -3194,7 +3194,7 @@ where
         // We need to read current db_size and sync policy before releasing inner.
         let (current_db_size, sync_policy) = {
             let inner = inner_arc
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             (inner.db_size, inner.wal_commit_sync_policy)
         };
@@ -3214,7 +3214,7 @@ where
         let (outcome, our_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
             let mut consolidator = queue
                 .consolidator
-                .write()
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             let t_lock_acquired = Instant::now();
@@ -3256,7 +3256,7 @@ where
                         let already_full = {
                             let consolidator = queue
                                 .consolidator
-                                .write()
+                                .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             consolidator.pending_batch_count() > 1
                                 || consolidator.should_flush_now()
@@ -3268,7 +3268,7 @@ where
                                 let should_flush = {
                                     let consolidator = queue
                                         .consolidator
-                                        .write()
+                                        .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     consolidator.should_flush_now()
                                 };
@@ -3287,7 +3287,7 @@ where
                     let (batches, flush_epoch) = {
                         let mut consolidator = queue
                             .consolidator
-                            .write()
+                            .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         let batches = consolidator.begin_flush()?;
                         (batches, consolidator.epoch())
@@ -3435,7 +3435,7 @@ where
                             let (completed_epoch, has_promoted) = {
                                 let mut consolidator = queue
                                     .consolidator
-                                    .write()
+                                    .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 let promoted = consolidator.complete_flush()?;
                                 (consolidator.epoch(), promoted)
@@ -3456,7 +3456,7 @@ where
                             let abort_result = {
                                 let mut consolidator = queue
                                     .consolidator
-                                    .write()
+                                    .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 consolidator.abort_flush()
                             };
@@ -3488,7 +3488,7 @@ where
                 let t_waiter_start = Instant::now();
                 let guard = queue
                     .consolidator
-                    .write()
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 queue.wait_for_epoch_outcome(guard, target_epoch)?;
                 let waiter_epoch_wait_us =
@@ -3526,7 +3526,7 @@ where
             TransactionMode::Concurrent => {
                 let inner = self
                     .inner
-                    .write()
+                    .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                 if inner.checkpoint_active {
                     return Err(FrankenError::Busy);
@@ -3539,7 +3539,7 @@ where
             TransactionMode::Deferred => {
                 let mut inner = self
                     .inner
-                    .write()
+                    .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                 if inner.checkpoint_active {
                     return Err(FrankenError::Busy);
@@ -3598,7 +3598,7 @@ where
         if self.rolled_back_pages.contains(&page_no) {
             let inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             return Ok(PageData::zeroed(inner.page_size));
         }
@@ -3749,11 +3749,10 @@ where
             return Ok(cached.clone());
         }
 
-        // WAL mode fast path: read from WAL via RwLock::read() (concurrent).
-        // Bypasses inner.lock() for pages in the WAL — the common case.
+        // WAL mode fast path: read from WAL via write lock (needs &mut self for snapshot updates).
         if self.journal_mode == JournalMode::Wal {
             if let Ok(Some(wal_data)) =
-                with_wal_backend_read(&self.wal_backend, |wal| wal.read_page(cx, page_no.get()))
+                with_wal_backend(&self.wal_backend, |wal| wal.read_page(cx, page_no.get()))
             {
                 let page = PageData::from_vec(wal_data);
                 self.txn_read_cache
@@ -3765,7 +3764,7 @@ where
 
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         let data = inner.read_page_copy(cx, &self.cache, &self.wal_backend, page_no)?;
         let page = PageData::from_vec(data);
@@ -3845,7 +3844,7 @@ where
 
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
         let committed_freelist_is_snapshot_pinned =
@@ -3942,7 +3941,7 @@ where
         if !self.is_writer {
             let mut inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             // Return any unused lease pages to the freelist so they can
             // be reused by other transactions.
@@ -3959,7 +3958,7 @@ where
         if !self.has_pending_writes() {
             let mut inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             // Return any unused lease pages.
             inner.freelist.append(&mut self.page_lease);
@@ -3997,7 +3996,7 @@ where
         // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         // Return any unused lease pages before computing committed db_size.
         inner.freelist.append(&mut self.page_lease);
@@ -4099,7 +4098,7 @@ where
             // Re-acquire inner lock for Phase C (finalize).
             inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
             result
@@ -4171,7 +4170,7 @@ where
                 if !committed_cache_pages.is_empty() {
                     let inner = self
                         .inner
-                        .write()
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if inner.commit_seq == publish_update.visible_commit_seq {
                         for (page_no, buf) in committed_cache_pages {
@@ -4211,7 +4210,7 @@ where
         //  - Clear write_set for reuse instead
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         inner.freelist.append(&mut self.page_lease);
 
@@ -4290,7 +4289,7 @@ where
                 );
                 inner = self
                     .inner
-                    .write()
+                    .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                 result
             } else {
@@ -4360,7 +4359,7 @@ where
         }
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.predicted_commit_pages_with_inner(&inner))
     }
@@ -4371,7 +4370,7 @@ where
         }
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.predicted_conflict_pages_with_inner(&inner))
     }
@@ -4387,7 +4386,7 @@ where
         }
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.page_one_in_pending_commit_surface_with_inner(&inner))
     }
@@ -4395,7 +4394,7 @@ where
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.allocate_page_requires_page_one_conflict_tracking_with_inner(&inner))
     }
@@ -4403,7 +4402,7 @@ where
     fn free_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.free_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
     }
@@ -4411,7 +4410,7 @@ where
     fn write_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.write_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
     }
@@ -4427,7 +4426,7 @@ where
         self.rolled_back_pages.clear();
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
         let restored_from_journal = if self.is_writer
@@ -4523,7 +4522,7 @@ where
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
         let inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
         self.savepoint_stack.push(SavepointEntry {
@@ -4581,7 +4580,7 @@ where
         {
             let mut inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             if self.mode != TransactionMode::Concurrent {
                 inner.next_page = entry.next_page_snapshot;
@@ -4767,7 +4766,7 @@ where
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
 
         // Update db_size if this page extends the database.
@@ -4810,7 +4809,7 @@ where
     fn truncate(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
 
         let old_db_size = inner.db_size;
@@ -4846,7 +4845,7 @@ where
     fn sync(&mut self, cx: &Cx) -> Result<()> {
         let mut inner = self
             .inner
-            .write()
+            .lock()
             .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
         // Ensure header page_count reflects the final db_size after all
         // checkpoint writes/truncation, even if page 1 was checkpointed early.
@@ -4931,7 +4930,7 @@ where
         let wal = {
             let mut inner = self
                 .inner
-                .write()
+                .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
             // Check we're in WAL mode.
@@ -7772,7 +7771,7 @@ mod tests {
         }
 
         fn read_page(
-            &self,
+            &mut self,
             _cx: &Cx,
             _page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
@@ -7943,7 +7942,7 @@ mod tests {
         }
 
         fn read_page(
-            &self,
+            &mut self,
             _cx: &Cx,
             _page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
@@ -8411,7 +8410,7 @@ mod tests {
         }
 
         fn read_page(
-            &self,
+            &mut self,
             _cx: &Cx,
             page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
@@ -8528,7 +8527,7 @@ mod tests {
         }
 
         fn read_page(
-            &self,
+            &mut self,
             _cx: &Cx,
             _page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
@@ -8672,7 +8671,7 @@ mod tests {
         }
 
         fn read_page(
-            &self,
+            &mut self,
             _cx: &Cx,
             page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
@@ -9478,7 +9477,7 @@ mod tests {
 
         let guard = queue
             .consolidator
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let err = queue.wait_for_epoch_outcome(guard, 1).unwrap_err();
         let message = err.to_string();
@@ -9504,7 +9503,7 @@ mod tests {
 
         let guard = queue
             .consolidator
-            .write()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.wait_for_epoch_outcome(guard, 2).unwrap();
     }
