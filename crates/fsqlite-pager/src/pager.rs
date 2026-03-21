@@ -3889,7 +3889,12 @@ where
         };
 
         if commit_result.is_ok() {
-            inner.db_size = committed_db_size;
+            // For journal mode, update db_size from our computed value.
+            // For WAL mode with group commit, the flusher already set inner.db_size
+            // to the consolidated max across all batched transactions - don't revert it.
+            if self.journal_mode != JournalMode::Wal {
+                inner.db_size = committed_db_size;
+            }
             inner.commit_seq = inner.commit_seq.next();
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
@@ -4054,7 +4059,12 @@ where
         };
 
         if commit_result.is_ok() {
-            inner.db_size = committed_db_size;
+            // For journal mode, update db_size from our computed value.
+            // For WAL mode with group commit, the flusher already set inner.db_size
+            // to the consolidated max across all batched transactions - don't revert it.
+            if self.journal_mode != JournalMode::Wal {
+                inner.db_size = committed_db_size;
+            }
             inner.commit_seq = inner.commit_seq.next();
             // NOTE: We intentionally do NOT decrement active_transactions or
             // set writer_active=false — the transaction stays "active" for reuse.
