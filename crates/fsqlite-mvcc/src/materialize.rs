@@ -216,8 +216,14 @@ pub fn materialize_page(
 
     // Build working state from base page
     let btree_ref = visible_deltas[0].cell_key.btree;
-    let mut state =
-        WorkingPageState::from_base_page(base, page_number, &header, header_offset, usable_size, btree_ref)?;
+    let mut state = WorkingPageState::from_base_page(
+        base,
+        page_number,
+        &header,
+        header_offset,
+        usable_size,
+        btree_ref,
+    )?;
 
     // Apply each visible delta
     for delta in &visible_deltas {
@@ -316,8 +322,12 @@ impl WorkingPageState {
             let cell_content = page_bytes[cell_offset..cell_end].to_vec();
 
             // Compute key digest and sort key for this cell
-            let (key_digest, sort_key) =
-                compute_cell_key_and_sort_key(page_bytes, cell_offset, header.page_type, btree_ref)?;
+            let (key_digest, sort_key) = compute_cell_key_and_sort_key(
+                page_bytes,
+                cell_offset,
+                header.page_type,
+                btree_ref,
+            )?;
 
             cells.push(WorkingCell {
                 content: cell_content,

@@ -617,7 +617,8 @@ impl S3Fifo {
 
         self.ghost_epoch = self.ghost_epoch.wrapping_add(1);
         self.ghost.push_back((page_id, self.ghost_epoch));
-        self.index.insert(page_id, EntryState::Ghost(self.ghost_epoch));
+        self.index
+            .insert(page_id, EntryState::Ghost(self.ghost_epoch));
         events.push(S3FifoEvent::EvictedFromSmallToGhost(page_id));
     }
 

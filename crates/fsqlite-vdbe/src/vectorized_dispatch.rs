@@ -1100,9 +1100,12 @@ mod tests {
             .map(|entry| entry.worker_id)
             .collect();
         // In CI or environments with few vCPUs, it is possible for a single worker to blast
-        // through all the tasks before the OS schedules the other worker threads. 
+        // through all the tasks before the OS schedules the other worker threads.
         if workers_used.len() < 2 {
-            println!("WARNING: bead_id={BEAD_ID} expected work across multiple workers, but only used {}", workers_used.len());
+            println!(
+                "WARNING: bead_id={BEAD_ID} expected work across multiple workers, but only used {}",
+                workers_used.len()
+            );
         }
     }
 

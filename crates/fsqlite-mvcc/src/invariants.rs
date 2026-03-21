@@ -723,7 +723,7 @@ impl VersionStore {
                 let Some(version) = arena.get(current_idx) else {
                     continue 'retry;
                 };
-                
+
                 traversed += 1;
 
                 if visible(version, snapshot) {

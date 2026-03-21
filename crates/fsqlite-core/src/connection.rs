@@ -936,6 +936,31 @@ impl PagerBackend {
         }
     }
 
+    fn install_existing_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+        let wal_path = wal_path_for_db_path(db_path);
+        match self {
+            Self::Memory(p) => {
+                let vfs = p.vfs_handle();
+                install_existing_wal_backend_with_vfs(p, vfs.as_ref(), cx, &wal_path)
+            }
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => {
+                let vfs = IoUringVfs::new();
+                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+            #[cfg(unix)]
+            Self::Unix(p) => {
+                let vfs = UnixVfs::new();
+                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => {
+                let vfs = fsqlite_vfs::WindowsVfs::new();
+                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+        }
+    }
+
     fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
         match self {
             Self::Memory(p) => p.set_wal_commit_sync_policy(policy),
@@ -1067,7 +1092,14 @@ where
 {
     if vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
-        let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
+        let (mut file, _) = match vfs.open(cx, Some(wal_path), open_flags) {
+            Ok(opened) => opened,
+            Err(_) => vfs.open(
+                cx,
+                Some(wal_path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+            )?,
+        };
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
             match WalFile::open(cx, file) {
                 Ok(wal) => {
@@ -1086,6 +1118,42 @@ where
     pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
 }
 
+fn install_existing_wal_backend_with_vfs<V>(
+    pager: &Arc<SimplePager<V>>,
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+) -> Result<bool>
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    if !vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
+        return Ok(false);
+    }
+
+    let (mut file, _) = match vfs.open(
+        cx,
+        Some(wal_path),
+        VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+    ) {
+        Ok(opened) => opened,
+        Err(_) => vfs.open(
+            cx,
+            Some(wal_path),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+        )?,
+    };
+    if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+        let _ = file.close(cx);
+        return Ok(false);
+    }
+
+    let wal = WalFile::open(cx, file)?;
+    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
+    Ok(true)
+}
+
 fn wal_file_present_with_vfs<V>(vfs: &V, cx: &Cx, wal_path: &Path) -> bool
 where
     V: Vfs + Send + Sync + 'static,
@@ -1097,7 +1165,7 @@ where
         return false;
     }
 
-    let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+    let open_flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
     let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), open_flags) else {
         return false;
     };
@@ -3237,7 +3305,7 @@ impl Connection {
         };
         conn.bootstrap_journal_mode_from_storage()?;
         conn.bootstrap_pragma_state_from_storage();
-        conn.apply_current_journal_mode_to_pager()?;
+        conn.apply_current_journal_mode_to_pager_readonly()?;
         conn.apply_current_synchronous_to_pager()?;
         let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
@@ -16335,8 +16403,7 @@ impl Connection {
 
             // Busy-retry loop for commit-path lock escalation.
             if matches!(commit_res, Err(FrankenError::Busy)) {
-                let busy_timeout_ms =
-                    self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                 if busy_timeout_ms > 0 {
                     let deadline = Duration::from_millis(busy_timeout_ms);
                     let started = Instant::now();
@@ -19613,6 +19680,25 @@ impl Connection {
     fn apply_current_synchronous_to_pager(&self) -> Result<()> {
         let synchronous = self.pragma_state.borrow().synchronous.clone();
         self.apply_synchronous_to_pager(&synchronous)
+    }
+
+    fn apply_current_journal_mode_to_pager_readonly(&self) -> Result<()> {
+        let journal_mode = self.pragma_state.borrow().journal_mode.clone();
+        let cx = self.op_cx()?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Ok(());
+        }
+
+        match self.pager.set_journal_mode(&cx, JournalMode::Wal) {
+            Ok(_) => Ok(()),
+            Err(FrankenError::Unsupported) => {
+                if self.pager.install_existing_wal_backend(&cx, &self.path)? {
+                    self.pager.set_journal_mode(&cx, JournalMode::Wal)?;
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn apply_journal_mode_to_pager(&self, journal_mode: &str) -> Result<()> {
@@ -59955,6 +60041,178 @@ mod schema_loading_tests {
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(20));
         assert_eq!(rows[1].values()[2], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_open_live_c_sqlite_wal_database_with_stale_main_header_page1() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_live_wal.db");
+        let db_str = db_path.to_str().unwrap();
+        let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+
+        let rconn = rusqlite::Connection::open(&db_path).unwrap();
+        let journal_mode: String = rconn
+            .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        rconn
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('alpha');",
+            )
+            .unwrap();
+
+        assert!(
+            wal_path.exists(),
+            "live C SQLite connection should leave a WAL sidecar present"
+        );
+        assert_eq!(
+            std::fs::metadata(&db_path).unwrap().len(),
+            4096,
+            "main database file should still be the stale one-page bootstrap image"
+        );
+
+        let file_bytes = std::fs::read(&db_path).unwrap();
+        let mut header_bytes = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
+        header_bytes.copy_from_slice(&file_bytes[..fsqlite_types::DATABASE_HEADER_SIZE]);
+        let header_err = DatabaseHeader::from_bytes(&header_bytes)
+            .expect_err("main-file header should still be stale while WAL owns page 1");
+        assert!(
+            matches!(
+                header_err,
+                fsqlite_types::DatabaseHeaderError::InvalidSchemaFormat { raw: 0 }
+            ),
+            "unexpected stale main-file header error: {header_err:?}"
+        );
+
+        let conn = Connection::open(db_str).expect(
+            "opening a live C SQLite WAL database must defer stale page-1 validation to the WAL snapshot",
+        );
+        let rows = conn
+            .query("SELECT id, v FROM t ORDER BY id;")
+            .expect("FrankenSQLite should read the authoritative page 1 from the WAL");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+    }
+
+    #[test]
+    fn test_open_schema_only_live_c_sqlite_wal_database_with_stale_main_header_page1() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_live_wal_schema_only.db");
+        let db_str = db_path.to_str().unwrap();
+        let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+
+        let rconn = rusqlite::Connection::open(&db_path).unwrap();
+        let journal_mode: String = rconn
+            .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        rconn
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('alpha');",
+            )
+            .unwrap();
+
+        assert!(
+            wal_path.exists(),
+            "schema-only open regression requires a live WAL sidecar"
+        );
+
+        let conn = Connection::open_schema_only(db_str).expect(
+            "schema-only open must also tolerate a stale main-file page 1 when the WAL carries the authoritative header",
+        );
+        let schema = conn.schema.borrow();
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].name, "t");
+        drop(schema);
+
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t;")
+            .expect("schema-only connection should still query through pager-backed cursors");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_open_schema_only_wal_mode_database_does_not_create_missing_wal_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_checkpointed_wal_mode.db");
+        let db_str = db_path.to_str().unwrap();
+        let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            let journal_mode: String = rconn
+                .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            rconn
+                .execute_batch(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t(v) VALUES ('alpha');",
+                )
+                .unwrap();
+        }
+
+        assert!(
+            !wal_path.exists(),
+            "closing the C SQLite connection should checkpoint and remove the WAL sidecar"
+        );
+
+        let conn = Connection::open_schema_only(db_str)
+            .expect("schema-only open should work without recreating a missing WAL sidecar");
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t;")
+            .expect("schema-only query should read the checkpointed main database");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+        assert!(
+            !wal_path.exists(),
+            "schema-only open must not create a WAL sidecar just because the header still advertises WAL mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_schema_only_live_c_sqlite_wal_database_with_read_only_wal_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_live_wal_readonly_sidecar.db");
+        let db_str = db_path.to_str().unwrap();
+        let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+
+        let rconn = rusqlite::Connection::open(&db_path).unwrap();
+        let journal_mode: String = rconn
+            .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        rconn
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('alpha');",
+            )
+            .unwrap();
+
+        let mut perms = std::fs::metadata(&wal_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&wal_path, perms).unwrap();
+
+        let conn = Connection::open_schema_only(db_str).expect(
+            "schema-only open must accept an existing WAL sidecar even when it is readable but not writable",
+        );
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t;")
+            .expect("schema-only query should read through the read-only WAL sidecar");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+        drop(conn);
+        drop(rconn);
     }
 
     #[test]

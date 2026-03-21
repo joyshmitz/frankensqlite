@@ -17,8 +17,9 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{
-    BTreePageHeader, CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader,
-    FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber, PageSize,
+    BTreePageHeader, CommitSeq, DATABASE_HEADER_MAGIC, DATABASE_HEADER_SIZE, DatabaseHeader,
+    DatabaseHeaderError, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,
+    PageSize,
 };
 use fsqlite_vfs::{Vfs, VfsFile};
 
@@ -480,12 +481,17 @@ impl<F: VfsFile> PagerInner<F> {
             }
             let mut base_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
             base_header_bytes.copy_from_slice(&base_page1[..DATABASE_HEADER_SIZE]);
-            let base_header = DatabaseHeader::from_bytes(&base_header_bytes).map_err(|error| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid database-file header during WAL refresh: {error}"),
+            match DatabaseHeader::from_bytes(&base_header_bytes) {
+                Ok(base_header) => u64::from(base_header.change_counter),
+                Err(error) => {
+                    stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "invalid database-file header during WAL refresh: {error}"
+                            ),
+                        })?
                 }
-            })?;
-            u64::from(base_header.change_counter)
+            }
         } else {
             u64::from(header.change_counter)
         };
@@ -1515,6 +1521,174 @@ pub struct SimplePager<V: Vfs> {
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
 
+fn page_size_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> Option<PageSize> {
+    if &header_bytes[..DATABASE_HEADER_MAGIC.len()] != DATABASE_HEADER_MAGIC {
+        return None;
+    }
+
+    let raw = u16::from_be_bytes([header_bytes[16], header_bytes[17]]);
+    let page_size = match raw {
+        1 => 65_536,
+        0 => return None,
+        value => u32::from(value),
+    };
+    PageSize::new(page_size)
+}
+
+fn stale_main_header_is_wal_recoverable_error(error: &DatabaseHeaderError) -> bool {
+    matches!(
+        error,
+        DatabaseHeaderError::InvalidSchemaFormat { raw: 0 }
+            | DatabaseHeaderError::InvalidTextEncoding { raw: 0 }
+    )
+}
+
+fn change_counter_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> u32 {
+    u32::from_be_bytes([
+        header_bytes[24],
+        header_bytes[25],
+        header_bytes[26],
+        header_bytes[27],
+    ])
+}
+
+fn stale_main_header_change_counter_under_wal(
+    header_bytes: &[u8; DATABASE_HEADER_SIZE],
+    error: &DatabaseHeaderError,
+) -> Option<u64> {
+    if !stale_main_header_is_wal_recoverable_error(error) {
+        return None;
+    }
+
+    page_size_from_header_bytes(header_bytes)?;
+    Some(u64::from(change_counter_from_header_bytes(header_bytes)))
+}
+
+fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
+    cx: &Cx,
+    vfs: &V,
+    path: &Path,
+    header_bytes: &[u8; DATABASE_HEADER_SIZE],
+    error: &DatabaseHeaderError,
+) -> Result<bool> {
+    if !stale_main_header_is_wal_recoverable_error(error) {
+        return Ok(false);
+    }
+
+    if page_size_from_header_bytes(header_bytes).is_none() {
+        return Ok(false);
+    }
+
+    let mut wal_path = path.to_owned().into_os_string();
+    wal_path.push("-wal");
+    let wal_path = PathBuf::from(wal_path);
+    if !vfs.access(cx, &wal_path, AccessFlags::EXISTS)? {
+        return Ok(false);
+    }
+
+    let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+    let Ok((mut wal_file, _)) = vfs.open(cx, Some(&wal_path), flags) else {
+        return Ok(false);
+    };
+    let wal_len = wal_file.file_size(cx).ok();
+    let _ = wal_file.close(cx);
+
+    Ok(wal_len.is_some_and(|len| len >= u64::from(fsqlite_types::limits::WAL_HEADER_SIZE)))
+}
+
+fn bootstrap_header_from_stale_main_file(
+    header_bytes: &[u8; DATABASE_HEADER_SIZE],
+    page_size: PageSize,
+) -> DatabaseHeader {
+    DatabaseHeader {
+        page_size,
+        write_version: header_bytes[18],
+        read_version: header_bytes[19],
+        reserved_per_page: header_bytes[20],
+        change_counter: u32::from_be_bytes([
+            header_bytes[24],
+            header_bytes[25],
+            header_bytes[26],
+            header_bytes[27],
+        ]),
+        page_count: u32::from_be_bytes([
+            header_bytes[28],
+            header_bytes[29],
+            header_bytes[30],
+            header_bytes[31],
+        ]),
+        freelist_trunk: u32::from_be_bytes([
+            header_bytes[32],
+            header_bytes[33],
+            header_bytes[34],
+            header_bytes[35],
+        ]),
+        freelist_count: u32::from_be_bytes([
+            header_bytes[36],
+            header_bytes[37],
+            header_bytes[38],
+            header_bytes[39],
+        ]),
+        schema_cookie: u32::from_be_bytes([
+            header_bytes[40],
+            header_bytes[41],
+            header_bytes[42],
+            header_bytes[43],
+        ]),
+        schema_format: u32::from_be_bytes([
+            header_bytes[44],
+            header_bytes[45],
+            header_bytes[46],
+            header_bytes[47],
+        ]),
+        default_cache_size: i32::from_be_bytes([
+            header_bytes[48],
+            header_bytes[49],
+            header_bytes[50],
+            header_bytes[51],
+        ]),
+        largest_root_page: u32::from_be_bytes([
+            header_bytes[52],
+            header_bytes[53],
+            header_bytes[54],
+            header_bytes[55],
+        ]),
+        // The authoritative encoding/schema header will be re-read from the
+        // WAL-backed page-1 snapshot on the first transaction begin.
+        text_encoding: fsqlite_types::TextEncoding::Utf8,
+        user_version: u32::from_be_bytes([
+            header_bytes[60],
+            header_bytes[61],
+            header_bytes[62],
+            header_bytes[63],
+        ]),
+        incremental_vacuum: u32::from_be_bytes([
+            header_bytes[64],
+            header_bytes[65],
+            header_bytes[66],
+            header_bytes[67],
+        ]),
+        application_id: u32::from_be_bytes([
+            header_bytes[68],
+            header_bytes[69],
+            header_bytes[70],
+            header_bytes[71],
+        ]),
+        version_valid_for: u32::from_be_bytes([
+            header_bytes[92],
+            header_bytes[93],
+            header_bytes[94],
+            header_bytes[95],
+        ]),
+        sqlite_version: u32::from_be_bytes([
+            header_bytes[96],
+            header_bytes[97],
+            header_bytes[98],
+            header_bytes[99],
+        ]),
+    }
+}
+
 impl<V> MvccPager for SimplePager<V>
 where
     V: Vfs + Send + Sync,
@@ -1828,7 +2002,7 @@ where
         // Without this, standard SQLite tools cannot detect WAL mode from the
         // on-disk header and will fail to look for the WAL file.
         let version_byte: u8 = if mode == JournalMode::Wal { 2 } else { 1 };
-        if inner.db_size > 0 {
+        if inner.db_size > 0 && !inner.access_mode.is_readonly() {
             let page_size = inner.page_size.as_usize();
             let mut page1 = vec![0u8; page_size];
             let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
@@ -2200,10 +2374,20 @@ where
             let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
             let header_read = db_file.read(cx, &mut header_bytes, 0)?;
             if header_read >= DATABASE_HEADER_SIZE {
-                if let Ok(header) = DatabaseHeader::from_bytes(&header_bytes) {
-                    header.page_size
-                } else {
-                    requested_page_size
+                match DatabaseHeader::from_bytes(&header_bytes) {
+                    Ok(header) => header.page_size,
+                    Err(error)
+                        if stale_main_header_can_be_recovered_from_live_wal(
+                            cx,
+                            &*vfs,
+                            path,
+                            &header_bytes,
+                            &error,
+                        )? =>
+                    {
+                        page_size_from_header_bytes(&header_bytes).unwrap_or(requested_page_size)
+                    }
+                    Err(_) => requested_page_size,
                 }
             } else {
                 requested_page_size
@@ -2227,7 +2411,7 @@ where
 
         // Refresh file size after potential recovery.
         file_size = db_file.file_size(cx)?;
-        let header = if file_size == 0 {
+        let (header, bootstrapped_from_live_wal_stub) = if file_size == 0 {
             // SQLite databases are never truly empty: page 1 contains the
             // 100-byte database header followed by the sqlite_master root page.
             //
@@ -2255,7 +2439,7 @@ where
             db_file.write(cx, &page1, 0)?;
             db_file.sync(cx, SyncFlags::NORMAL)?;
             file_size = db_file.file_size(cx)?;
-            header
+            (header, false)
         } else {
             if file_size < DATABASE_HEADER_SIZE as u64 {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -2274,11 +2458,34 @@ where
                     ),
                 });
             }
-            let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid database header: {error}"),
-                }
-            })?;
+            let (header, bootstrapped_from_live_wal_stub) =
+                match DatabaseHeader::from_bytes(&header_bytes) {
+                    Ok(header) => (header, false),
+                    Err(error)
+                        if stale_main_header_can_be_recovered_from_live_wal(
+                            cx,
+                            &*vfs,
+                            path,
+                            &header_bytes,
+                            &error,
+                        )? =>
+                    {
+                        // A live SQLite WAL can carry the authoritative page-1
+                        // header while the main file still contains the stale
+                        // bootstrap stub. Accept the file here and let the
+                        // first WAL-backed refresh validate and load the real
+                        // header from page 1 in the committed snapshot.
+                        (
+                            bootstrap_header_from_stale_main_file(&header_bytes, page_size),
+                            true,
+                        )
+                    }
+                    Err(error) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("invalid database header: {error}"),
+                        });
+                    }
+                };
             if header.page_size != page_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -2288,7 +2495,7 @@ where
                     ),
                 });
             }
-            header
+            (header, bootstrapped_from_live_wal_stub)
         };
 
         let page_size_u64 = page_size.as_usize() as u64;
@@ -2312,14 +2519,18 @@ where
         } else {
             2
         };
-        let freelist = load_freelist_from_disk(
-            cx,
-            &mut db_file,
-            page_size,
-            db_size,
-            header.freelist_trunk,
-            header.freelist_count,
-        )?;
+        let freelist = if bootstrapped_from_live_wal_stub {
+            Vec::new()
+        } else {
+            load_freelist_from_disk(
+                cx,
+                &mut db_file,
+                page_size,
+                db_size,
+                header.freelist_trunk,
+                header.freelist_count,
+            )?
+        };
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
         let freelist_count = freelist.len();
@@ -2400,12 +2611,34 @@ where
                 ),
             });
         }
-        let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-            FrankenError::DatabaseCorrupt {
-                detail: format!("invalid database header: {error}"),
+        let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
+            Ok(header) => {
+                let page_size = header.page_size;
+                (Some(header), page_size)
             }
-        })?;
-        let page_size = header.page_size;
+            Err(error)
+                if stale_main_header_can_be_recovered_from_live_wal(
+                    cx,
+                    &*vfs,
+                    path,
+                    &header_bytes,
+                    &error,
+                )? =>
+            {
+                let page_size = page_size_from_header_bytes(&header_bytes).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: "live WAL bootstrap could not recover database page size"
+                            .to_owned(),
+                    }
+                })?;
+                (None, page_size)
+            }
+            Err(error) => {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid database header: {error}"),
+                });
+            }
+        };
 
         let page_size_u64 = page_size.as_usize() as u64;
         if file_size % page_size_u64 != 0 {
@@ -2432,7 +2665,9 @@ where
         // Skip freelist traversal for read-only — use empty freelist.
         let freelist = Vec::new();
 
-        let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
+        let initial_commit_seq = CommitSeq::new(u64::from(
+            header.as_ref().map_or(0, |header| header.change_counter),
+        ));
         let cache = ShardedPageCache::new(page_size);
         let pool = cache.pool().clone();
         Ok(Self {

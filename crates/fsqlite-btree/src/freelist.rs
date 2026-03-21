@@ -375,9 +375,9 @@ pub const fn ptrmap_entry_offset(
         // pointer map page forward by one page.
         return None;
     }
-    
+
     let index = pgno.get() - ptrmap_page.get() - 1;
-    
+
     Some(index * PTRMAP_ENTRY_SIZE_BYTES)
 }
 
@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn test_ptrmap_entry_offset_skips_pending_byte_inside_group() {
         // For 4096-byte pages, the pending byte page lands in the middle of
-        // the pointer-map group that starts at page 261582. 
+        // the pointer-map group that starts at page 261582.
         // The slot corresponding to the pending byte page is simply left unused,
         // and subsequent pages maintain their unshifted index offsets.
         let usable_size = 4096;
@@ -764,14 +764,13 @@ mod tests {
             ptrmap_page_for(pgno, usable_size, page_size),
             None // It's a ptrmap page itself!
         );
-        assert_eq!(
-            ptrmap_entry_offset(pgno, usable_size, page_size),
-            None
-        );
+        assert_eq!(ptrmap_entry_offset(pgno, usable_size, page_size), None);
 
         let last_in_group = PageNumber::new(262401).unwrap();
         assert_eq!(
-            ptrmap_page_for(last_in_group, usable_size, page_size).unwrap().get(),
+            ptrmap_page_for(last_in_group, usable_size, page_size)
+                .unwrap()
+                .get(),
             ptrmap_page
         );
         let offset = ptrmap_entry_offset(last_in_group, usable_size, page_size).unwrap();

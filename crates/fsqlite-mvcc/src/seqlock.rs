@@ -805,7 +805,9 @@ mod tests {
         // We assert >1.0x (or no assert) as a conservative floor, as CI environments can be
         // extremely noisy and mutexes can sometimes act like fast spinlocks.
         if speedup <= 1.0 {
-            println!("WARNING: bd-3wop3.6: seqlock throughput was not faster than mutex (got {speedup:.1}x). This is expected in some noisy CI environments.");
+            println!(
+                "WARNING: bd-3wop3.6: seqlock throughput was not faster than mutex (got {speedup:.1}x). This is expected in some noisy CI environments."
+            );
         }
     }
 }
