@@ -1049,7 +1049,7 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Read a frame by 0-based index, returning header and page data.
-    pub fn read_frame(&mut self, cx: &Cx, frame_index: usize) -> Result<(WalFrameHeader, Vec<u8>)> {
+    pub fn read_frame(&self, cx: &Cx, frame_index: usize) -> Result<(WalFrameHeader, Vec<u8>)> {
         let frame_size = self.frame_size();
         let mut buf = vec![0u8; frame_size];
         let header = self.read_frame_into(cx, frame_index, &mut buf)?;
@@ -1063,7 +1063,7 @@ impl<F: VfsFile> WalFile<F> {
     /// from the beginning of the buffer, and the page data follows immediately
     /// after at offset `WAL_FRAME_HEADER_SIZE`.
     pub fn read_frame_into(
-        &mut self,
+        &self,
         cx: &Cx,
         frame_index: usize,
         buf: &mut [u8],
@@ -1100,7 +1100,7 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Read just the frame header at a given 0-based index.
-    pub fn read_frame_header(&mut self, cx: &Cx, frame_index: usize) -> Result<WalFrameHeader> {
+    pub fn read_frame_header(&self, cx: &Cx, frame_index: usize) -> Result<WalFrameHeader> {
         if frame_index >= self.frame_count {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(

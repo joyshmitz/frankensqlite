@@ -102,7 +102,7 @@ pub struct CheckpointResult {
 ///
 /// The pager calls into this trait during WAL-mode commits and page lookups
 /// instead of writing a rollback journal.
-pub trait WalBackend: Send {
+pub trait WalBackend: Send + Sync {
     /// Prepare WAL state for a newly-started transaction.
     ///
     /// Implementations may refresh internal snapshot metadata so reads during
@@ -187,7 +187,7 @@ pub trait WalBackend: Send {
     /// structure for the steady-state path. Any slower fallback path should be
     /// explicit and reserved for exceptional cases such as a deliberately
     /// partial index or recovery-oriented handling.
-    fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
+    fn read_page(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
 
     /// Count committed transactions that occur after the latest committed
     /// frame for `page_number` in the current visible WAL snapshot.
@@ -195,7 +195,7 @@ pub trait WalBackend: Send {
     /// This lets the pager derive an exact visible commit sequence even when a
     /// WAL commit does not need to rewrite page 1. Implementations may return
     /// 0 when they cannot provide a more precise answer.
-    fn committed_txns_since_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<u64> {
+    fn committed_txns_since_page(&self, _cx: &Cx, _page_number: u32) -> Result<u64> {
         Ok(0)
     }
 

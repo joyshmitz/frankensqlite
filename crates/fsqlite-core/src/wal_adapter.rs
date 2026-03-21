@@ -1023,7 +1023,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Ok(())
     }
 
-    fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
+    fn read_page(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
         let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
             snapshot
         } else {
@@ -1086,7 +1086,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Ok(Some(data))
     }
 
-    fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
+    fn committed_txns_since_page(&self, cx: &Cx, page_number: u32) -> Result<u64> {
         let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
             snapshot
         } else {
