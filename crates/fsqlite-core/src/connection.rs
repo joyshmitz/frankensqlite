@@ -11523,6 +11523,8 @@ impl Connection {
         let auto = self.active_txn.borrow().is_none();
         let mut auto_commit_succeeded = false;
         if auto {
+            self.invalidate_cached_read_snapshot(&cx);
+            self.invalidate_cached_write_txn(&cx);
             let txn = self.begin_pager_txn_with_busy_timeout(
                 &self.pager,
                 &cx,

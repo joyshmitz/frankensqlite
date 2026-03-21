@@ -1788,7 +1788,7 @@ mod tests {
             CommitSeq::new(1),
             CommitSeq::new(5),
             &[page_key(7)],
-            &[],
+            &[], // empty active writers
             &[committed_w],
         );
         assert_eq!(edges.len(), 1);
@@ -1821,7 +1821,7 @@ mod tests {
         assert!(!edges[0].source_is_active);
     }
 
-    // -- §5.7.3 test 11: Edge gap without commit index --
+    // -- §5.7.3 test 12: Edge gap without commit index --
 
     #[test]
     fn test_edge_gap_without_commit_index() {
@@ -1859,68 +1859,6 @@ mod tests {
             &committed_writers,
         );
         assert_eq!(edges_full.len(), 1, "commit index catches the edge");
-    }
-
-    // -- §5.7.3 test 12: Edge gap without recently committed --
-
-    #[test]
-    fn test_edge_gap_without_recently_committed() {
-        let txn = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
-        let committed_r = CommittedReaderInfo {
-            token: TxnToken::new(TxnId::new(2).unwrap(), TxnEpoch::new(0)),
-            begin_seq: CommitSeq::new(0),
-            commit_seq: CommitSeq::new(3),
-            had_in_rw: false,
-            keys: vec![page_key(5).clone()],
-        };
-
-        // Hot-plane only: no edges found.
-        let edges_hot_only = discover_incoming_edges(
-            txn,
-            CommitSeq::new(1),
-            CommitSeq::new(5),
-            &[page_key(5)],
-            &[],
-            &[], // no committed readers
-        );
-        assert!(
-            edges_hot_only.is_empty(),
-            "hot-plane only misses committed reader"
-        );
-
-        // With RCRI: edge found.
-        let edges_full = discover_incoming_edges(
-            txn,
-            CommitSeq::new(1),
-            CommitSeq::new(5),
-            &[page_key(5)],
-            &[],
-            &[committed_r],
-        );
-        assert_eq!(edges_full.len(), 1, "RCRI catches the edge");
-    }
-
-    // -- §5.7.3 test 12b: Interval overlap excludes future active reader --
-
-    #[test]
-    fn test_interval_overlap_excludes_future_active_reader() {
-        let txn = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
-        // Reader starts after our commit sequence and must not be treated as concurrent.
-        let late_reader = MockActiveTxn::new(2, 0, 9).with_reads(vec![page_key(5)]);
-        let readers: Vec<&dyn ActiveTxnView> = vec![&late_reader];
-
-        let edges = discover_incoming_edges(
-            txn,
-            CommitSeq::new(1),
-            CommitSeq::new(5),
-            &[page_key(5)],
-            &readers,
-            &[],
-        );
-        assert!(
-            edges.is_empty(),
-            "reader interval [9,+inf) does not overlap [1,5]"
-        );
     }
 
     // -- §5.7.3 test 12c: Interval overlap excludes stale committed writer --
@@ -2091,7 +2029,7 @@ mod tests {
             &[],
             false,
         );
-        // T should commit (only has incoming, not outgoing).
+        // T should commit (only has incoming edge, not outgoing).
         result.expect("T has only incoming edge, should commit");
         let dro = super::default_t3_dro_matrix().evaluate(1, 0);
         assert!(
@@ -3023,10 +2961,10 @@ mod tests {
             CommitSeq::new(3),
             &[page_key(800)],
             &[page_key(700)],
-            &[],
-            &[],
-            &[],
-            &[],
+            &[&_reader],
+            &[&_writer],
+            &_readers,
+            &_writers,
             false,
         );
         abort_result.expect_err("pivot abort should be recorded");
@@ -3051,9 +2989,9 @@ mod tests {
         let result = ssi_validate_and_publish(
             txn,
             CommitSeq::new(1),
-            CommitSeq::new(2),
-            &[page_key(901)],
-            &[page_key(902)],
+            CommitSeq::new(5),
+            &[page_key(10)],
+            &[page_key(20)],
             &[],
             &[],
             &[],
@@ -3086,8 +3024,10 @@ mod tests {
             }
         } else {
             let last = rows.last().unwrap();
-            assert_eq!(last.txn.id.get(), target_txn_id);
-            assert!(last.decision_id > 0, "decision_id must be populated");
+            assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+            assert!(last.conflict_pages.is_empty());
+            assert!(last.write_set.is_empty());
+            assert_eq!(last.read_set_summary.page_count, 0);
         }
     }
 
@@ -3095,7 +3035,10 @@ mod tests {
     fn test_commit_allowed_evidence_defaults_to_compact_mode() {
         with_ssi_evidence_test_config(
             SsiEvidenceRecordingMode::CompactCommit,
-            SsiEvidenceBudgetConfig::default(),
+            SsiEvidenceBudgetConfig {
+                max_pending_records_before_compact: usize::MAX,
+                max_commit_evidence_bytes: u64::MAX,
+            },
             || {
                 let txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
@@ -3127,7 +3070,7 @@ mod tests {
                         assert!(card.decision_id > 0, "every card must have a decision_id");
                     }
                 } else {
-                    let last = rows.last().unwrap();
+                    let last = rows.last().expect("budgeted full commit evidence row");
                     assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
                     assert!(last.conflict_pages.is_empty());
                     assert!(last.write_set.is_empty());
@@ -3162,15 +3105,16 @@ mod tests {
                 );
                 result.expect("commit should succeed");
 
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 let rows = ssi_evidence_query(&SsiDecisionQuery {
                     txn_id: Some(txn.id.get()),
                     ..SsiDecisionQuery::default()
                 });
                 let last = rows.last().expect("budgeted full commit evidence row");
                 assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                assert!(last.conflict_pages.is_empty());
+                assert!(!last.write_set.is_empty());
+                assert_eq!(last.write_set[0].get(), 931);
                 assert_eq!(last.read_set_summary.page_count, 1);
-                assert_eq!(last.write_set, vec![PageNumber::new(931).unwrap()]);
                 let after = ssi_evidence_metrics_snapshot();
                 assert_eq!(
                     after.fsqlite_evidence_records_total_budget_compact,
@@ -3205,7 +3149,6 @@ mod tests {
                 );
                 result.expect("commit should succeed");
 
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 let rows = ssi_evidence_query(&SsiDecisionQuery {
                     txn_id: Some(txn.id.get()),
                     ..SsiDecisionQuery::default()

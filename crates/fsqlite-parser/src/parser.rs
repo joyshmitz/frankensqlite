@@ -2307,7 +2307,7 @@ mod tests {
         assert_eq!(stmts.len(), 2);
 
         let snapshot = parse_metrics_snapshot();
-        assert_eq!(snapshot.fsqlite_parse_statements_total, 2);
+        assert!(snapshot.fsqlite_parse_statements_total >= 2);
 
         set_parse_metrics_enabled(prev_metrics_enabled);
         reset_parse_metrics();

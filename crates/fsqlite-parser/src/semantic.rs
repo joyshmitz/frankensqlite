@@ -894,8 +894,6 @@ impl<'a> Resolver<'a> {
                         self.resolve_expr(&order.expr, &post_select_scope);
                     }
                 }
-
-                self.tables_resolved += 1;
             }
             SelectCore::Values(rows) => {
                 for row in rows {

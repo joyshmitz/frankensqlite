@@ -108,6 +108,7 @@ flamegraph*.svg
 
 # Codex build artifacts
 target-codex*/
+.codex-target-arc/
 
 # Ephemeral agent scratch files
 bead_comment.md

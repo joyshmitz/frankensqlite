@@ -3848,8 +3848,8 @@ mod tests {
         // Rule: |T1| > p (1 > 0), so T1 is preferred for eviction.
         // But T1 is pinned. It should fall back to T2.
 
-        // Force eviction by resizing byte limit.
-        cache.resize(10, 1); // 1 byte limit -> must evict everything possible
+        // Force eviction by resizing limit.
+        cache.resize(0, 1); // 0 page limit -> must evict everything possible
 
         assert!(
             cache.get(&k1).is_none(),

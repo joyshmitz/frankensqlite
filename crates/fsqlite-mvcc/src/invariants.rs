@@ -667,10 +667,14 @@ impl VersionStore {
         snapshot: &Snapshot,
     ) -> Option<PageVersion> {
         'retry: loop {
-            let head_idx = self.chain_heads.get_head(page)?;
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                crate::observability::record_snapshot_read_versions_traversed(0);
+                return None;
+            };
 
             let arena = self.arena.read();
             let mut current_idx = head_idx;
+            let mut traversed = 0;
 
             loop {
                 let Some(version) = arena.get(current_idx) else {
@@ -679,12 +683,19 @@ impl VersionStore {
                     continue 'retry;
                 };
 
+                traversed += 1;
+
                 if visible(version, snapshot) {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
                     return Some(version.clone());
                 }
 
-                let prev_ptr = version.prev?;
-                current_idx = version_pointer_to_idx(prev_ptr);
+                if let Some(prev_ptr) = version.prev {
+                    current_idx = version_pointer_to_idx(prev_ptr);
+                } else {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
+                    return None;
+                }
             }
         }
     }
@@ -699,22 +710,33 @@ impl VersionStore {
         snapshot: &Snapshot,
     ) -> Option<CommitSeq> {
         'retry: loop {
-            let head_idx = self.chain_heads.get_head(page)?;
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                crate::observability::record_snapshot_read_versions_traversed(0);
+                return None;
+            };
 
             let arena = self.arena.read();
             let mut current_idx = head_idx;
+            let mut traversed = 0;
 
             loop {
                 let Some(version) = arena.get(current_idx) else {
                     continue 'retry;
                 };
+                
+                traversed += 1;
 
                 if visible(version, snapshot) {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
                     return Some(version.commit_seq);
                 }
 
-                let prev_ptr = version.prev?;
-                current_idx = version_pointer_to_idx(prev_ptr);
+                if let Some(prev_ptr) = version.prev {
+                    current_idx = version_pointer_to_idx(prev_ptr);
+                } else {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
+                    return None;
+                }
             }
         }
     }

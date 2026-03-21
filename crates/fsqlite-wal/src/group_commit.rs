@@ -917,14 +917,15 @@ impl GroupCommitConsolidator {
         // failed flush, so they should be retried in the next epoch.
         if self.next_epoch_batches.is_empty() {
             self.phase = ConsolidationPhase::Complete;
+            self.filling_started = None;
         } else {
             self.pending_batches = std::mem::take(&mut self.next_epoch_batches);
             self.pending_frame_count = self.next_epoch_frame_count;
             self.next_epoch_frame_count = 0;
             self.phase = ConsolidationPhase::Filling;
             self.filling_started = Some(Instant::now());
+            // Keep filling_started set — promoted batches need the timeout
         }
-        self.filling_started = None;
 
         debug!(
             target: "fsqlite_wal::group_commit",

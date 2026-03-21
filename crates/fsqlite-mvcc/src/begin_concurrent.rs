@@ -2143,8 +2143,27 @@ pub fn prepare_concurrent_commit_with_ssi(
         registry.committed_writers.len(),
     );
 
+    let mut abort_reason = None;
     if has_in_rw && has_out_rw {
-        let reason = SsiAbortReason::Pivot;
+        abort_reason = Some(SsiAbortReason::Pivot);
+    } else {
+        for edge in &incoming_edges {
+            if !edge.source_is_active && edge.source_has_in_rw {
+                abort_reason = Some(SsiAbortReason::CommittedPivot);
+                break;
+            }
+        }
+        if abort_reason.is_none() {
+            for edge in &outgoing_edges {
+                if !edge.source_is_active && edge.source_has_in_rw {
+                    abort_reason = Some(SsiAbortReason::CommittedPivot);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(reason) = abort_reason {
         tracing::warn!(
             ?txn,
             ?reason,
@@ -2673,25 +2692,33 @@ mod tests {
             .expect("session 2");
 
         // Session 1 writes page 5.
-        let mut h1 = registry.get_mut(s1).expect("handle 1");
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
-            .expect("write page 5");
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
+                .expect("write page 5");
+        }
 
         // Session 2 writes page 10 (different page => no conflict).
-        let mut h2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data())
-            .expect("write page 10");
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data())
+                .expect("write page 10");
+        }
 
         // Both commit successfully.
-        let mut h1 = registry.get_mut(s1).expect("handle 1");
-        let seq1 = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("commit 1");
-        assert_eq!(seq1, CommitSeq::new(11));
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            let seq1 = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+                .expect("commit 1");
+            assert_eq!(seq1, CommitSeq::new(11));
+        }
 
-        let mut h2 = registry.get_mut(s2).expect("handle 2");
-        let seq2 = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12))
-            .expect("commit 2");
-        assert_eq!(seq2, CommitSeq::new(12));
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            let seq2 = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12))
+                .expect("commit 2");
+            assert_eq!(seq2, CommitSeq::new(12));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2713,27 +2740,35 @@ mod tests {
         // Both write to page 5, but lock contention prevents s2 from
         // acquiring the same lock.  In our model, each session uses its
         // session_id as the lock holder.
-        let mut h1 = registry.get_mut(s1).expect("handle 1");
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
-            .expect("s1 write page 5");
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
+                .expect("s1 write page 5");
+        }
 
         // s1 commits first (first-committer-wins).
-        let mut h1 = registry.get_mut(s1).expect("handle 1");
-        concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("s1 commits first");
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+                .expect("s1 commits first");
+        }
 
         // Now s2 tries to write and commit the same page.  The lock was
         // released by s1's commit, so s2 can acquire it.
-        let mut h2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data())
-            .expect("s2 write page 5");
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data())
+                .expect("s2 write page 5");
+        }
 
-        let mut h2 = registry.get_mut(s2).expect("handle 2");
-        let result = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
-        assert!(result.is_err());
-        let (err, fcw) = result.unwrap_err();
-        assert_eq!(err, MvccError::BusySnapshot);
-        assert!(matches!(fcw, FcwResult::Conflict { .. }));
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle 2");
+            let result = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+            assert!(result.is_err());
+            let (err, fcw) = result.unwrap_err();
+            assert_eq!(err, MvccError::BusySnapshot);
+            assert!(matches!(fcw, FcwResult::Conflict { .. }));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2756,32 +2791,44 @@ mod tests {
             .expect("session 3");
 
         // s1 writes page 5, s3 writes page 10 (no overlap).
-        let mut h1 = registry.get_mut(s1).expect("h1");
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        {
+            let mut h1 = registry.get_mut(s1).expect("h1");
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        }
 
-        let mut h3 = registry.get_mut(s3).expect("h3");
-        concurrent_write_page(&mut h3, &lock_table, s3, test_page(10), test_data()).unwrap();
+        {
+            let mut h3 = registry.get_mut(s3).expect("h3");
+            concurrent_write_page(&mut h3, &lock_table, s3, test_page(10), test_data()).unwrap();
+        }
 
         // s1 commits first on page 5.
-        let mut h1 = registry.get_mut(s1).expect("h1");
-        concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("s1 commits");
+        {
+            let mut h1 = registry.get_mut(s1).expect("h1");
+            concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+                .expect("s1 commits");
+        }
 
         // s2 now tries page 5 (same as s1, but s1 already committed).
-        let mut h2 = registry.get_mut(s2).expect("h2");
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data()).unwrap();
+        {
+            let mut h2 = registry.get_mut(s2).expect("h2");
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data()).unwrap();
+        }
 
-        let mut h2 = registry.get_mut(s2).expect("h2");
-        let result = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
-        assert!(result.is_err());
-        let (err, _) = result.unwrap_err();
-        assert_eq!(err, MvccError::BusySnapshot);
+        {
+            let mut h2 = registry.get_mut(s2).expect("h2");
+            let result = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+            assert!(result.is_err());
+            let (err, _) = result.unwrap_err();
+            assert_eq!(err, MvccError::BusySnapshot);
+        }
 
         // s3 commits on page 10 (no conflict with s1's page 5).
-        let mut h3 = registry.get_mut(s3).expect("h3");
-        let seq3 = concurrent_commit(&mut h3, &commit_index, &lock_table, s3, CommitSeq::new(13))
-            .expect("s3 commits");
-        assert_eq!(seq3, CommitSeq::new(13));
+        {
+            let mut h3 = registry.get_mut(s3).expect("h3");
+            let seq3 = concurrent_commit(&mut h3, &commit_index, &lock_table, s3, CommitSeq::new(13))
+                .expect("s3 commits");
+            assert_eq!(seq3, CommitSeq::new(13));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2902,16 +2949,22 @@ mod tests {
             .expect("session");
 
         // Before writing, local read returns None (would fall through to MVCC).
-        let handle = registry.get(s1).expect("handle");
-        assert!(concurrent_read_page(&handle, test_page(5)).is_none());
+        {
+            let handle = registry.get(s1).expect("handle");
+            assert!(concurrent_read_page(&handle, test_page(5)).is_none());
+        }
 
         // After writing, local read returns the written data.
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+        }
 
-        let handle = registry.get(s1).expect("handle");
-        assert!(concurrent_read_page(&handle, test_page(5)).is_some());
-        assert!(concurrent_read_page(&handle, test_page(6)).is_none());
+        {
+            let handle = registry.get(s1).expect("handle");
+            assert!(concurrent_read_page(&handle, test_page(5)).is_some());
+            assert!(concurrent_read_page(&handle, test_page(6)).is_none());
+        }
     }
 
     #[test]
@@ -4373,18 +4426,24 @@ mod tests {
             .expect("session");
 
         // Abort the handle.
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_abort(&mut handle, &lock_table, s1);
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_abort(&mut handle, &lock_table, s1);
+        }
 
         // Write should fail on aborted handle.
-        let mut handle = registry.get_mut(s1).expect("handle");
-        let result = concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data());
-        assert_eq!(result.unwrap_err(), MvccError::InvalidState);
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            let result = concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data());
+            assert_eq!(result.unwrap_err(), MvccError::InvalidState);
+        }
 
         // Savepoint should fail on aborted handle.
-        let handle = registry.get(s1).expect("handle");
-        let result = concurrent_savepoint(&handle, "sp1");
-        assert_eq!(result.unwrap_err(), MvccError::InvalidState);
+        {
+            let handle = registry.get(s1).expect("handle");
+            let result = concurrent_savepoint(&handle, "sp1");
+            assert_eq!(result.unwrap_err(), MvccError::InvalidState);
+        }
     }
 
     // -----------------------------------------------------------------------

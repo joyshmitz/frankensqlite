@@ -421,10 +421,11 @@ fn ssi_anomaly_committed_pivot_abort() {
     // Scenario: T1 (committed reader with has_in_rw) creates a committed pivot.
     // T2 writes to a page T1 read → incoming edge with committed source.
     // If T1 had has_in_rw at commit time, T2 must abort (committed pivot rule).
+    let txn1 = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
     let txn2 = TxnToken::new(TxnId::new(2).unwrap(), TxnEpoch::new(0));
 
     let committed_reader = CommittedReaderInfo {
-        token: txn2,
+        token: txn1,
         begin_seq: CommitSeq::new(5),
         commit_seq: CommitSeq::new(10),
         had_in_rw: true,

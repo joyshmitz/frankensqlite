@@ -160,7 +160,7 @@ impl ResidentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryState {
     Resident(ResidentState),
-    Ghost,
+    Ghost(u64),
 }
 
 /// Deterministic transition events emitted by [`S3Fifo::insert`].
@@ -335,7 +335,7 @@ pub struct S3Fifo {
     config: S3FifoConfig,
     small: VecDeque<PageNumber>,
     main: VecDeque<PageNumber>,
-    ghost: VecDeque<PageNumber>,
+    ghost: VecDeque<(PageNumber, u64)>,
     index: HashMap<PageNumber, EntryState>,
     small_capacity_min: usize,
     small_capacity_max: usize,
@@ -347,6 +347,7 @@ pub struct S3Fifo {
     main_pressure_since_adapt: usize,
     posterior_alpha: u64,
     posterior_beta: u64,
+    ghost_epoch: u64,
 }
 
 impl S3Fifo {
@@ -390,6 +391,7 @@ impl S3Fifo {
             main_pressure_since_adapt: 0,
             posterior_alpha: 1,
             posterior_beta: 1,
+            ghost_epoch: 0,
         }
     }
 
@@ -465,7 +467,7 @@ impl S3Fifo {
     #[inline]
     #[must_use]
     pub fn ghost_pages(&self) -> Vec<PageNumber> {
-        self.ghost.iter().copied().collect()
+        self.ghost.iter().map(|(p, _)| *p).collect()
     }
 
     /// O(1) queue-location lookup.
@@ -474,7 +476,7 @@ impl S3Fifo {
     pub fn lookup(&self, page_id: PageNumber) -> Option<QueueLocation> {
         match self.index.get(&page_id).copied() {
             Some(EntryState::Resident(state)) => Some(QueueLocation { kind: state.queue }),
-            Some(EntryState::Ghost) => Some(QueueLocation {
+            Some(EntryState::Ghost(_)) => Some(QueueLocation {
                 kind: QueueKind::Ghost,
             }),
             None => None,
@@ -497,7 +499,7 @@ impl S3Fifo {
                 }
                 true
             }
-            Some(EntryState::Ghost) | None => false,
+            Some(EntryState::Ghost(_)) | None => false,
         }
     }
 
@@ -517,7 +519,7 @@ impl S3Fifo {
                 });
                 return events;
             }
-            Some(EntryState::Ghost) => {
+            Some(EntryState::Ghost(_)) => {
                 self.remove_ghost(page_id);
                 self.ghost_hits_since_adapt = self.ghost_hits_since_adapt.saturating_add(1);
 
@@ -613,8 +615,9 @@ impl S3Fifo {
             return;
         }
 
-        self.ghost.push_back(page_id);
-        self.index.insert(page_id, EntryState::Ghost);
+        self.ghost_epoch = self.ghost_epoch.wrapping_add(1);
+        self.ghost.push_back((page_id, self.ghost_epoch));
+        self.index.insert(page_id, EntryState::Ghost(self.ghost_epoch));
         events.push(S3FifoEvent::EvictedFromSmallToGhost(page_id));
     }
 
@@ -656,11 +659,13 @@ impl S3Fifo {
 
     fn trim_ghosts(&mut self, events: &mut Vec<S3FifoEvent>) {
         while self.ghost.len() > self.config.ghost_capacity {
-            let Some(page_id) = self.ghost.pop_front() else {
+            let Some((page_id, epoch)) = self.ghost.pop_front() else {
                 break;
             };
-            if matches!(self.index.get(&page_id), Some(EntryState::Ghost)) {
-                self.index.remove(&page_id);
+            if let Some(EntryState::Ghost(current_epoch)) = self.index.get(&page_id) {
+                if *current_epoch == epoch {
+                    self.index.remove(&page_id);
+                }
             }
             events.push(S3FifoEvent::GhostTrimmed(page_id));
         }
@@ -668,8 +673,8 @@ impl S3Fifo {
 
     fn remove_ghost(&mut self, page_id: PageNumber) {
         // PERF: Avoid O(N) `retain` scan on the ghost queue. Dead entries will be
-        // lazily ignored by `trim_ghosts` since they will no longer have `EntryState::Ghost`.
-        if matches!(self.index.get(&page_id), Some(EntryState::Ghost)) {
+        // lazily ignored by `trim_ghosts` since they will no longer have `EntryState::Ghost` matching the epoch.
+        if matches!(self.index.get(&page_id), Some(EntryState::Ghost(_))) {
             self.index.remove(&page_id);
         }
     }
