@@ -2054,7 +2054,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<()> {
+    fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<bool> {
         if self.stack.is_empty() || self.at_eof {
             return Err(FrankenError::internal(
                 "cursor at EOF during interior replace",
@@ -2088,14 +2088,11 @@ impl<P: PageWriter> BtCursor<P> {
         let local_size = local_size.min(new_payload.len());
 
         new_cell.extend_from_slice(&new_payload[..local_size]);
-        let overflow_head = if local_size < new_payload.len() {
+        if local_size < new_payload.len() {
             let first_overflow =
                 self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
             new_cell.extend_from_slice(&first_overflow.get().to_be_bytes());
-            Some(first_overflow)
-        } else {
-            None
-        };
+        }
 
         // Remove old cell from page and try to insert new cell.
         let mut page_data = self.pager.read_page_data(cx, page_no)?;
@@ -2196,17 +2193,35 @@ impl<P: PageWriter> BtCursor<P> {
             if let Some(first) = old_overflow {
                 self.free_overflow_chain(cx, first)?;
             }
-            return Ok(());
+            return Ok(false);
         }
 
-        // Replacement that would require structural rebalance is intentionally
-        // rejected here so delete paths remain failure-atomic at the cursor layer.
-        if let Some(first) = overflow_head {
-            let _ = self.free_overflow_chain(cx, first);
+        // It doesn't fit! We must delete the old cell and balance.
+        header.cell_count =
+            u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "interior cell count exceeds u16 range".to_owned(),
+            })?;
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "interior content offset exceeds u32 range".to_owned(),
+            })?;
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            header.write(page_bytes, header_offset);
+            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
-        Err(FrankenError::internal(
-            "interior replacement requires rebalance; refusing partial update",
-        ))
+
+        self.pager.write_page_data(cx, page_no, page_data)?;
+
+        // Free the OLD overflow chain since we are discarding the old cell.
+        if let Some(first) = old_overflow {
+            self.free_overflow_chain(cx, first)?;
+        }
+
+        // Now we must insert `new_cell` at `cell_idx`, which will trigger a structural rebalance.
+        self.balance_for_insert(cx, &new_cell, cell_idx)?;
+
+        Ok(true)
     }
 
     fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
@@ -2658,23 +2673,47 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
 
                 // Replace the interior key first so failures do not lose both keys.
-                cursor.replace_interior_cell(cx, &successor_key)?;
+                let rebalanced = cursor.replace_interior_cell(cx, &successor_key)?;
 
-                // The duplicate successor still exists as the next logical entry
-                // in the right subtree. Walk there from the interior replacement
-                // site instead of re-seeking, which would land back on the new
-                // interior separator.
-                let successor_found = cursor.advance_next(cx)?;
-                if !successor_found || cursor.at_eof {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "duplicate successor missing after interior replacement".to_owned(),
-                    });
-                }
-                let duplicate_successor = cursor.payload(cx)?;
-                if duplicate_successor != successor_key {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "interior delete advanced to wrong successor duplicate".to_owned(),
-                    });
+                if rebalanced {
+                    // The replacement triggered a rebalance on the interior node, which
+                    // invalidated the cursor stack. We must re-seek to the successor key
+                    // to find the duplicate leaf entry.
+                    let seek_res = cursor.index_seek(cx, &successor_key)?;
+                    if !seek_res.is_found() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "duplicate successor missing after interior rebalance".to_owned(),
+                        });
+                    }
+                    
+                    let top_after_seek = cursor.stack.last().expect("cursor stack empty").clone();
+                    if !top_after_seek.header.page_type.is_leaf() {
+                        // The seek found the interior node separator we just inserted.
+                        // We must advance to the next logical entry to reach the duplicate in the leaf.
+                        let successor_found = cursor.advance_next(cx)?;
+                        if !successor_found || cursor.at_eof {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "duplicate leaf successor missing after interior rebalance".to_owned(),
+                            });
+                        }
+                    }
+                } else {
+                    // The duplicate successor still exists as the next logical entry
+                    // in the right subtree. Walk there from the interior replacement
+                    // site instead of re-seeking, which would land back on the new
+                    // interior separator.
+                    let successor_found = cursor.advance_next(cx)?;
+                    if !successor_found || cursor.at_eof {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "duplicate successor missing after interior replacement".to_owned(),
+                        });
+                    }
+                    let duplicate_successor = cursor.payload(cx)?;
+                    if duplicate_successor != successor_key {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "interior delete advanced to wrong successor duplicate".to_owned(),
+                        });
+                    }
                 }
 
                 // Remove the duplicate leaf successor.
