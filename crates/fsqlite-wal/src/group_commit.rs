@@ -206,6 +206,17 @@ pub struct ConsolidationMetrics {
     pub flusher_commits: AtomicU64,
     /// Count of commits that took waiter role.
     pub waiter_commits: AtomicU64,
+    // ── Full commit path phase timing ──
+    /// Phase A: prepare under inner.lock (microseconds).
+    pub commit_phase_a_us_total: AtomicU64,
+    /// Phase B: WAL group commit (microseconds).
+    pub commit_phase_b_us_total: AtomicU64,
+    /// Phase C1: post-commit metadata under inner.lock (microseconds).
+    pub commit_phase_c1_us_total: AtomicU64,
+    /// Phase C2: publish to snapshot plane (microseconds).
+    pub commit_phase_c2_us_total: AtomicU64,
+    /// Total commits with phase timing recorded.
+    pub commit_phase_count: AtomicU64,
 }
 
 impl ConsolidationMetrics {
@@ -233,6 +244,11 @@ impl ConsolidationMetrics {
             waiter_epoch_wait_us_total: AtomicU64::new(0),
             flusher_commits: AtomicU64::new(0),
             waiter_commits: AtomicU64::new(0),
+            commit_phase_a_us_total: AtomicU64::new(0),
+            commit_phase_b_us_total: AtomicU64::new(0),
+            commit_phase_c1_us_total: AtomicU64::new(0),
+            commit_phase_c2_us_total: AtomicU64::new(0),
+            commit_phase_count: AtomicU64::new(0),
         }
     }
 
@@ -302,6 +318,25 @@ impl ConsolidationMetrics {
         }
     }
 
+    /// Record full commit path phase timing.
+    pub fn record_commit_phases(
+        &self,
+        phase_a_us: u64,
+        phase_b_us: u64,
+        phase_c1_us: u64,
+        phase_c2_us: u64,
+    ) {
+        self.commit_phase_a_us_total
+            .fetch_add(phase_a_us, Ordering::Relaxed);
+        self.commit_phase_b_us_total
+            .fetch_add(phase_b_us, Ordering::Relaxed);
+        self.commit_phase_c1_us_total
+            .fetch_add(phase_c1_us, Ordering::Relaxed);
+        self.commit_phase_c2_us_total
+            .fetch_add(phase_c2_us, Ordering::Relaxed);
+        self.commit_phase_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> ConsolidationMetricsSnapshot {
@@ -332,6 +367,11 @@ impl ConsolidationMetrics {
             waiter_epoch_wait_us_total: self.waiter_epoch_wait_us_total.load(Ordering::Relaxed),
             flusher_commits: self.flusher_commits.load(Ordering::Relaxed),
             waiter_commits: self.waiter_commits.load(Ordering::Relaxed),
+            commit_phase_a_us_total: self.commit_phase_a_us_total.load(Ordering::Relaxed),
+            commit_phase_b_us_total: self.commit_phase_b_us_total.load(Ordering::Relaxed),
+            commit_phase_c1_us_total: self.commit_phase_c1_us_total.load(Ordering::Relaxed),
+            commit_phase_c2_us_total: self.commit_phase_c2_us_total.load(Ordering::Relaxed),
+            commit_phase_count: self.commit_phase_count.load(Ordering::Relaxed),
         }
     }
 
@@ -360,6 +400,11 @@ impl ConsolidationMetrics {
         self.waiter_epoch_wait_us_total.store(0, Ordering::Relaxed);
         self.flusher_commits.store(0, Ordering::Relaxed);
         self.waiter_commits.store(0, Ordering::Relaxed);
+        self.commit_phase_a_us_total.store(0, Ordering::Relaxed);
+        self.commit_phase_b_us_total.store(0, Ordering::Relaxed);
+        self.commit_phase_c1_us_total.store(0, Ordering::Relaxed);
+        self.commit_phase_c2_us_total.store(0, Ordering::Relaxed);
+        self.commit_phase_count.store(0, Ordering::Relaxed);
     }
 }
 
@@ -392,6 +437,12 @@ pub struct ConsolidationMetricsSnapshot {
     pub waiter_epoch_wait_us_total: u64,
     pub flusher_commits: u64,
     pub waiter_commits: u64,
+    // Full commit path phases
+    pub commit_phase_a_us_total: u64,
+    pub commit_phase_b_us_total: u64,
+    pub commit_phase_c1_us_total: u64,
+    pub commit_phase_c2_us_total: u64,
+    pub commit_phase_count: u64,
 }
 
 impl ConsolidationMetricsSnapshot {
@@ -523,7 +574,12 @@ impl ConsolidationMetricsSnapshot {
              ├─ wal_append: {}µs\n\
              └─ wal_sync: {}µs (total WAL I/O: {}µs)\n\
              waiter path ({} commits):\n\
-             └─ epoch_wait: {}µs",
+             └─ epoch_wait: {}µs\n\
+             full commit path ({} commits):\n\
+             ├─ phase_A (prepare+inner.lock): {}µs\n\
+             ├─ phase_B (group_commit): {}µs\n\
+             ├─ phase_C1 (post-commit+inner.lock): {}µs\n\
+             └─ phase_C2 (publish): {}µs",
             total,
             self.flusher_commits,
             self.waiter_commits,
@@ -539,6 +595,19 @@ impl ConsolidationMetricsSnapshot {
             avg_append + avg_sync,
             self.waiter_commits,
             avg_epoch_wait,
+            self.commit_phase_count,
+            self.commit_phase_a_us_total
+                .checked_div(self.commit_phase_count)
+                .unwrap_or(0),
+            self.commit_phase_b_us_total
+                .checked_div(self.commit_phase_count)
+                .unwrap_or(0),
+            self.commit_phase_c1_us_total
+                .checked_div(self.commit_phase_count)
+                .unwrap_or(0),
+            self.commit_phase_c2_us_total
+                .checked_div(self.commit_phase_count)
+                .unwrap_or(0),
         )
     }
 }

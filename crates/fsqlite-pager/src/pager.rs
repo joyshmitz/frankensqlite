@@ -3312,7 +3312,8 @@ where
                             })?;
                             inner_lock_wait_us = Instant::now()
                                 .duration_since(t_inner_lock_start)
-                                .as_micros() as u64;
+                                .as_micros()
+                                as u64;
 
                             let t_excl_start = Instant::now();
                             inner.db_file.lock(cx, LockLevel::Exclusive)?;
@@ -3324,16 +3325,16 @@ where
                                 with_wal_backend(wal_backend, |wal| {
                                     wal.append_frames(cx, &frame_refs)
                                 })?;
-                                wal_append_us = Instant::now()
-                                    .duration_since(t_append_start)
-                                    .as_micros() as u64;
+                                wal_append_us =
+                                    Instant::now().duration_since(t_append_start).as_micros()
+                                        as u64;
 
                                 if sync_policy.should_sync_on_commit() {
                                     let t_sync_start = Instant::now();
                                     with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-                                    wal_sync_us = Instant::now()
-                                        .duration_since(t_sync_start)
-                                        .as_micros() as u64;
+                                    wal_sync_us =
+                                        Instant::now().duration_since(t_sync_start).as_micros()
+                                            as u64;
                                     GLOBAL_CONSOLIDATION_METRICS
                                         .fsyncs_total
                                         .fetch_add(1, AtomicOrdering::Relaxed);
@@ -3380,15 +3381,21 @@ where
                                 u64::try_from(frame_count).unwrap_or(u64::MAX),
                                 AtomicOrdering::Relaxed,
                             );
-                            GLOBAL_CONSOLIDATION_METRICS.max_group_size_observed.fetch_max(
-                                u64::try_from(frame_count).unwrap_or(u64::MAX),
-                                AtomicOrdering::Relaxed,
-                            );
+                            GLOBAL_CONSOLIDATION_METRICS
+                                .max_group_size_observed
+                                .fetch_max(
+                                    u64::try_from(frame_count).unwrap_or(u64::MAX),
+                                    AtomicOrdering::Relaxed,
+                                );
 
                             // Record phase timing for flusher
                             GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
                                 if is_first_iteration { prepare_us } else { 0 },
-                                if is_first_iteration { consolidator_lock_wait_us } else { 0 },
+                                if is_first_iteration {
+                                    consolidator_lock_wait_us
+                                } else {
+                                    0
+                                },
                                 flushing_wait_us,
                                 true, // is_flusher
                                 arrival_wait_us,
@@ -3931,6 +3938,9 @@ where
         // serialization from N*100us to N*20us + 50us + 10us.
         // =====================================================================
 
+        // ── Full commit path timing instrumentation ──
+        let t_commit_start = Instant::now();
+
         // Phase A: Prepare write_set under inner lock (~20us)
         // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
         let mut inner = self
@@ -4011,6 +4021,8 @@ where
             }
         }
 
+        let t_phase_a_done = Instant::now();
+
         // Phase B: Commit via WAL or journal
         // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
         // threads can start their Phase A (prepare) while we wait for
@@ -4052,9 +4064,10 @@ where
             )
         };
 
+        let t_phase_b_done = Instant::now();
+
         if commit_result.is_ok() {
             // Phase C1 (FAST, under inner.lock): Update metadata only.
-            // Minimize time under inner.lock — 16 threads serialize here.
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
@@ -4073,16 +4086,29 @@ where
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
-
-            // DROP inner.lock BEFORE publish — eliminates double-serialization.
-            // Previously: inner.lock + publish_lock held simultaneously = convoy.
-            // Now: inner.lock released first, publish_lock acquired independently.
             drop(inner);
 
+            let t_phase_c1_done = Instant::now();
+
             // Phase C2 (outside inner.lock): Publish to snapshot plane.
-            // This acquires publish_lock but no longer under inner.lock,
-            // so other threads can do Phase C1 while we publish.
             self.publish_committed_state(cx, publish_update);
+
+            let t_phase_c2_done = Instant::now();
+
+            // Record full commit path timing.
+            if self.journal_mode == JournalMode::Wal {
+                let phase_a_us =
+                    t_phase_a_done.duration_since(t_commit_start).as_micros() as u64;
+                let phase_b_us =
+                    t_phase_b_done.duration_since(t_phase_a_done).as_micros() as u64;
+                let phase_c1_us =
+                    t_phase_c1_done.duration_since(t_phase_b_done).as_micros() as u64;
+                let phase_c2_us =
+                    t_phase_c2_done.duration_since(t_phase_c1_done).as_micros() as u64;
+                GLOBAL_CONSOLIDATION_METRICS.record_commit_phases(
+                    phase_a_us, phase_b_us, phase_c1_us, phase_c2_us,
+                );
+            }
 
             // WAL readers prefer the published snapshot plane or WAL backend,
             // so copying committed pages into the shared cache is wasted work.
