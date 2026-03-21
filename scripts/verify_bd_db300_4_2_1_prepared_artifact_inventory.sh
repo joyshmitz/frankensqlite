@@ -156,9 +156,10 @@ REF_SCHEMA_INVALIDATION="$(find_line_ref "crates/fsqlite-core/src/connection.rs"
 REF_COMPILE_CACHE="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'fn compile_with_cache')"
 REF_REWRITE_SUBQUERY="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'fn rewrite_subquery_statement')"
 REF_DEFERRED_QUERY_CLONE="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'deferred_query_statement: Some\(Arc::new\(statement\.clone\(\)\)\)')"
-REF_DML_AST_CLONE="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'dml_statement: Some\(Arc::new\(statement\.clone\(\)\)\)')"
+REF_DML_AST_CLONE="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'PreparedDmlDispatch::Deferred\(Arc::new\(statement\.clone\(\)\)\)')"
+REF_PREPARED_DML_FAST_PATH="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'if stmt\.dispatch_precompiled_program\(\)\.is_some\(\)')"
 REF_PREPARED_QUERY_REDISPATCH="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'if let Some\(statement\) = &self\.deferred_query_statement')"
-REF_PREPARED_DML_REDISPATCH="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'self\.execute_statement_impl\(dml\.as_ref\(\), p, stmt\.dispatch_precompiled_program\(\)\)\?')"
+REF_PREPARED_DML_REDISPATCH="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'if let Some\(dml\) = stmt\.deferred_dml_statement\(\)')"
 REF_DISTINCT_LIMIT_CLONE="$(find_line_ref "crates/fsqlite-core/src/connection.rs" 'let mut unbounded = select\.clone\(\)')"
 
 emit_event "scan_code" "pass" "pass" "resolved code references for prepared-artifact churn sites"
@@ -184,6 +185,7 @@ jq -n \
   --arg ref_rewrite_subquery "${REF_REWRITE_SUBQUERY}" \
   --arg ref_deferred_query_clone "${REF_DEFERRED_QUERY_CLONE}" \
   --arg ref_dml_ast_clone "${REF_DML_AST_CLONE}" \
+  --arg ref_prepared_dml_fast_path "${REF_PREPARED_DML_FAST_PATH}" \
   --arg ref_prepared_query_redispatch "${REF_PREPARED_QUERY_REDISPATCH}" \
   --arg ref_prepared_dml_redispatch "${REF_PREPARED_DML_REDISPATCH}" \
   --arg ref_distinct_limit_clone "${REF_DISTINCT_LIMIT_CLONE}" \
@@ -218,7 +220,7 @@ jq -n \
     inventory: [
       {
         rank: 1,
-        label: "prepare() canonicalizes SQL and compile_and_wrap() rebuilds prepared artifacts outside the compiled cache",
+        label: "prepare() canonicalizes SQL and compile_and_wrap() rebuilds prepared wrappers even when branch-local codegen reuses cached programs",
         code_ref: $ref_compile_and_wrap,
         supporting_refs: [
           $ref_prepare,
@@ -233,9 +235,9 @@ jq -n \
           parse_time_ns_total: $parser_metrics.parse_time_ns_total,
           compile_time_ns_total: $parser_metrics.compile_time_ns_total
         },
-        current_behavior: "prepare() always does cached_parse_single(), rewrite_subquery_statement(), statement.to_string(), and then compile_and_wrap(); compile_and_wrap() constructs a fresh PreparedStatement and does not consult compile_with_cache().",
-        why_hot: "This keeps repeated prepare() calls on stable SQL on a rebuild-only path even though the raw query()/execute() lane already has separate compiled-cache reuse. D1 still measured 440 parse misses, 410 compiled misses, 7.13 ms parse time, and 3.53 ms compile time across the authoritative mixed runs.",
-        redesign_target: "Route prepare() through reusable compiled artifacts plus explicit bind/dispatch metadata instead of rebuilding canonical prepared wrappers each time."
+        current_behavior: "prepare() still does cached_parse_single(), rewrite_subquery_statement(), statement.to_string(), and then compile_and_wrap(); compile_and_wrap() may reuse a cached VdbeProgram on some branches, but it always allocates a fresh PreparedStatement wrapper plus per-shape dispatch metadata or placeholder state.",
+        why_hot: "Repeated prepare() calls on stable SQL still rebuild wrapper state around the cached or placeholder program, so the prepared lane keeps churn that raw query()/execute() can sometimes skip. D1 still measured 440 parse misses, 410 compiled misses, 7.13 ms parse time, and 3.53 ms compile time across the authoritative mixed runs.",
+        redesign_target: "Route prepare() through reusable prepared artifacts with stable bind/dispatch metadata instead of reconstructing wrapper state on every prepare."
       },
       {
         rank: 2,
@@ -261,6 +263,7 @@ jq -n \
         label: "Prepared DML keeps cloned Statement ASTs and only partially reuses compiled programs",
         code_ref: $ref_dml_ast_clone,
         supporting_refs: [
+          $ref_prepared_dml_fast_path,
           $ref_prepared_dml_redispatch
         ],
         lifecycle_stage: "prepared_dml_fallback",
@@ -271,8 +274,8 @@ jq -n \
           compile_time_ns_total: $parser_metrics.compile_time_ns_total,
           parser_ast_churn_avg_overhead_pct: $parser_ast_churn.avg_overhead_pct
         },
-        current_behavior: "Simple VALUES-style INSERT gets a compiled program but still stores a cloned Statement; complex INSERT, UPDATE, and DELETE prepare placeholder programs plus cloned ASTs and later re-enter execute_statement_impl().",
-        why_hot: "Prepared DML is only partly reusable today, so the prepared artifact still carries heavyweight AST state and many shapes fall back to the slow dispatch path instead of a stable bound-program execution path.",
+        current_behavior: "Prepared DML stores cloned ASTs inside PreparedDmlDispatch::Deferred; some INSERT/UPDATE/DELETE shapes also carry a compiled program and can take a direct-dispatch fast path, but the deferred lane still re-enters execute_statement_impl_after_background_status() for many shapes.",
+        why_hot: "Prepared DML is only partly reusable today, so the prepared artifact still carries heavyweight AST state and mixed fast-path versus deferred execution behavior instead of a uniformly stable bound-program execution path.",
         redesign_target: "Split DML prepared artifacts into reusable compiled programs plus minimal binding metadata, with explicit slow-path handling only for the shapes that truly need it."
       },
       {
