@@ -5580,6 +5580,18 @@ impl Connection {
         Ok(last_count)
     }
 
+    /// Execute zero or more SQL statements separated by semicolons.
+    ///
+    /// Empty batches and batches containing only whitespace, semicolons, or
+    /// SQL comments are treated as a no-op, matching SQLite batch semantics.
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.background_status()?;
+        if batch_is_noop(sql)? {
+            return Ok(());
+        }
+        self.execute(sql).map(|_| ())
+    }
+
     /// Prepare and execute SQL with bound SQL parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
         self.background_status()?;
@@ -33847,6 +33859,70 @@ fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
     }
 
     Ok(statements)
+}
+
+fn batch_is_noop(sql: &str) -> Result<bool> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' | b' ' | b'\t' | b'\r' | b'\n' => {
+                i += 1;
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let comment_start = i;
+                i += 2;
+                let mut terminated = false;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return Err(FrankenError::ParseError {
+                        offset: comment_start,
+                        detail: "unterminated block comment".to_owned(),
+                    });
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    Ok(true)
+}
+
+#[cfg(test)]
+mod batch_execution_tests {
+    use super::*;
+
+    #[test]
+    fn execute_batch_treats_empty_and_comment_only_sql_as_noop() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch("").unwrap();
+        conn.execute_batch("   ;  ;  ").unwrap();
+        conn.execute_batch("  -- nothing here\n/* still empty */ ; ")
+            .unwrap();
+    }
+
+    #[test]
+    fn execute_batch_rejects_unterminated_block_comment() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .execute_batch("/* unterminated")
+            .expect_err("unterminated block comments should not be treated as empty batches");
+        assert!(matches!(error, FrankenError::ParseError { offset: 0, .. }));
+    }
 }
 
 fn quote_identifier(identifier: &str) -> String {

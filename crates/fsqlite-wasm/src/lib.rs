@@ -154,7 +154,7 @@ impl FrankenDb {
 
     #[wasm_bindgen(js_name = executeBatch)]
     pub fn execute_batch(&self, sql: &str) -> Result<(), JsValue> {
-        self.with_connection(|conn| conn.execute(sql).map(|_| ()))
+        self.with_connection(|conn| conn.execute_batch(sql))
     }
 
     #[wasm_bindgen(js_name = executeWithParams)]
@@ -759,6 +759,20 @@ mod tests {
     }
 
     #[test]
+    fn franken_db_execute_batch_allows_empty_and_comment_only_input_on_host() {
+        let _guard = host_connection_test_guard();
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute_batch("").expect("empty batch should be a no-op");
+        db.execute_batch("  -- nothing here\n/* still empty */ ; ")
+            .expect("comment-only batch should be a no-op");
+        assert_eq!(
+            db.execute("SELECT 1")
+                .expect("database should remain usable after no-op batches"),
+            1
+        );
+    }
+
+    #[test]
     fn js_safe_integer_boundaries_match_bigint_cutover() {
         assert!(is_js_safe_integer(MAX_SAFE_INTEGER));
         assert!(is_js_safe_integer(MIN_SAFE_INTEGER));
@@ -912,6 +926,19 @@ mod wasm_tests {
         assert_eq!(rows.length(), 3);
         let second_row = rows.get(1).unchecked_into::<Array>();
         assert_eq!(second_row.get(1).as_string().as_deref(), Some("delta"));
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_execute_batch_allows_empty_and_comment_only_input() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute_batch("").expect("empty batch should be a no-op");
+        db.execute_batch("  -- nothing here\n/* still empty */ ; ")
+            .expect("comment-only batch should be a no-op");
+        assert_eq!(
+            db.execute("SELECT 1")
+                .expect("database should remain usable after no-op batches"),
+            1
+        );
     }
 
     #[wasm_bindgen_test]
