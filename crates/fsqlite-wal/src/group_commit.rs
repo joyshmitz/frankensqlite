@@ -180,6 +180,8 @@ pub struct ConsolidationMetrics {
     pub wait_duration_us_total: AtomicU64,
     /// Maximum group size observed.
     pub max_group_size_observed: AtomicU64,
+    /// Total busy retries during flush (exponential backoff).
+    pub busy_retries: AtomicU64,
 }
 
 impl ConsolidationMetrics {
@@ -194,6 +196,7 @@ impl ConsolidationMetrics {
             flush_duration_us_total: AtomicU64::new(0),
             wait_duration_us_total: AtomicU64::new(0),
             max_group_size_observed: AtomicU64::new(0),
+            busy_retries: AtomicU64::new(0),
         }
     }
 
@@ -218,6 +221,11 @@ impl ConsolidationMetrics {
             .fetch_add(duration_us, Ordering::Relaxed);
     }
 
+    /// Record a flush retry triggered by a transient busy error.
+    pub fn record_busy_retry(&self) {
+        self.busy_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> ConsolidationMetricsSnapshot {
@@ -229,6 +237,7 @@ impl ConsolidationMetrics {
             flush_duration_us_total: self.flush_duration_us_total.load(Ordering::Relaxed),
             wait_duration_us_total: self.wait_duration_us_total.load(Ordering::Relaxed),
             max_group_size_observed: self.max_group_size_observed.load(Ordering::Relaxed),
+            busy_retries: self.busy_retries.load(Ordering::Relaxed),
         }
     }
 
@@ -241,6 +250,7 @@ impl ConsolidationMetrics {
         self.flush_duration_us_total.store(0, Ordering::Relaxed);
         self.wait_duration_us_total.store(0, Ordering::Relaxed);
         self.max_group_size_observed.store(0, Ordering::Relaxed);
+        self.busy_retries.store(0, Ordering::Relaxed);
     }
 }
 
@@ -260,6 +270,7 @@ pub struct ConsolidationMetricsSnapshot {
     pub flush_duration_us_total: u64,
     pub wait_duration_us_total: u64,
     pub max_group_size_observed: u64,
+    pub busy_retries: u64,
 }
 
 impl ConsolidationMetricsSnapshot {
@@ -304,7 +315,7 @@ impl std::fmt::Display for ConsolidationMetricsSnapshot {
         write!(
             f,
             "groups={} frames={} txns={} fsyncs={} avg_group={} \
-             avg_flush_us={} max_group={} reduction={}x",
+             avg_flush_us={} max_group={} busy_retries={} reduction={}x",
             self.groups_flushed,
             self.frames_consolidated,
             self.transactions_batched,
@@ -312,6 +323,7 @@ impl std::fmt::Display for ConsolidationMetricsSnapshot {
             self.avg_group_size(),
             self.avg_flush_duration_us(),
             self.max_group_size_observed,
+            self.busy_retries,
             self.fsync_reduction_ratio(),
         )
     }
@@ -855,7 +867,6 @@ mod tests {
         .unwrap();
         c.begin_flush().unwrap();
         c.abort_flush().unwrap();
-
         assert_eq!(c.phase(), ConsolidationPhase::Complete);
         assert_eq!(c.completed_epoch(), 1);
 
@@ -869,6 +880,7 @@ mod tests {
         assert_eq!(outcome, SubmitOutcome::Flusher);
         assert_eq!(c.phase(), ConsolidationPhase::Filling);
         assert_eq!(c.pending_batch_count(), 1);
+        assert_eq!(c.epoch(), 1);
     }
 
     // ── Consolidated write tests ──
@@ -1058,6 +1070,8 @@ mod tests {
         m.record_flush(10, 3, 500);
         m.record_flush(20, 5, 1000);
         m.record_wait(100);
+        m.record_busy_retry();
+        m.record_busy_retry();
 
         let snap = m.snapshot();
         assert_eq!(snap.groups_flushed, 2);
@@ -1067,6 +1081,7 @@ mod tests {
         assert_eq!(snap.flush_duration_us_total, 1500);
         assert_eq!(snap.wait_duration_us_total, 100);
         assert_eq!(snap.max_group_size_observed, 20);
+        assert_eq!(snap.busy_retries, 2);
         assert_eq!(snap.avg_group_size(), 15);
         assert_eq!(snap.avg_transactions_per_group(), 4);
         assert_eq!(snap.avg_flush_duration_us(), 750);
@@ -1077,20 +1092,24 @@ mod tests {
     fn test_consolidation_metrics_reset() {
         let m = ConsolidationMetrics::new();
         m.record_flush(10, 3, 500);
+        m.record_busy_retry();
         m.reset();
         let snap = m.snapshot();
         assert_eq!(snap.groups_flushed, 0);
         assert_eq!(snap.frames_consolidated, 0);
+        assert_eq!(snap.busy_retries, 0);
     }
 
     #[test]
     fn test_consolidation_metrics_display() {
         let m = ConsolidationMetrics::new();
         m.record_flush(10, 5, 500);
+        m.record_busy_retry();
         let s = m.snapshot().to_string();
         assert!(s.contains("groups=1"));
         assert!(s.contains("frames=10"));
         assert!(s.contains("txns=5"));
+        assert!(s.contains("busy_retries=1"));
         assert!(s.contains("reduction=5x"));
     }
 

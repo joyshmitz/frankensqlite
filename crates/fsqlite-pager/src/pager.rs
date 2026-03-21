@@ -3244,32 +3244,69 @@ where
                     AtomicOrdering::Relaxed,
                 );
 
-                // Acquire inner.lock() briefly for WAL I/O.
-                let flush_result = (|| -> Result<()> {
-                    let mut inner = inner_arc
-                        .lock()
-                        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                // D1-CRITICAL: Retry with exponential backoff on Busy errors.
+                // Under high concurrency, transient lock contention can cause
+                // Busy errors that resolve after a brief delay.
+                const MAX_FLUSH_RETRIES: u32 = 10;
+                let mut flush_result: Result<()> = Ok(());
 
-                    // WAL mode: No EXCLUSIVE lock needed. WAL allows concurrent
-                    // readers while writer appends frames. The wal_backend mutex
-                    // serializes writers, and MVCC handles reader isolation.
-                    // EXCLUSIVE is only needed during checkpoint.
+                for attempt in 0..MAX_FLUSH_RETRIES {
+                    // Acquire inner.lock() briefly for WAL I/O.
+                    flush_result = (|| -> Result<()> {
+                        let mut inner = inner_arc.lock().map_err(|_| {
+                            FrankenError::internal("SimpleTransaction lock poisoned")
+                        })?;
 
-                    // Write all frames in one consolidated I/O.
-                    with_wal_backend(wal_backend, |wal| wal.append_frames(cx, &frame_refs))?;
+                        // D1-CRITICAL (bd-3wop3.8): Acquire EXCLUSIVE lock for WAL write.
+                        // Even in WAL mode, EXCLUSIVE prevents checkpoint from starting
+                        // while we're appending frames. Without this, there's a race:
+                        // 1. Flusher starts appending frames
+                        // 2. Checkpoint starts and acquires EXCLUSIVE
+                        // 3. Flusher's WAL write conflicts with checkpoint
+                        // The retry loop handles transient Busy from lock contention.
+                        inner.db_file.lock(cx, LockLevel::Exclusive)?;
 
-                    // Single fsync for the entire batch.
-                    if sync_policy.should_sync_on_commit() {
-                        with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-                        GLOBAL_CONSOLIDATION_METRICS
-                            .fsyncs_total
-                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        // Write all frames in one consolidated I/O.
+                        with_wal_backend(wal_backend, |wal| wal.append_frames(cx, &frame_refs))?;
+
+                        // Single fsync for the entire batch.
+                        if sync_policy.should_sync_on_commit() {
+                            with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
+                            GLOBAL_CONSOLIDATION_METRICS
+                                .fsyncs_total
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+
+                        // Update db_size to reflect all committed transactions.
+                        inner.db_size = final_db_size;
+
+                        // Downgrade from EXCLUSIVE back to RESERVED to allow readers
+                        // and other writers to proceed while we finalize.
+                        inner.db_file.unlock(cx, LockLevel::Reserved)?;
+                        Ok(())
+                    })();
+
+                    match &flush_result {
+                        Ok(()) => break,
+                        Err(FrankenError::Busy)
+                        | Err(FrankenError::BusyRecovery)
+                        | Err(FrankenError::BusySnapshot { .. }) => {
+                            if attempt + 1 < MAX_FLUSH_RETRIES {
+                                // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 512ms
+                                let base_delay_ms = 1u64 << attempt;
+                                // Add jitter (0-50% of base) using nanoseconds for variance
+                                let jitter_nanos =
+                                    std::time::Instant::now().elapsed().subsec_nanos() as u64;
+                                let jitter_ms = jitter_nanos % (base_delay_ms / 2).max(1);
+                                let delay_ms = base_delay_ms.saturating_add(jitter_ms);
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                                GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
+                                continue;
+                            }
+                        }
+                        Err(_) => break, // Non-retryable error, exit loop
                     }
-
-                    // Update db_size to reflect all committed transactions.
-                    inner.db_size = final_db_size;
-                    Ok(())
-                })();
+                }
 
                 match flush_result {
                     Ok(()) => {
@@ -7353,6 +7390,22 @@ mod tests {
         }
     }
 
+    struct FailingGroupCommitWalBackend {
+        append_frames_calls: SharedCounter,
+    }
+
+    impl FailingGroupCommitWalBackend {
+        fn new() -> (Self, SharedCounter) {
+            let append_frames_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            (
+                Self {
+                    append_frames_calls: StdArc::clone(&append_frames_calls),
+                },
+                append_frames_calls,
+            )
+        }
+    }
+
     struct PreparedBatchObservedWalBackend {
         frames: SharedFrames,
         append_frames_calls: SharedCounter,
@@ -8263,6 +8316,74 @@ mod tests {
         }
     }
 
+    impl crate::traits::WalBackend for FailingGroupCommitWalBackend {
+        fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            Ok(())
+        }
+
+        fn append_frame(
+            &mut self,
+            _cx: &Cx,
+            _page_number: u32,
+            _page_data: &[u8],
+            _db_size_if_commit: u32,
+        ) -> fsqlite_error::Result<()> {
+            Err(FrankenError::internal(
+                "forced single-frame group commit failure",
+            ))
+        }
+
+        fn append_frames(
+            &mut self,
+            _cx: &Cx,
+            _frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<()> {
+            let mut append_frames_calls = self.append_frames_calls.lock().unwrap();
+            *append_frames_calls += 1;
+            drop(append_frames_calls);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Err(FrankenError::internal(
+                "forced batched group commit append failure",
+            ))
+        }
+
+        fn read_page(
+            &mut self,
+            _cx: &Cx,
+            _page_number: u32,
+        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
+            Ok(0)
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            0
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+            Ok(crate::traits::CheckpointResult {
+                total_frames: 0,
+                frames_backfilled: 0,
+                completed: true,
+                wal_was_reset: false,
+            })
+        }
+    }
+
     impl crate::traits::WalBackend for PreparedBatchObservedWalBackend {
         fn append_frame(
             &mut self,
@@ -8894,6 +9015,85 @@ mod tests {
             frames.lock().unwrap().len(),
             2,
             "bead_id={BEAD_ID} case=wal_sync_policy_per_commit_appends_wal_frames"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_flush_failure_wakes_waiters_with_error() {
+        for attempt in 0..32 {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from(format!("/wal_group_commit_failure_waiter_{attempt}.db"));
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+            let cx = Cx::new();
+            let (backend, append_frames_calls) = FailingGroupCommitWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::Deferred)
+                .unwrap();
+
+            let inner = Arc::clone(&pager.inner);
+            let wal_backend = Arc::clone(&pager.wal_backend);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let pool = pager.pool.clone();
+            let start = StdArc::new(std::sync::Barrier::new(3));
+
+            let spawn_commit = |page_number: u32, fill: u8| {
+                let inner = Arc::clone(&inner);
+                let wal_backend = Arc::clone(&wal_backend);
+                let queue = Arc::clone(&queue);
+                let pool = pool.clone();
+                let start = StdArc::clone(&start);
+                std::thread::spawn(move || {
+                    let cx = Cx::new();
+                    let page_no = PageNumber::new(page_number).unwrap();
+                    let page =
+                        StagedPage::from_bytes(&pool, &vec![fill; pool.page_size()]).unwrap();
+                    let mut write_set = HashMap::new();
+                    write_set.insert(page_no, page);
+                    let write_pages_sorted = vec![page_no];
+                    start.wait();
+                    SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                        &cx,
+                        &wal_backend,
+                        &inner,
+                        &write_set,
+                        &write_pages_sorted,
+                        &queue,
+                    )
+                })
+            };
+
+            let writer_a = spawn_commit(2, 0x11);
+            let writer_b = spawn_commit(3, 0x22);
+            start.wait();
+
+            let result_a = writer_a.join().unwrap();
+            let result_b = writer_b.join().unwrap();
+            let append_call_count = *append_frames_calls.lock().unwrap();
+            if append_call_count != 1 {
+                continue;
+            }
+
+            let error_a = result_a.expect_err("flusher should observe append failure");
+            let error_b = result_b.expect_err("waiter should observe propagated failure");
+            let error_a = error_a.to_string();
+            let error_b = error_b.to_string();
+            assert!(
+                error_a.contains("forced batched group commit append failure")
+                    || error_b.contains("forced batched group commit append failure"),
+                "bead_id={BEAD_ID} case=group_commit_flusher_reports_backend_failure error_a={error_a} error_b={error_b}"
+            );
+            assert!(
+                error_a.contains("group commit flush failed")
+                    || error_b.contains("group commit flush failed"),
+                "bead_id={BEAD_ID} case=group_commit_waiter_reports_epoch_failure error_a={error_a} error_b={error_b}"
+            );
+            return;
+        }
+
+        panic!(
+            "bead_id={BEAD_ID} case=group_commit_flush_failure_wakes_waiters could not coalesce flusher+waiter in allotted attempts"
         );
     }
 
