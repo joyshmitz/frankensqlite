@@ -389,12 +389,12 @@ jq -n \
     ],
     next_step_candidates: [
       {
-        bead_id: "bd-db300.4.2.2",
-        reason: "Redesign one prepared-artifact lifecycle around reuse using the ranked churn inventory above."
+        bead_id: "bd-db300.4.2.3",
+        reason: "Verify the landed prepared-template reuse path against the ranked churn inventory above, including invalidation correctness and attributable churn reduction."
       },
       {
         bead_id: "bd-db300.4.3.1",
-        reason: "Allocator pressure still dominates, so any D2 reuse redesign should coordinate with D3 scratch/arena ownership work."
+        reason: "Allocator pressure still dominates, so the next remaining prepared-artifact follow-up should stay coordinated with D3 scratch/arena ownership work."
       }
     ]
   }
