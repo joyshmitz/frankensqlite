@@ -3197,17 +3197,11 @@ where
                 .duration_since(t_consolidator_lock_start)
                 .as_micros() as u64;
 
-            // Wait if currently FLUSHING (another thread is writing frames).
-            let t_flushing_wait_start = Instant::now();
-            while consolidator.phase() == ConsolidationPhase::Flushing {
-                consolidator = queue
-                    .flush_complete
-                    .wait(consolidator)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            let flushing_wait = Instant::now()
-                .duration_since(t_flushing_wait_start)
-                .as_micros() as u64;
+            // ── Epoch pipelining: NO waiting during FLUSHING ──
+            // The consolidator now accepts submissions during FLUSHING,
+            // queuing them for the next epoch. This eliminates the
+            // flushing_wait bottleneck that was 1-2.7ms at 16 threads.
+            let flushing_wait = 0u64; // No longer blocks
 
             // Record epoch BEFORE submit (begin_flush will increment it).
             let epoch = consolidator.epoch();
@@ -3316,28 +3310,40 @@ where
 
                         // Write all frames in one consolidated I/O.
                         let t_append_start = Instant::now();
-                        with_wal_backend(wal_backend, |wal| wal.append_frames(cx, &frame_refs))?;
-                        wal_append_us =
-                            Instant::now().duration_since(t_append_start).as_micros() as u64;
+                        let flush_io_result = (|| -> Result<()> {
+                            with_wal_backend(wal_backend, |wal| {
+                                wal.append_frames(cx, &frame_refs)
+                            })?;
+                            wal_append_us =
+                                Instant::now().duration_since(t_append_start).as_micros() as u64;
 
-                        // Single fsync for the entire batch.
-                        if sync_policy.should_sync_on_commit() {
-                            let t_sync_start = Instant::now();
-                            with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-                            wal_sync_us =
-                                Instant::now().duration_since(t_sync_start).as_micros() as u64;
-                            GLOBAL_CONSOLIDATION_METRICS
-                                .fsyncs_total
-                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            // Single fsync for the entire batch.
+                            if sync_policy.should_sync_on_commit() {
+                                let t_sync_start = Instant::now();
+                                with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
+                                wal_sync_us =
+                                    Instant::now().duration_since(t_sync_start).as_micros() as u64;
+                                GLOBAL_CONSOLIDATION_METRICS
+                                    .fsyncs_total
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+
+                            // Update db_size to reflect all committed transactions.
+                            inner.db_size = final_db_size;
+                            Ok(())
+                        })();
+
+                        let restore_result = inner.db_file.unlock(cx, LockLevel::Reserved);
+                        match (flush_io_result, restore_result) {
+                            (Ok(()), Ok(())) => Ok(()),
+                            (Err(flush_error), Ok(())) => Err(flush_error),
+                            (Ok(()), Err(restore_error)) => Err(restore_error),
+                            (Err(flush_error), Err(restore_error)) => {
+                                Err(FrankenError::internal(format!(
+                                    "group commit flush failed and could not restore RESERVED lock: flush={flush_error}; restore={restore_error}"
+                                )))
+                            }
                         }
-
-                        // Update db_size to reflect all committed transactions.
-                        inner.db_size = final_db_size;
-
-                        // Downgrade from EXCLUSIVE back to RESERVED to allow readers
-                        // and other writers to proceed while we finalize.
-                        inner.db_file.unlock(cx, LockLevel::Reserved)?;
-                        Ok(())
                     })();
 
                     match &flush_result {
@@ -9177,6 +9183,48 @@ mod tests {
 
         panic!(
             "bead_id={BEAD_ID} case=group_commit_flush_failure_wakes_waiters could not coalesce flusher+waiter in allotted attempts"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_flush_failure_restores_reserved_lock_level() {
+        let vfs = BlockingObservedLockVfs::new();
+        let observed_lock_level = vfs.observed_lock_level();
+        let path = PathBuf::from("/wal_group_commit_failure_restores_reserved.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, _append_frames_calls) = FailingGroupCommitWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        pager
+            .set_wal_commit_sync_policy(WalCommitSyncPolicy::Deferred)
+            .unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0x77; PageSize::DEFAULT.as_usize()])
+            .unwrap();
+
+        let error = txn.commit(&cx).expect_err(
+            "failing WAL backend should surface a group commit error instead of committing",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("forced batched group commit append failure"),
+            "bead_id={BEAD_ID} case=group_commit_failure_surfaces_backend_error error={error}"
+        );
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::Reserved,
+            "bead_id={BEAD_ID} case=group_commit_failure_restores_writer_lock_after_exclusive_error"
+        );
+
+        drop(txn);
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::None,
+            "bead_id={BEAD_ID} case=group_commit_failure_drop_releases_retained_writer_lock"
         );
     }
 
