@@ -59,6 +59,10 @@ struct GroupCommitQueue {
     /// Atomic epoch counter for lock-free waiter polling.
     /// Updated by flusher after complete_flush(), read by waiters.
     completed_epoch: AtomicU64,
+    /// Epoch of the most recent failed flush, if any.
+    failed_epoch: AtomicU64,
+    /// Error message published by the flusher for failed epochs.
+    failed_error: Mutex<Option<String>>,
 }
 
 impl GroupCommitQueue {
@@ -67,6 +71,8 @@ impl GroupCommitQueue {
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
+            failed_epoch: AtomicU64::new(0),
+            failed_error: Mutex::new(None),
         }
     }
 
@@ -76,9 +82,51 @@ impl GroupCommitQueue {
         self.flush_complete.notify_all();
     }
 
+    /// Publish a failed epoch and wake all waiters.
+    fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError) {
+        self.failed_epoch.store(epoch, AtomicOrdering::Release);
+        let mut failed_error = self
+            .failed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failed_error = Some(error.to_string());
+        drop(failed_error);
+        self.flush_complete.notify_all();
+    }
+
     /// Check if a given epoch has completed (for waiters).
     fn is_epoch_complete(&self, epoch: u64) -> bool {
         self.completed_epoch.load(AtomicOrdering::Acquire) >= epoch
+    }
+
+    /// Wait for the target epoch to either complete successfully or fail.
+    fn wait_for_epoch_outcome(
+        &self,
+        mut guard: std::sync::MutexGuard<'_, GroupCommitConsolidator>,
+        target_epoch: u64,
+    ) -> Result<()> {
+        loop {
+            if self.is_epoch_complete(target_epoch) {
+                return Ok(());
+            }
+
+            if self.failed_epoch.load(AtomicOrdering::Acquire) >= target_epoch {
+                let detail = self
+                    .failed_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .unwrap_or_else(|| "group commit flush failed".to_owned());
+                return Err(FrankenError::internal(format!(
+                    "group commit flush failed for epoch {target_epoch}: {detail}"
+                )));
+            }
+
+            guard = self
+                .flush_complete
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -775,11 +823,13 @@ fn insert_staged_page(
     }
 }
 
+#[cfg(test)]
 struct WalCommitBatch<'a> {
     new_db_size: u32,
     frames: Vec<traits::WalFrameRef<'a>>,
 }
 
+#[cfg(test)]
 fn collect_wal_commit_batch<'a>(
     current_db_size: u32,
     write_set: &'a HashMap<PageNumber, StagedPage>,
@@ -822,8 +872,8 @@ fn collect_wal_commit_batch<'a>(
 
 /// Build a [`TransactionFrameBatch`] with OWNED frame data for group commit.
 ///
-/// Unlike [`collect_wal_commit_batch`] which borrows page data, this function
-/// clones each page's bytes into the batch. This is necessary for group commit
+/// Unlike the borrowed-frame helper used by unit tests, this function clones
+/// each page's bytes into the batch. This is necessary for group commit
 /// because the batch must outlive the caller's write_set while waiting for the
 /// flusher to write all batched frames.
 ///
@@ -1221,22 +1271,6 @@ impl PublishedPagerState {
         self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
 
         self.pages.remove(page_no);
-        let page_set_size = self.pages.len();
-
-        self.finalize_publish(cx, update, page_set_size, start);
-    }
-
-    /// Publish metadata and retain only pages with page_no <= max_page.
-    fn publish_retain_up_to(&self, cx: &Cx, update: PublishedPagerUpdate, max_page: u32) {
-        let _publish_guard = self
-            .publish_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
-
-        self.pages.retain(|page_no| page_no.get() <= max_page);
         let page_set_size = self.pages.len();
 
         self.finalize_publish(cx, update, page_set_size, start);
@@ -3084,48 +3118,6 @@ where
 
         Ok(())
     }
-    /// Commit using the WAL protocol (append frames to WAL file).
-    fn commit_wal(
-        cx: &Cx,
-        wal_backend: &SharedWalBackend,
-        inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, StagedPage>,
-        write_pages_sorted: &[PageNumber],
-    ) -> Result<()> {
-        if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
-        {
-            let mut prepared_batch =
-                with_wal_backend(wal_backend, |wal| wal.prepare_append_frames(&batch.frames))?;
-            if let Some(prepared_batch) = prepared_batch.as_mut() {
-                with_wal_backend(wal_backend, |wal| {
-                    wal.finalize_prepared_frames(cx, prepared_batch)
-                })?;
-            }
-
-            // Escalate to EXCLUSIVE before writing WAL frames.
-            // This prevents concurrent processes from appending to the WAL
-            // simultaneously, which would cause corruption.
-            inner.db_file.lock(cx, LockLevel::Exclusive)?;
-
-            if let Some(prepared_batch) = prepared_batch.as_mut() {
-                with_wal_backend(wal_backend, |wal| {
-                    wal.append_prepared_frames(cx, prepared_batch)
-                })?;
-            } else {
-                with_wal_backend(wal_backend, |wal| wal.append_frames(cx, &batch.frames))?;
-            }
-
-            if inner.wal_commit_sync_policy.should_sync_on_commit() {
-                with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-            }
-
-            // Update db_size for any new pages.
-            inner.db_size = batch.new_db_size;
-        }
-
-        Ok(())
-    }
-
     /// Commit using the WAL protocol with group commit batching.
     ///
     /// This method implements the group commit pattern (D1: bd-3wop3.1) which
@@ -3217,12 +3209,13 @@ where
                 }
 
                 // Transition to FLUSHING phase and take all pending batches.
-                let batches = {
+                let (batches, flush_epoch) = {
                     let mut consolidator = queue
                         .consolidator
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    consolidator.begin_flush()?
+                    let batches = consolidator.begin_flush()?;
+                    (batches, consolidator.epoch())
                 };
 
                 // Build WalFrameRef slice from all batches.
@@ -3254,7 +3247,7 @@ where
                 );
 
                 // Acquire inner.lock() briefly for WAL I/O.
-                {
+                let flush_result = (|| -> Result<()> {
                     let mut inner = inner_arc
                         .lock()
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
@@ -3275,34 +3268,55 @@ where
 
                     // Update db_size to reflect all committed transactions.
                     inner.db_size = final_db_size;
-                }
+                    Ok(())
+                })();
 
-                // Update more metrics.
-                GLOBAL_CONSOLIDATION_METRICS
-                    .groups_flushed
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                GLOBAL_CONSOLIDATION_METRICS.frames_consolidated.fetch_add(
-                    u64::try_from(frame_count).unwrap_or(u64::MAX),
-                    AtomicOrdering::Relaxed,
-                );
-                GLOBAL_CONSOLIDATION_METRICS
-                    .max_group_size_observed
-                    .fetch_max(
-                        u64::try_from(frame_count).unwrap_or(u64::MAX),
-                        AtomicOrdering::Relaxed,
-                    );
+                match flush_result {
+                    Ok(()) => {
+                        // Update more metrics.
+                        GLOBAL_CONSOLIDATION_METRICS
+                            .groups_flushed
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        GLOBAL_CONSOLIDATION_METRICS.frames_consolidated.fetch_add(
+                            u64::try_from(frame_count).unwrap_or(u64::MAX),
+                            AtomicOrdering::Relaxed,
+                        );
+                        GLOBAL_CONSOLIDATION_METRICS
+                            .max_group_size_observed
+                            .fetch_max(
+                                u64::try_from(frame_count).unwrap_or(u64::MAX),
+                                AtomicOrdering::Relaxed,
+                            );
 
-                // Complete flush and notify all waiters.
-                let completed_epoch = {
-                    let mut consolidator = queue
-                        .consolidator
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    consolidator.complete_flush()?;
-                    consolidator.epoch()
+                        // Complete flush and notify all waiters.
+                        let completed_epoch = {
+                            let mut consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            consolidator.complete_flush()?;
+                            consolidator.epoch()
+                        };
+
+                        queue.publish_completed_epoch(completed_epoch);
+                    }
+                    Err(error) => {
+                        let abort_result = {
+                            let mut consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            consolidator.abort_flush()
+                        };
+                        queue.publish_failed_epoch(flush_epoch, &error);
+                        if let Err(abort_error) = abort_result {
+                            return Err(FrankenError::internal(format!(
+                                "group commit flush failed for epoch {flush_epoch} and abort_flush also failed: flush={error}; abort={abort_error}"
+                            )));
+                        }
+                        return Err(error);
+                    }
                 };
-
-                queue.publish_completed_epoch(completed_epoch);
             }
 
             SubmitOutcome::Waiter => {
@@ -3320,13 +3334,7 @@ where
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                while !queue.is_epoch_complete(target_epoch) {
-                    guard = queue
-                        .flush_complete
-                        .wait(guard)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
-                drop(guard);
+                queue.wait_for_epoch_outcome(guard, target_epoch)?;
 
                 // The flusher already updated inner.db_size.
                 // Our frames are now durable in the WAL.
