@@ -591,6 +591,12 @@ pub struct GroupCommitConsolidator {
     epoch: u64,
     /// Number of completed flush results awaiting pickup by waiters.
     completed_epoch: u64,
+    /// Epoch pipelining: batches submitted during FLUSHING phase, queued
+    /// for the next epoch. This eliminates the flushing_wait bottleneck —
+    /// threads never block waiting for a flush to complete.
+    next_epoch_batches: VecDeque<TransactionFrameBatch>,
+    /// Total frames across next_epoch_batches.
+    next_epoch_frame_count: usize,
 }
 
 impl GroupCommitConsolidator {
@@ -606,6 +612,8 @@ impl GroupCommitConsolidator {
             filling_started: None,
             epoch: 0,
             completed_epoch: 0,
+            next_epoch_batches: VecDeque::new(),
+            next_epoch_frame_count: 0,
         }
     }
 
@@ -642,10 +650,25 @@ impl GroupCommitConsolidator {
     ///
     /// Returns `Err` if the consolidator is in an unexpected phase.
     pub fn submit_batch(&mut self, batch: TransactionFrameBatch) -> Result<SubmitOutcome> {
+        // ── Epoch pipelining: accept submissions during FLUSHING ──
+        // Instead of blocking, queue batches for the next epoch. This
+        // eliminates the flushing_wait bottleneck entirely — threads
+        // never block waiting for a flush to complete.
         if self.phase == ConsolidationPhase::Flushing {
-            return Err(FrankenError::Internal(
-                "cannot submit during FLUSHING phase; wait for COMPLETE".to_owned(),
-            ));
+            self.next_epoch_frame_count += batch.frame_count();
+            self.next_epoch_batches.push_back(batch);
+
+            trace!(
+                target: "fsqlite_wal::group_commit",
+                epoch = self.epoch,
+                next_epoch_frames = self.next_epoch_frame_count,
+                next_epoch_batches = self.next_epoch_batches.len(),
+                "batch pipelined for next epoch (submitted during FLUSHING)"
+            );
+
+            // Always a Waiter — the next epoch's flusher will be elected
+            // when complete_flush() promotes these batches.
+            return Ok(SubmitOutcome::Waiter);
         }
 
         // If we're in COMPLETE, transition to new FILLING epoch.
@@ -751,7 +774,10 @@ impl GroupCommitConsolidator {
     /// # Errors
     ///
     /// Returns `Err` if not in FLUSHING phase.
-    pub fn complete_flush(&mut self) -> Result<()> {
+    /// Returns `true` if pipelined batches were promoted and the caller
+    /// should flush again (the caller is the only thread that knows it
+    /// must be the flusher for the promoted epoch).
+    pub fn complete_flush(&mut self) -> Result<bool> {
         if self.phase != ConsolidationPhase::Flushing {
             return Err(FrankenError::Internal(format!(
                 "complete_flush called in {:?} phase, expected Flushing",
@@ -759,17 +785,46 @@ impl GroupCommitConsolidator {
             )));
         }
 
-        self.phase = ConsolidationPhase::Complete;
         self.completed_epoch = self.epoch;
         self.filling_started = None;
 
-        debug!(
-            target: "fsqlite_wal::group_commit",
-            epoch = self.epoch,
-            "complete_flush: FLUSHING → COMPLETE"
-        );
+        // ── Epoch pipelining: promote next-epoch batches ──
+        // If threads submitted during FLUSHING, their batches are in
+        // next_epoch_batches. Promote them to pending_batches and
+        // transition directly to FILLING (skipping COMPLETE) so the
+        // current flusher can immediately begin_flush() again.
+        if self.next_epoch_batches.is_empty() {
+            self.phase = ConsolidationPhase::Complete;
+            debug!(
+                target: "fsqlite_wal::group_commit",
+                epoch = self.epoch,
+                "complete_flush: FLUSHING → COMPLETE"
+            );
+            Ok(false)
+        } else {
+            let promoted_count = self.next_epoch_batches.len();
+            let promoted_frames = self.next_epoch_frame_count;
+            self.pending_batches = std::mem::take(&mut self.next_epoch_batches);
+            self.pending_frame_count = self.next_epoch_frame_count;
+            self.next_epoch_frame_count = 0;
+            self.phase = ConsolidationPhase::Filling;
+            self.filling_started = Some(Instant::now());
 
-        Ok(())
+            debug!(
+                target: "fsqlite_wal::group_commit",
+                epoch = self.epoch,
+                promoted_batches = promoted_count,
+                promoted_frames = promoted_frames,
+                "complete_flush: FLUSHING → FILLING (epoch pipelining)"
+            );
+            Ok(true) // Caller must flush again
+        }
+    }
+
+    /// Whether pipelined batches are waiting for the next epoch.
+    #[must_use]
+    pub fn has_pipelined_batches(&self) -> bool {
+        !self.next_epoch_batches.is_empty()
     }
 
     /// Abort the current flush after the flusher observed an I/O error.
@@ -788,14 +843,25 @@ impl GroupCommitConsolidator {
             )));
         }
 
-        self.phase = ConsolidationPhase::Complete;
-        self.completed_epoch = self.epoch;
+        // On abort, promote pipelined batches the same way as
+        // complete_flush — those transactions weren't part of the
+        // failed flush, so they should be retried in the next epoch.
+        if self.next_epoch_batches.is_empty() {
+            self.phase = ConsolidationPhase::Complete;
+        } else {
+            self.pending_batches = std::mem::take(&mut self.next_epoch_batches);
+            self.pending_frame_count = self.next_epoch_frame_count;
+            self.next_epoch_frame_count = 0;
+            self.phase = ConsolidationPhase::Filling;
+            self.filling_started = Some(Instant::now());
+        }
         self.filling_started = None;
 
         debug!(
             target: "fsqlite_wal::group_commit",
             epoch = self.epoch,
-            "abort_flush: FLUSHING → COMPLETE"
+            "abort_flush: FLUSHING → {:?}",
+            self.phase
         );
 
         Ok(())
