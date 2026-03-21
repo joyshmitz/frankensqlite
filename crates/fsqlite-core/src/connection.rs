@@ -16300,13 +16300,19 @@ impl Connection {
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
-        let (commit_result, committed_write) = {
+        //
+        // Stock SQLite applies the busy handler during COMMIT lock escalation,
+        // not just at BEGIN time. We mirror that by retrying on Busy with the
+        // same spin-loop backoff used in begin_pager_txn_with_busy_timeout().
+        let committed_write = {
             let concurrent_commit_plan = if is_concurrent_txn && txn_has_pending_writes {
                 self.plan_concurrent_commit(&pending_conflict_pages)?
             } else {
                 None
             };
-            let commit_res = {
+
+            // First attempt — fast path, no timing overhead.
+            let mut commit_res = {
                 let mut txn_guard = self.active_txn.borrow_mut();
                 if let Some(txn) = txn_guard.as_mut() {
                     txn.commit(cx)
@@ -16314,6 +16320,35 @@ impl Connection {
                     Ok(())
                 }
             };
+
+            // Busy-retry loop for commit-path lock escalation.
+            if matches!(commit_res, Err(FrankenError::Busy)) {
+                let busy_timeout_ms =
+                    self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                if busy_timeout_ms > 0 {
+                    let deadline = Duration::from_millis(busy_timeout_ms);
+                    let started = Instant::now();
+                    let mut handoff = BeginBusyRetryHandoff::default();
+
+                    loop {
+                        let Some(wait) = handoff.next_wait(started, deadline) else {
+                            break; // timeout expired — propagate the Busy below
+                        };
+                        perform_begin_busy_retry_handoff(wait);
+                        commit_res = {
+                            let mut txn_guard = self.active_txn.borrow_mut();
+                            if let Some(txn) = txn_guard.as_mut() {
+                                txn.commit(cx)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        if !matches!(commit_res, Err(FrankenError::Busy)) {
+                            break;
+                        }
+                    }
+                }
+            }
 
             if matches!(commit_res, Ok(())) {
                 if let Some(plan) = concurrent_commit_plan {
@@ -16329,10 +16364,9 @@ impl Connection {
                 }
             }
 
-            (commit_res, txn_has_pending_writes)
+            commit_res?;
+            txn_has_pending_writes
         };
-
-        commit_result?;
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
