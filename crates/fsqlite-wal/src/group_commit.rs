@@ -182,6 +182,30 @@ pub struct ConsolidationMetrics {
     pub max_group_size_observed: AtomicU64,
     /// Total busy retries during flush (exponential backoff).
     pub busy_retries: AtomicU64,
+
+    // ── Phase timing instrumentation ──
+    /// Time building batch before entering consolidator (microseconds).
+    pub prepare_us_total: AtomicU64,
+    /// Time waiting to acquire consolidator.lock() (microseconds).
+    pub consolidator_lock_wait_us_total: AtomicU64,
+    /// Time waiting while consolidator phase == FLUSHING (microseconds).
+    pub consolidator_flushing_wait_us_total: AtomicU64,
+    /// Time flusher spends waiting for more batches (microseconds).
+    pub flusher_arrival_wait_us_total: AtomicU64,
+    /// Time waiting to acquire inner.lock() (microseconds).
+    pub inner_lock_wait_us_total: AtomicU64,
+    /// Time acquiring EXCLUSIVE file lock (microseconds).
+    pub exclusive_lock_us_total: AtomicU64,
+    /// Time in WAL append_frames (microseconds).
+    pub wal_append_us_total: AtomicU64,
+    /// Time in WAL sync/fsync (microseconds).
+    pub wal_sync_us_total: AtomicU64,
+    /// Time waiters spend waiting for epoch completion (microseconds).
+    pub waiter_epoch_wait_us_total: AtomicU64,
+    /// Count of commits that took flusher role.
+    pub flusher_commits: AtomicU64,
+    /// Count of commits that took waiter role.
+    pub waiter_commits: AtomicU64,
 }
 
 impl ConsolidationMetrics {
@@ -197,6 +221,18 @@ impl ConsolidationMetrics {
             wait_duration_us_total: AtomicU64::new(0),
             max_group_size_observed: AtomicU64::new(0),
             busy_retries: AtomicU64::new(0),
+            // Phase timing
+            prepare_us_total: AtomicU64::new(0),
+            consolidator_lock_wait_us_total: AtomicU64::new(0),
+            consolidator_flushing_wait_us_total: AtomicU64::new(0),
+            flusher_arrival_wait_us_total: AtomicU64::new(0),
+            inner_lock_wait_us_total: AtomicU64::new(0),
+            exclusive_lock_us_total: AtomicU64::new(0),
+            wal_append_us_total: AtomicU64::new(0),
+            wal_sync_us_total: AtomicU64::new(0),
+            waiter_epoch_wait_us_total: AtomicU64::new(0),
+            flusher_commits: AtomicU64::new(0),
+            waiter_commits: AtomicU64::new(0),
         }
     }
 
@@ -226,6 +262,46 @@ impl ConsolidationMetrics {
         self.busy_retries.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record phase timing for a commit operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_phase_timing(
+        &self,
+        prepare_us: u64,
+        consolidator_lock_wait_us: u64,
+        consolidator_flushing_wait_us: u64,
+        is_flusher: bool,
+        flusher_arrival_wait_us: u64,
+        inner_lock_wait_us: u64,
+        exclusive_lock_us: u64,
+        wal_append_us: u64,
+        wal_sync_us: u64,
+        waiter_epoch_wait_us: u64,
+    ) {
+        self.prepare_us_total
+            .fetch_add(prepare_us, Ordering::Relaxed);
+        self.consolidator_lock_wait_us_total
+            .fetch_add(consolidator_lock_wait_us, Ordering::Relaxed);
+        self.consolidator_flushing_wait_us_total
+            .fetch_add(consolidator_flushing_wait_us, Ordering::Relaxed);
+        if is_flusher {
+            self.flusher_arrival_wait_us_total
+                .fetch_add(flusher_arrival_wait_us, Ordering::Relaxed);
+            self.inner_lock_wait_us_total
+                .fetch_add(inner_lock_wait_us, Ordering::Relaxed);
+            self.exclusive_lock_us_total
+                .fetch_add(exclusive_lock_us, Ordering::Relaxed);
+            self.wal_append_us_total
+                .fetch_add(wal_append_us, Ordering::Relaxed);
+            self.wal_sync_us_total
+                .fetch_add(wal_sync_us, Ordering::Relaxed);
+            self.flusher_commits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.waiter_epoch_wait_us_total
+                .fetch_add(waiter_epoch_wait_us, Ordering::Relaxed);
+            self.waiter_commits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Take a point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> ConsolidationMetricsSnapshot {
@@ -238,6 +314,24 @@ impl ConsolidationMetrics {
             wait_duration_us_total: self.wait_duration_us_total.load(Ordering::Relaxed),
             max_group_size_observed: self.max_group_size_observed.load(Ordering::Relaxed),
             busy_retries: self.busy_retries.load(Ordering::Relaxed),
+            // Phase timing
+            prepare_us_total: self.prepare_us_total.load(Ordering::Relaxed),
+            consolidator_lock_wait_us_total: self
+                .consolidator_lock_wait_us_total
+                .load(Ordering::Relaxed),
+            consolidator_flushing_wait_us_total: self
+                .consolidator_flushing_wait_us_total
+                .load(Ordering::Relaxed),
+            flusher_arrival_wait_us_total: self
+                .flusher_arrival_wait_us_total
+                .load(Ordering::Relaxed),
+            inner_lock_wait_us_total: self.inner_lock_wait_us_total.load(Ordering::Relaxed),
+            exclusive_lock_us_total: self.exclusive_lock_us_total.load(Ordering::Relaxed),
+            wal_append_us_total: self.wal_append_us_total.load(Ordering::Relaxed),
+            wal_sync_us_total: self.wal_sync_us_total.load(Ordering::Relaxed),
+            waiter_epoch_wait_us_total: self.waiter_epoch_wait_us_total.load(Ordering::Relaxed),
+            flusher_commits: self.flusher_commits.load(Ordering::Relaxed),
+            waiter_commits: self.waiter_commits.load(Ordering::Relaxed),
         }
     }
 
@@ -251,6 +345,21 @@ impl ConsolidationMetrics {
         self.wait_duration_us_total.store(0, Ordering::Relaxed);
         self.max_group_size_observed.store(0, Ordering::Relaxed);
         self.busy_retries.store(0, Ordering::Relaxed);
+        // Phase timing
+        self.prepare_us_total.store(0, Ordering::Relaxed);
+        self.consolidator_lock_wait_us_total
+            .store(0, Ordering::Relaxed);
+        self.consolidator_flushing_wait_us_total
+            .store(0, Ordering::Relaxed);
+        self.flusher_arrival_wait_us_total
+            .store(0, Ordering::Relaxed);
+        self.inner_lock_wait_us_total.store(0, Ordering::Relaxed);
+        self.exclusive_lock_us_total.store(0, Ordering::Relaxed);
+        self.wal_append_us_total.store(0, Ordering::Relaxed);
+        self.wal_sync_us_total.store(0, Ordering::Relaxed);
+        self.waiter_epoch_wait_us_total.store(0, Ordering::Relaxed);
+        self.flusher_commits.store(0, Ordering::Relaxed);
+        self.waiter_commits.store(0, Ordering::Relaxed);
     }
 }
 
@@ -271,6 +380,18 @@ pub struct ConsolidationMetricsSnapshot {
     pub wait_duration_us_total: u64,
     pub max_group_size_observed: u64,
     pub busy_retries: u64,
+    // Phase timing (all in microseconds)
+    pub prepare_us_total: u64,
+    pub consolidator_lock_wait_us_total: u64,
+    pub consolidator_flushing_wait_us_total: u64,
+    pub flusher_arrival_wait_us_total: u64,
+    pub inner_lock_wait_us_total: u64,
+    pub exclusive_lock_us_total: u64,
+    pub wal_append_us_total: u64,
+    pub wal_sync_us_total: u64,
+    pub waiter_epoch_wait_us_total: u64,
+    pub flusher_commits: u64,
+    pub waiter_commits: u64,
 }
 
 impl ConsolidationMetricsSnapshot {
@@ -307,6 +428,118 @@ impl ConsolidationMetricsSnapshot {
         self.transactions_batched
             .checked_div(self.fsyncs_total)
             .unwrap_or(0)
+    }
+
+    /// Total commits (flusher + waiter).
+    #[must_use]
+    pub fn total_commits(&self) -> u64 {
+        self.flusher_commits.saturating_add(self.waiter_commits)
+    }
+
+    /// Average prepare time per commit (microseconds).
+    #[must_use]
+    pub fn avg_prepare_us(&self) -> u64 {
+        self.prepare_us_total
+            .checked_div(self.total_commits())
+            .unwrap_or(0)
+    }
+
+    /// Average consolidator lock wait per commit (microseconds).
+    #[must_use]
+    pub fn avg_consolidator_lock_wait_us(&self) -> u64 {
+        self.consolidator_lock_wait_us_total
+            .checked_div(self.total_commits())
+            .unwrap_or(0)
+    }
+
+    /// Average WAL I/O time per flusher (microseconds).
+    #[must_use]
+    pub fn avg_wal_io_us(&self) -> u64 {
+        self.wal_append_us_total
+            .saturating_add(self.wal_sync_us_total)
+            .checked_div(self.flusher_commits)
+            .unwrap_or(0)
+    }
+
+    /// Average waiter epoch wait time (microseconds).
+    #[must_use]
+    pub fn avg_waiter_wait_us(&self) -> u64 {
+        self.waiter_epoch_wait_us_total
+            .checked_div(self.waiter_commits)
+            .unwrap_or(0)
+    }
+
+    /// Generate detailed phase timing report.
+    #[must_use]
+    pub fn phase_timing_report(&self) -> String {
+        let total = self.total_commits();
+        if total == 0 {
+            return "no commits".to_string();
+        }
+
+        // Calculate per-commit averages
+        let avg_prepare = self.avg_prepare_us();
+        let avg_consol_lock = self.avg_consolidator_lock_wait_us();
+        let avg_flushing_wait = self
+            .consolidator_flushing_wait_us_total
+            .checked_div(total)
+            .unwrap_or(0);
+
+        // Flusher-only metrics (per flusher)
+        let avg_arrival_wait = self
+            .flusher_arrival_wait_us_total
+            .checked_div(self.flusher_commits)
+            .unwrap_or(0);
+        let avg_inner_lock = self
+            .inner_lock_wait_us_total
+            .checked_div(self.flusher_commits)
+            .unwrap_or(0);
+        let avg_excl_lock = self
+            .exclusive_lock_us_total
+            .checked_div(self.flusher_commits)
+            .unwrap_or(0);
+        let avg_append = self
+            .wal_append_us_total
+            .checked_div(self.flusher_commits)
+            .unwrap_or(0);
+        let avg_sync = self
+            .wal_sync_us_total
+            .checked_div(self.flusher_commits)
+            .unwrap_or(0);
+
+        // Waiter-only metrics
+        let avg_epoch_wait = self.avg_waiter_wait_us();
+
+        format!(
+            "commits: {} (flusher={}, waiter={})\n\
+             per-commit avg:\n\
+             ├─ prepare: {}µs\n\
+             ├─ consolidator_lock_wait: {}µs\n\
+             ├─ flushing_wait: {}µs\n\
+             flusher path ({} commits):\n\
+             ├─ arrival_wait: {}µs\n\
+             ├─ inner_lock_wait: {}µs\n\
+             ├─ exclusive_lock: {}µs\n\
+             ├─ wal_append: {}µs\n\
+             └─ wal_sync: {}µs (total WAL I/O: {}µs)\n\
+             waiter path ({} commits):\n\
+             └─ epoch_wait: {}µs",
+            total,
+            self.flusher_commits,
+            self.waiter_commits,
+            avg_prepare,
+            avg_consol_lock,
+            avg_flushing_wait,
+            self.flusher_commits,
+            avg_arrival_wait,
+            avg_inner_lock,
+            avg_excl_lock,
+            avg_append,
+            avg_sync,
+            avg_append + avg_sync,
+            self.waiter_commits,
+            avg_epoch_wait,
+        )
     }
 }
 

@@ -4231,7 +4231,7 @@ impl Connection {
     /// (passed as filter args) and a residual predicate (evaluated post-scan).
     fn plan_live_vtab_scan(
         &self,
-        table_name: &str,
+        src: &JoinTableSource,
         where_clause: Option<&Expr>,
         col_map: &[(String, String, bool)],
     ) -> Result<LiveVtabScanPlan> {
@@ -4244,7 +4244,12 @@ impl Connection {
             let mut terms: Vec<&Expr> = Vec::new();
             flatten_and_terms(where_expr, &mut terms);
             for term in terms {
-                if let Some(candidate) = extract_live_vtab_constraint_candidate(term, col_map) {
+                if let Some(candidate) = extract_live_vtab_constraint_candidate(
+                    term,
+                    col_map,
+                    &src.table_name,
+                    src.alias.as_deref(),
+                ) {
                     candidates.push(candidate);
                 } else {
                     residual_terms.push(term.clone());
@@ -4259,9 +4264,9 @@ impl Connection {
 
         {
             let instances = self.vtab_instances.borrow();
-            let key = table_name.to_ascii_uppercase();
+            let key = src.table_name.to_ascii_uppercase();
             let instance = instances.get(&key).ok_or_else(|| {
-                FrankenError::Internal(format!("virtual table not found: {table_name}"))
+                FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
             })?;
             instance.best_index(&mut info)?;
         }
@@ -4386,9 +4391,9 @@ impl Connection {
     fn build_fts5_aux_context_for_source(
         &self,
         src: &JoinTableSource,
-        plan: &LiveVtabScanPlan,
-    ) -> Result<Option<(String, Fts5AuxTableContext)>> {
-        if plan.idx_num != 1 || plan.args.is_empty() {
+        queries: &[String],
+    ) -> Result<Option<Fts5AuxTableContext>> {
+        if queries.is_empty() {
             return Ok(None);
         }
 
@@ -4401,19 +4406,15 @@ impl Connection {
             return Ok(None);
         };
 
-        let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
         let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-        let query_terms = fts5.query_terms_for_queries(&query_refs).map_err(|error| {
-            FrankenError::function_error(format!("fts5 query failed: {error}"))
-        })?;
-        let table_label = src.alias.clone().unwrap_or_else(|| src.table_name.clone());
-        Ok(Some((
-            table_label,
-            Fts5AuxTableContext {
-                index: fts5.index().clone(),
-                query_terms,
-            },
-        )))
+        let query_terms = fts5
+            .query_terms_for_queries(&query_refs)
+            .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))?;
+        Ok(Some(Fts5AuxTableContext {
+            index: fts5.index().clone(),
+            query_terms,
+            row_table_label: src.alias.clone().unwrap_or_else(|| src.table_name.clone()),
+        }))
     }
 
     fn reset_statement_change_count(&self) {
@@ -24287,11 +24288,8 @@ impl Connection {
         let mut live_vtab_primary_scan = None;
         let live_vtab_where_override = if self.has_live_vtab_instance(&table_sources[0].table_name)
         {
-            let live_plan = self.plan_live_vtab_scan(
-                &table_sources[0].table_name,
-                where_clause.as_deref(),
-                &col_map,
-            )?;
+            let live_plan =
+                self.plan_live_vtab_scan(&table_sources[0], where_clause.as_deref(), &col_map)?;
             live_vtab_primary_scan = Some(live_plan);
             Some(
                 live_vtab_primary_scan
@@ -24301,17 +24299,21 @@ impl Connection {
         } else {
             None
         };
-        let mut fts5_aux_context = Fts5AuxContext::default();
-        if let Some(plan) = live_vtab_primary_scan.as_ref()
-            && let Some((table_label, aux_table)) =
-                self.build_fts5_aux_context_for_source(&table_sources[0], plan)?
-        {
-            fts5_aux_context.insert(table_label, aux_table);
-        }
         let effective_where_clause = live_vtab_where_override
             .as_ref()
             .map(|expr| expr.as_ref())
             .unwrap_or(where_clause.as_deref());
+        let mut fts5_aux_context = Fts5AuxContext::default();
+        for src in &table_sources {
+            let queries = collect_fts5_match_queries_for_source(
+                where_clause.as_deref(),
+                &src.table_name,
+                src.alias.as_deref(),
+            );
+            if let Some(aux_table) = self.build_fts5_aux_context_for_source(src, &queries)? {
+                fts5_aux_context.insert(src.table_name.clone(), aux_table);
+            }
+        }
         let primary_where_pushdown = effective_where_clause.and_then(|expr| {
             expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
         });
@@ -36579,6 +36581,7 @@ struct LiveVtabScanPlan {
 struct Fts5AuxTableContext {
     index: InvertedIndex,
     query_terms: Vec<String>,
+    row_table_label: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36588,7 +36591,8 @@ struct Fts5AuxContext {
 
 impl Fts5AuxContext {
     fn insert(&mut self, table_label: String, context: Fts5AuxTableContext) {
-        self.tables.insert(table_label.to_ascii_uppercase(), context);
+        self.tables
+            .insert(table_label.to_ascii_uppercase(), context);
     }
 
     fn table(&self, table_label: &str) -> Option<&Fts5AuxTableContext> {
@@ -37139,10 +37143,23 @@ fn eval_live_vtab_constant_expr(expr: &Expr) -> Option<SqliteValue> {
     }
 }
 
-fn is_vtab_table_match_operand(expr: &Expr, col_map: &[(String, String, bool)]) -> bool {
+fn is_vtab_table_match_operand(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    table_name: &str,
+    alias: Option<&str>,
+) -> bool {
     if let Expr::Column(col_ref, _) = expr
         && col_ref.table.is_none()
     {
+        if col_ref.column.eq_ignore_ascii_case(table_name) {
+            return true;
+        }
+        if let Some(alias) = alias
+            && col_ref.column.eq_ignore_ascii_case(alias)
+        {
+            return true;
+        }
         return col_map
             .iter()
             .any(|(table, _, _)| table.eq_ignore_ascii_case(&col_ref.column));
@@ -37166,6 +37183,8 @@ fn column_ref_to_vtab_constraint_column(
 fn extract_live_vtab_constraint_candidate(
     expr: &Expr,
     col_map: &[(String, String, bool)],
+    table_name: &str,
+    alias: Option<&str>,
 ) -> Option<LiveVtabConstraintCandidate> {
     match expr {
         Expr::BinaryOp {
@@ -37211,7 +37230,7 @@ fn extract_live_vtab_constraint_candidate(
             ..
         } => {
             let value = eval_live_vtab_constant_expr(pattern)?;
-            let column = if is_vtab_table_match_operand(inner, col_map) {
+            let column = if is_vtab_table_match_operand(inner, col_map, table_name, alias) {
                 0
             } else if let Expr::Column(col_ref, _) = inner.as_ref() {
                 column_ref_to_vtab_constraint_column(col_ref, col_map)?
@@ -37230,6 +37249,47 @@ fn extract_live_vtab_constraint_candidate(
         }
         _ => None,
     }
+}
+
+fn is_fts5_table_label_match(expr: &Expr, table_name: &str, alias: Option<&str>) -> bool {
+    let Expr::Column(col_ref, _) = expr else {
+        return false;
+    };
+    col_ref.table.is_none()
+        && (col_ref.column.eq_ignore_ascii_case(table_name)
+            || alias.is_some_and(|alias| col_ref.column.eq_ignore_ascii_case(alias)))
+}
+
+fn collect_fts5_match_queries_for_source(
+    where_clause: Option<&Expr>,
+    table_name: &str,
+    alias: Option<&str>,
+) -> Vec<String> {
+    let Some(where_clause) = where_clause else {
+        return Vec::new();
+    };
+
+    let mut terms = Vec::new();
+    flatten_and_terms(where_clause, &mut terms);
+
+    let mut queries = Vec::new();
+    for term in terms {
+        if let Expr::Like {
+            expr,
+            pattern,
+            op: LikeOp::Match,
+            not: false,
+            ..
+        } = term
+            && is_fts5_table_label_match(expr, table_name, alias)
+            && let Some(query) = eval_live_vtab_constant_expr(pattern)
+            && !query.is_null()
+        {
+            queries.push(query.to_text());
+        }
+    }
+
+    queries
 }
 
 fn maybe_filter_primary_join_rows(
@@ -37449,6 +37509,25 @@ fn current_fts5_visible_columns<'a>(
         .collect()
 }
 
+fn resolve_fts5_row_table_label(
+    table_label: &str,
+    col_map: &[(String, String, bool)],
+) -> Option<String> {
+    if col_map
+        .iter()
+        .any(|(table, _, _)| table.eq_ignore_ascii_case(table_label))
+    {
+        return Some(table_label.to_owned());
+    }
+
+    with_current_fts5_aux_context(|ctx_opt| {
+        ctx_opt.and_then(|ctx| {
+            ctx.table(table_label)
+                .map(|table_ctx| table_ctx.row_table_label.clone())
+        })
+    })
+}
+
 fn auto_fts5_column_index(query_terms: &[String], columns: &[&SqliteValue]) -> Option<usize> {
     if columns.is_empty() {
         return None;
@@ -37486,17 +37565,15 @@ fn eval_fts5_aux_function(
     col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     let table_label = fts5_table_label_from_args(args).ok_or_else(|| {
-        FrankenError::function_error(format!("unable to use function {name} in the requested context"))
+        FrankenError::function_error(format!(
+            "unable to use function {name} in the requested context"
+        ))
     })?;
     let FunctionArgs::List(arguments) = args else {
         return Err(FrankenError::function_error(format!(
             "unable to use function {name} in the requested context",
         )));
     };
-    let rowid = current_fts5_rowid(table_label, row, col_map).ok_or_else(|| {
-        FrankenError::function_error(format!("unable to use function {name} in the requested context"))
-    })?;
-    let visible_columns = current_fts5_visible_columns(table_label, row, col_map);
 
     with_current_fts5_aux_context(|ctx_opt| {
         let ctx = ctx_opt.ok_or_else(|| {
@@ -37509,6 +37586,14 @@ fn eval_fts5_aux_function(
                 "unable to use function {name} in the requested context",
             ))
         })?;
+        let rowid =
+            current_fts5_rowid(&table_ctx.row_table_label, row, col_map).ok_or_else(|| {
+                FrankenError::function_error(format!(
+                    "unable to use function {name} in the requested context"
+                ))
+            })?;
+        let visible_columns =
+            current_fts5_visible_columns(&table_ctx.row_table_label, row, col_map);
 
         match name {
             "bm25" => {
@@ -37633,6 +37718,7 @@ fn try_eval_fts5_aux_function(
     row: &[SqliteValue],
     col_map: &[(String, String, bool)],
 ) -> Option<Result<SqliteValue>> {
+    let _table_label = fts5_table_label_from_args(args)?;
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "bm25" | "highlight" | "snippet" => {
@@ -38390,11 +38476,9 @@ fn match_query_with_table_columns(
 ) -> bool {
     if let Expr::Column(col_ref, _) = operand_expr
         && col_ref.table.is_none()
-        && col_map
-            .iter()
-            .any(|(table, _, _)| table.eq_ignore_ascii_case(&col_ref.column))
+        && let Some(row_table_label) = resolve_fts5_row_table_label(&col_ref.column, col_map)
     {
-        let columns = collect_match_columns(&col_ref.column, row, col_map);
+        let columns = collect_match_columns(&row_table_label, row, col_map);
         return simple_match_query_with_columns(query, document, &columns);
     }
 
@@ -40728,6 +40812,459 @@ mod tests {
             Some(&SqliteValue::Text("Auth failure".into()))
         );
         assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(2)));
+    }
+
+    #[test]
+    fn test_sql_fts5_live_scan_intersects_multiple_match_constraints() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'hello world')")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (2, 'hello rust')")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (3, 'world only')")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'hello' AND docs MATCH 'world'")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+    }
+
+    #[test]
+    fn test_sql_fts5_bm25_aux_function_orders_joined_results() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, idx INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at,
+                message_id
+             )",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO messages(id, idx) VALUES (7, 2)")
+            .unwrap();
+        conn.execute("INSERT INTO messages(id, idx) VALUES (8, 8)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES (1, 'auth auth auth failure', 'best', 'codex', '/ws', '/tmp/1.jsonl', 42, 7)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES (2, 'auth failure', 'worse', 'codex', '/ws', '/tmp/2.jsonl', 43, 8)",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT fts_messages.title, messages.idx, bm25(fts_messages)
+                 FROM fts_messages
+                 LEFT JOIN messages ON fts_messages.message_id = messages.id
+                 WHERE fts_messages MATCH 'auth'
+                 ORDER BY bm25(fts_messages)
+                 LIMIT 5",
+            )
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("best".into())));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(2)));
+
+        let first_score = match rows[0].get(2) {
+            Some(SqliteValue::Float(score)) => *score,
+            other => panic!("expected real bm25 score, got {other:?}"),
+        };
+        let second_score = match rows[1].get(2) {
+            Some(SqliteValue::Float(score)) => *score,
+            other => panic!("expected real bm25 score, got {other:?}"),
+        };
+        assert!(first_score < second_score);
+    }
+
+    #[test]
+    fn test_sql_fts5_bm25_aux_function_available_when_fts_table_is_join_rhs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, idx INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                message_id
+             )",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO messages(id, idx) VALUES (7, 2)")
+            .unwrap();
+        conn.execute("INSERT INTO messages(id, idx) VALUES (8, 8)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, message_id)
+             VALUES (1, 'auth auth auth failure', 'best', 7)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, message_id)
+             VALUES (2, 'auth failure', 'worse', 8)",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT fts_messages.title, messages.idx, bm25(fts_messages)
+                 FROM messages
+                 JOIN fts_messages ON fts_messages.message_id = messages.id
+                 WHERE fts_messages MATCH 'auth'
+                 ORDER BY bm25(fts_messages)
+                 LIMIT 5",
+            )
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("best".into())));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Integer(2)));
+    }
+
+    #[test]
+    fn test_sql_fts5_aux_functions_keep_base_table_name_under_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'Rust powers search')")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT highlight(docs, 0, '[', ']') FROM docs AS d WHERE docs MATCH 'rust'")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("[Rust] powers search".into()))
+        );
+    }
+
+    #[test]
+    fn test_sql_fts5_highlight_aux_function_available_in_prepared_match_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'Rust powers search')")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT highlight(docs, 0, '[', ']') FROM docs WHERE docs MATCH 'rust'")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("[Rust] powers search".into()))
+        );
+    }
+
+    #[test]
+    fn test_sql_fts5_snippet_aux_function_available_in_prepared_match_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO docs(rowid, content) VALUES (1, 'alpha beta gamma delta epsilon zeta eta theta')",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT snippet(docs, 0, '<b>', '</b>', '...', 5)
+                 FROM docs
+                 WHERE docs MATCH 'delta'",
+            )
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        let snippet = match rows[0].get(0) {
+            Some(SqliteValue::Text(text)) => text.as_ref(),
+            other => panic!("expected snippet text, got {other:?}"),
+        };
+        assert!(snippet.contains("<b>delta</b>"));
+    }
+
+    #[test]
+    fn test_sql_fts5_cass_join_shape_with_snippet_and_source_joins() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT,
+                origin_host TEXT
+             )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER
+             )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED
+             )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES (1, 'alpha beta gamma delta epsilon zeta eta theta', 'snippet title', 'codex', '/ws', '/tmp/snippet.jsonl', 42, 1)",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT fts_messages.title,
+                        fts_messages.content,
+                        snippet(fts_messages, 0, '<b>', '</b>', '...', 24),
+                        fts_messages.agent,
+                        COALESCE(fts_messages.workspace, ''),
+                        fts_messages.source_path,
+                        CAST(fts_messages.created_at AS INTEGER),
+                        m.idx,
+                        c.source_id,
+                        c.origin_host,
+                        COALESCE(s.kind, 'local'),
+                        bm25(fts_messages)
+                 FROM fts_messages
+                 LEFT JOIN messages m ON CAST(fts_messages.message_id AS INTEGER) = m.id
+                 LEFT JOIN conversations c ON m.conversation_id = c.id
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE fts_messages MATCH 'delta'
+                 ORDER BY bm25(fts_messages), m.id
+                 LIMIT 5 OFFSET 0",
+            )
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("snippet title".into()))
+        );
+        let snippet = match rows[0].get(2) {
+            Some(SqliteValue::Text(text)) => text.as_ref(),
+            other => panic!("expected snippet text, got {other:?}"),
+        };
+        assert!(snippet.contains("<b>delta</b>"));
+        assert_eq!(rows[0].get(7), Some(&SqliteValue::Integer(0)));
+        assert_eq!(rows[0].get(8), Some(&SqliteValue::Text("local".into())));
+        assert_eq!(rows[0].get(10), Some(&SqliteValue::Text("local".into())));
+    }
+
+    #[test]
+    fn test_sql_fts5_cass_parameterized_join_shape_with_snippet_and_source_joins() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT,
+                origin_host TEXT
+             )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER
+             )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED
+             )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES (1, 'alpha beta gamma delta epsilon zeta eta theta', 'snippet title', 'codex', '/ws', '/tmp/snippet.jsonl', 42, 1)",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT fts_messages.title,
+                        fts_messages.content,
+                        snippet(fts_messages, 0, '<b>', '</b>', '...', 24),
+                        fts_messages.agent,
+                        COALESCE(fts_messages.workspace, ''),
+                        fts_messages.source_path,
+                        CAST(fts_messages.created_at AS INTEGER),
+                        m.idx,
+                        c.source_id,
+                        c.origin_host,
+                        COALESCE(s.kind, 'local'),
+                        bm25(fts_messages)
+                 FROM fts_messages
+                 LEFT JOIN messages m ON CAST(fts_messages.message_id AS INTEGER) = m.id
+                 LEFT JOIN conversations c ON m.conversation_id = c.id
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE fts_messages MATCH ?
+                 ORDER BY bm25(fts_messages), m.id
+                 LIMIT ? OFFSET ?",
+                &[
+                    SqliteValue::Text("delta".into()),
+                    SqliteValue::Integer(5),
+                    SqliteValue::Integer(0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("snippet title".into()))
+        );
+        let snippet = match rows[0].get(2) {
+            Some(SqliteValue::Text(text)) => text.as_ref(),
+            other => panic!("expected snippet text, got {other:?}"),
+        };
+        assert!(snippet.contains("<b>delta</b>"));
+        assert_eq!(rows[0].get(7), Some(&SqliteValue::Integer(0)));
+        assert_eq!(rows[0].get(8), Some(&SqliteValue::Text("local".into())));
+        assert_eq!(rows[0].get(10), Some(&SqliteValue::Text("local".into())));
+    }
+
+    #[test]
+    fn test_parallel_private_memory_fts_connections_remain_isolated() {
+        let workers = 4usize;
+        let iterations = 12usize;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for worker in 0..workers {
+                let barrier = Arc::clone(&barrier);
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    for iteration in 0..iterations {
+                        let conn = Connection::open(":memory:").unwrap();
+                        conn.execute("CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT)")
+                            .unwrap();
+                        conn.execute(
+                            "CREATE TABLE conversations (
+                                id INTEGER PRIMARY KEY,
+                                source_id TEXT,
+                                origin_host TEXT
+                             )",
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "CREATE TABLE messages (
+                                id INTEGER PRIMARY KEY,
+                                conversation_id INTEGER,
+                                idx INTEGER
+                             )",
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                                content,
+                                title,
+                                agent,
+                                workspace,
+                                source_path,
+                                created_at UNINDEXED,
+                                message_id UNINDEXED
+                             )",
+                        )
+                        .unwrap();
+                        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")
+                            .unwrap();
+                        conn.execute(
+                            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+                        )
+                        .unwrap();
+                        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")
+                            .unwrap();
+                        conn.execute(
+                            &format!(
+                                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+                                 VALUES (1, 'alpha beta gamma delta epsilon', 'worker-{worker}-iter-{iteration}', 'codex', '/ws', '/tmp/snippet.jsonl', 42, 1)"
+                            ),
+                        )
+                        .unwrap();
+
+                        let rows = conn
+                            .query_with_params(
+                                "SELECT fts_messages.title,
+                                        snippet(fts_messages, 0, '<b>', '</b>', '...', 24),
+                                        bm25(fts_messages)
+                                 FROM fts_messages
+                                 LEFT JOIN messages m ON CAST(fts_messages.message_id AS INTEGER) = m.id
+                                 LEFT JOIN conversations c ON m.conversation_id = c.id
+                                 LEFT JOIN sources s ON c.source_id = s.id
+                                 WHERE fts_messages MATCH ?
+                                 ORDER BY bm25(fts_messages), m.id
+                                 LIMIT ? OFFSET ?",
+                                &[
+                                    SqliteValue::Text("delta".into()),
+                                    SqliteValue::Integer(5),
+                                    SqliteValue::Integer(0),
+                                ],
+                            )
+                            .unwrap();
+                        assert_eq!(rows.len(), 1, "worker={worker} iteration={iteration}");
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 
     #[test]

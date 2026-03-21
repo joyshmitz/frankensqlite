@@ -186,6 +186,17 @@ fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
     )
 }
 
+fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommitQueueRef {
+    if vfs.is_memory() {
+        // Private :memory: databases are connection-local, so sharing a
+        // global queue by the synthetic "/:memory:" path would cross-wire
+        // unrelated databases. Use a fresh queue instead.
+        Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))
+    } else {
+        group_commit_queue_for_path(db_path)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalCommitSyncPolicy {
     Deferred,
@@ -1587,7 +1598,10 @@ where
             return Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
                 journal_path: Self::journal_path(&self.db_path),
-                group_commit_queue: group_commit_queue_for_path(&self.db_path),
+                group_commit_queue: group_commit_queue_for_backend(
+                    self.vfs.as_ref(),
+                    &self.db_path,
+                ),
                 inner: Arc::clone(&self.inner),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
@@ -1746,7 +1760,7 @@ where
         Ok(SimpleTransaction {
             vfs: Arc::clone(&self.vfs),
             journal_path: Self::journal_path(&self.db_path),
-            group_commit_queue: group_commit_queue_for_path(&self.db_path),
+            group_commit_queue: group_commit_queue_for_backend(self.vfs.as_ref(), &self.db_path),
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
@@ -3148,6 +3162,9 @@ where
         write_pages_sorted: &[PageNumber],
         queue: &GroupCommitQueueRef,
     ) -> Result<()> {
+        // ── Phase timing instrumentation ──
+        let t_start = Instant::now();
+
         // Step 1: Build our batch with OWNED frame data.
         // We need to read current db_size and sync policy before releasing inner.
         let (current_db_size, sync_policy) = {
@@ -3163,26 +3180,39 @@ where
                 None => return Ok(()), // Nothing to commit
             };
 
+        let t_prepare_done = Instant::now();
+        let prepare_us = t_prepare_done.duration_since(t_start).as_micros() as u64;
+
         // Step 2: Submit batch to consolidator, get Flusher or Waiter role.
         // If phase is FLUSHING, wait for current flush to complete before submitting.
-        let (outcome, our_epoch) = {
+        let t_consolidator_lock_start = Instant::now();
+        let (outcome, our_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
             let mut consolidator = queue
                 .consolidator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+            let t_lock_acquired = Instant::now();
+            let lock_wait_us = t_lock_acquired
+                .duration_since(t_consolidator_lock_start)
+                .as_micros() as u64;
+
             // Wait if currently FLUSHING (another thread is writing frames).
+            let t_flushing_wait_start = Instant::now();
             while consolidator.phase() == ConsolidationPhase::Flushing {
                 consolidator = queue
                     .flush_complete
                     .wait(consolidator)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            let flushing_wait = Instant::now()
+                .duration_since(t_flushing_wait_start)
+                .as_micros() as u64;
 
             // Record epoch BEFORE submit (begin_flush will increment it).
             let epoch = consolidator.epoch();
             let outcome = consolidator.submit_batch(batch)?;
-            (outcome, epoch)
+            (outcome, epoch, lock_wait_us, flushing_wait)
         };
 
         match outcome {
@@ -3191,6 +3221,7 @@ where
 
                 // Wait up to 50μs for more transactions to queue up.
                 // This amortizes fsync overhead across concurrent writers.
+                let t_arrival_wait_start = Instant::now();
                 let deadline = Instant::now() + Duration::from_micros(50);
                 loop {
                     let should_flush = {
@@ -3205,6 +3236,9 @@ where
                     }
                     std::hint::spin_loop();
                 }
+                let arrival_wait_us = Instant::now()
+                    .duration_since(t_arrival_wait_start)
+                    .as_micros() as u64;
 
                 // Transition to FLUSHING phase and take all pending batches.
                 let (batches, flush_epoch) = {
@@ -3250,12 +3284,23 @@ where
                 const MAX_FLUSH_RETRIES: u32 = 10;
                 let mut flush_result: Result<()> = Ok(());
 
+                // Timing accumulators for retry loop
+                let mut inner_lock_wait_us: u64 = 0;
+                let mut exclusive_lock_us: u64 = 0;
+                let mut wal_append_us: u64 = 0;
+                let mut wal_sync_us: u64 = 0;
+
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     // Acquire inner.lock() briefly for WAL I/O.
+                    let t_inner_lock_start = Instant::now();
                     flush_result = (|| -> Result<()> {
                         let mut inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
+                        let t_inner_lock_acquired = Instant::now();
+                        inner_lock_wait_us = t_inner_lock_acquired
+                            .duration_since(t_inner_lock_start)
+                            .as_micros() as u64;
 
                         // D1-CRITICAL (bd-3wop3.8): Acquire EXCLUSIVE lock for WAL write.
                         // Even in WAL mode, EXCLUSIVE prevents checkpoint from starting
@@ -3264,14 +3309,23 @@ where
                         // 2. Checkpoint starts and acquires EXCLUSIVE
                         // 3. Flusher's WAL write conflicts with checkpoint
                         // The retry loop handles transient Busy from lock contention.
+                        let t_excl_start = Instant::now();
                         inner.db_file.lock(cx, LockLevel::Exclusive)?;
+                        exclusive_lock_us =
+                            Instant::now().duration_since(t_excl_start).as_micros() as u64;
 
                         // Write all frames in one consolidated I/O.
+                        let t_append_start = Instant::now();
                         with_wal_backend(wal_backend, |wal| wal.append_frames(cx, &frame_refs))?;
+                        wal_append_us =
+                            Instant::now().duration_since(t_append_start).as_micros() as u64;
 
                         // Single fsync for the entire batch.
                         if sync_policy.should_sync_on_commit() {
+                            let t_sync_start = Instant::now();
                             with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
+                            wal_sync_us =
+                                Instant::now().duration_since(t_sync_start).as_micros() as u64;
                             GLOBAL_CONSOLIDATION_METRICS
                                 .fsyncs_total
                                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -3287,24 +3341,22 @@ where
                     })();
 
                     match &flush_result {
-                        Ok(()) => break,
-                        Err(FrankenError::Busy)
-                        | Err(FrankenError::BusyRecovery)
-                        | Err(FrankenError::BusySnapshot { .. }) => {
-                            if attempt + 1 < MAX_FLUSH_RETRIES {
-                                // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 512ms
-                                let base_delay_ms = 1u64 << attempt;
-                                // Add jitter (0-50% of base) using nanoseconds for variance
-                                let jitter_nanos =
-                                    std::time::Instant::now().elapsed().subsec_nanos() as u64;
-                                let jitter_ms = jitter_nanos % (base_delay_ms / 2).max(1);
-                                let delay_ms = base_delay_ms.saturating_add(jitter_ms);
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                                GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
-                                continue;
-                            }
+                        Err(
+                            FrankenError::Busy
+                            | FrankenError::BusyRecovery
+                            | FrankenError::BusySnapshot { .. },
+                        ) if attempt + 1 < MAX_FLUSH_RETRIES => {
+                            // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 512ms
+                            let base_delay_ms = 1u64 << attempt;
+                            // Add jitter (0-50% of base) using nanoseconds for variance
+                            let jitter_nanos =
+                                std::time::Instant::now().elapsed().subsec_nanos() as u64;
+                            let jitter_ms = jitter_nanos % (base_delay_ms / 2).max(1);
+                            let delay_ms = base_delay_ms.saturating_add(jitter_ms);
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
                         }
-                        Err(_) => break, // Non-retryable error, exit loop
+                        _ => break,
                     }
                 }
 
@@ -3324,6 +3376,20 @@ where
                                 u64::try_from(frame_count).unwrap_or(u64::MAX),
                                 AtomicOrdering::Relaxed,
                             );
+
+                        // Record phase timing for flusher
+                        GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                            prepare_us,
+                            consolidator_lock_wait_us,
+                            flushing_wait_us,
+                            true, // is_flusher
+                            arrival_wait_us,
+                            inner_lock_wait_us,
+                            exclusive_lock_us,
+                            wal_append_us,
+                            wal_sync_us,
+                            0, // waiter_epoch_wait_us (N/A for flusher)
+                        );
 
                         // Complete flush and notify all waiters.
                         let completed_epoch = {
@@ -3367,11 +3433,28 @@ where
                 // So we wait for completed_epoch >= N+1.
                 let target_epoch = our_epoch + 1;
 
+                let t_waiter_start = Instant::now();
                 let guard = queue
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 queue.wait_for_epoch_outcome(guard, target_epoch)?;
+                let waiter_epoch_wait_us =
+                    Instant::now().duration_since(t_waiter_start).as_micros() as u64;
+
+                // Record phase timing for waiter
+                GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                    prepare_us,
+                    consolidator_lock_wait_us,
+                    flushing_wait_us,
+                    false, // is_flusher
+                    0,     // arrival_wait_us (N/A for waiter)
+                    0,     // inner_lock_wait_us (N/A for waiter)
+                    0,     // exclusive_lock_us (N/A for waiter)
+                    0,     // wal_append_us (N/A for waiter)
+                    0,     // wal_sync_us (N/A for waiter)
+                    waiter_epoch_wait_us,
+                );
 
                 // The flusher already updated inner.db_size.
                 // Our frames are now durable in the WAL.
