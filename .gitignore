@@ -238,3 +238,4 @@ tmp_rch_probe/
 # Session extension binary test artifacts
 __CHANGESET__
 __PATCHSET__
+.codex-target-arc/
