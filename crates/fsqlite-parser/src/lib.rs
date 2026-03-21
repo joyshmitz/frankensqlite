@@ -22,7 +22,5 @@ pub use semantic::{
     SemanticError, SemanticErrorKind, SemanticMetricsSnapshot, TableDef as SemanticTableDef,
     reset_semantic_metrics, semantic_metrics_snapshot,
 };
-#[cfg(test)]
-mod semantic_test_hack;
 
 pub use token::{Token, TokenKind};

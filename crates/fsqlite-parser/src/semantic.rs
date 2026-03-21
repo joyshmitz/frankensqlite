@@ -876,46 +876,33 @@ impl<'a> Resolver<'a> {
                 }
                 if !output_cols.is_empty() {
                     post_select_scope.add_alias("<output>", "<output>", Some(output_cols));
+                } else {
+                    post_select_scope.add_alias("<output>", "<output>", None);
                 }
 
-                // Resolve GROUP BY.
                 for expr in group_by {
                     self.resolve_expr(expr, &post_select_scope);
                 }
-
-                // Resolve HAVING.
-                if let Some(having_expr) = having {
-                    self.resolve_expr(having_expr, &post_select_scope);
+                if let Some(having) = having {
+                    self.resolve_expr(having, &post_select_scope);
+                }
+                for window in windows {
+                    for part in &window.spec.partition_by {
+                        self.resolve_expr(part, &post_select_scope);
+                    }
+                    for order in &window.spec.order_by {
+                        self.resolve_expr(&order.expr, &post_select_scope);
+                    }
                 }
 
-                // Resolve WINDOW definitions.
-                for window_def in windows {
-                    for expr in &window_def.spec.partition_by {
-                        self.resolve_expr(expr, &post_select_scope);
-                    }
-                    for term in &window_def.spec.order_by {
-                        self.resolve_expr(&term.expr, &post_select_scope);
-                    }
-                    if let Some(frame) = &window_def.spec.frame {
-                        match &frame.start {
-                            fsqlite_ast::FrameBound::Preceding(expr)
-                            | fsqlite_ast::FrameBound::Following(expr) => {
-                                self.resolve_expr(expr, &post_select_scope);
-                            }
-                            _ => {}
-                        }
-                        if let Some(
-                            fsqlite_ast::FrameBound::Preceding(expr)
-                            | fsqlite_ast::FrameBound::Following(expr),
-                        ) = &frame.end
-                        {
-                            self.resolve_expr(expr, &post_select_scope);
-                        }
-                    }
-                }
+                self.tables_resolved += 1;
             }
-            SelectCore::Values(_) => {
-                // VALUES doesn't reference columns.
+            SelectCore::Values(rows) => {
+                for row in rows {
+                    for expr in row {
+                        self.resolve_expr(expr, scope);
+                    }
+                }
             }
         }
     }
@@ -2073,5 +2060,16 @@ mod tests {
             "Should report amount as unresolved for users table, instead got: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn test_rowid_resolution() {
+        let schema = make_schema();
+        let mut p = Parser::from_sql("SELECT rowid FROM users");
+        let (stmts, _) = p.parse_all();
+        let stmt = stmts.into_iter().next().unwrap();
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "errors: {:?}", errors);
     }
 }

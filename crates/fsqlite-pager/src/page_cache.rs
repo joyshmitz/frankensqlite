@@ -536,10 +536,6 @@ pub struct ShardedPageCache {
     pool: PageBufPool,
     /// Configured page size.
     page_size: PageSize,
-    /// Global hit counter (atomic, for fast aggregate reads).
-    global_hits: AtomicU64,
-    /// Global miss counter.
-    global_misses: AtomicU64,
 }
 
 impl ShardedPageCache {
@@ -558,8 +554,6 @@ impl ShardedPageCache {
             shards,
             pool,
             page_size,
-            global_hits: AtomicU64::new(0),
-            global_misses: AtomicU64::new(0),
         }
     }
 
@@ -610,7 +604,6 @@ impl ShardedPageCache {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(|slice| {
-            self.global_hits.fetch_add(1, AtomicOrdering::Relaxed);
             slice.to_vec()
         })
     }
@@ -624,10 +617,8 @@ impl ShardedPageCache {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         if let Some(data) = shard.get(page_no) {
-            self.global_hits.fetch_add(1, AtomicOrdering::Relaxed);
             Some(f(data))
         } else {
-            self.global_misses.fetch_add(1, AtomicOrdering::Relaxed);
             None
         }
     }
@@ -642,10 +633,8 @@ impl ShardedPageCache {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         if let Some(data) = shard.get_mut(page_no) {
-            self.global_hits.fetch_add(1, AtomicOrdering::Relaxed);
             Some(f(data))
         } else {
-            self.global_misses.fetch_add(1, AtomicOrdering::Relaxed);
             None
         }
     }
@@ -668,7 +657,6 @@ impl ShardedPageCache {
         // Check for cache hit first, then update metrics
         if shard.pages.contains_key(&page_no) {
             shard.hits = shard.hits.saturating_add(1);
-            self.global_hits.fetch_add(1, AtomicOrdering::Relaxed);
             // SAFETY: we just checked contains_key, so unwrap is safe
             let data = shard.pages.get(&page_no).unwrap();
             return Ok(f(data.as_slice()));
@@ -676,7 +664,6 @@ impl ShardedPageCache {
 
         // Cache miss — read from VFS
         shard.misses = shard.misses.saturating_add(1);
-        self.global_misses.fetch_add(1, AtomicOrdering::Relaxed);
 
         let mut buf = self.pool.acquire()?;
         let offset = page_offset(page_no, self.page_size);
@@ -815,8 +802,6 @@ impl ShardedPageCache {
         for shard in self.shards.iter() {
             shard.lock().reset_metrics();
         }
-        self.global_hits.store(0, AtomicOrdering::Relaxed);
-        self.global_misses.store(0, AtomicOrdering::Relaxed);
     }
 
     /// Get the configured page size.
@@ -852,10 +837,8 @@ impl ShardedPageCache {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         if let Some(data) = shard.get(page_no) {
-            self.global_hits.fetch_add(1, AtomicOrdering::Relaxed);
             Some(data.to_vec())
         } else {
-            self.global_misses.fetch_add(1, AtomicOrdering::Relaxed);
             None
         }
     }
@@ -1335,7 +1318,7 @@ mod tests {
             "bead_id={BEAD_ID} case=page_decode_content_offset"
         );
 
-        // Out-of-bounds access panics (safe Rust guarantee).
+        // Out of bounds access panics (safe Rust guarantee).
         // We verify by checking the page length is exactly page_size.
         assert_eq!(
             page.len(),

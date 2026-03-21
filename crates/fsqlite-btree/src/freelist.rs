@@ -748,6 +748,23 @@ mod tests {
     }
 
     #[test]
+    fn test_ptrmap_entry_offset_last_page_in_group_with_pending_byte() {
+        let usable_size = 4096;
+        let page_size = 4096;
+        let ptrmap_page = 261582;
+        // group size is 820. With pending byte page, it covers 821 pages: 261582 to 262402.
+        let pgno = PageNumber::new(262402).unwrap();
+        
+        assert_eq!(
+            ptrmap_page_for(pgno, usable_size, page_size).unwrap().get(),
+            ptrmap_page
+        );
+        
+        let offset = ptrmap_entry_offset(pgno, usable_size, page_size).unwrap();
+        assert!(offset + PTRMAP_ENTRY_SIZE_BYTES <= usable_size, "offset {} + 5 > usable_size {}", offset, usable_size);
+    }
+
+    #[test]
     fn test_ptrmap_entry_encode_decode() {
         let entry = PtrMapEntry {
             kind: PtrMapType::Overflow1,
