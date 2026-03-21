@@ -434,15 +434,16 @@ impl<F: VfsFile> PagerInner<F> {
             }
         })?;
 
-        let db_size = if header.is_page_count_stale() {
-            let file_size = self.db_file.file_size(cx)?;
-            header
-                .page_count_from_file_size(file_size)
-                .unwrap_or(header.page_count)
-        } else {
-            header.page_count
-        }
-        .max(1);
+        // Always cross-check header.page_count against the actual file size.
+        // A crash between growing the file and updating the header leaves
+        // page_count stale even when the stale marker is not set.  Using
+        // max(header, file) ensures newly-committed pages are visible and
+        // avoids BusySnapshot errors on startup (see GH issue #49).
+        let file_size = self.db_file.file_size(cx)?;
+        let file_derived = header
+            .page_count_from_file_size(file_size)
+            .unwrap_or(header.page_count);
+        let db_size = header.page_count.max(file_derived).max(1);
         // Skip freelist scan for read-only pagers — the freelist is only
         // needed for page allocation during writes.
         let freelist = if self.access_mode.is_readonly() {
@@ -539,6 +540,9 @@ fn return_pages_to_freelist(
             freelist.push(page);
         }
     }
+    // Sort descending so that pop() and rposition() yield the lowest page numbers first,
+    // which keeps the database file compact and reduces file size growth.
+    freelist.sort_unstable_by(|a, b| b.get().cmp(&a.get()));
 }
 
 fn load_freelist_from_disk<F: VfsFile>(
@@ -3294,6 +3298,10 @@ where
                         })
                         .collect();
 
+                    let mut prepared_batch = with_wal_backend(wal_backend, |wal| {
+                        wal.prepare_append_frames(&frame_refs)
+                    })?;
+
                     // Compute final db_size: max of all commit frame db_size values.
                     let final_db_size = all_frames
                         .iter()
@@ -3853,9 +3861,9 @@ where
             if let Some(idx) = inner
                 .freelist
                 .iter()
-                .position(|page| page.get() > inner.db_size)
+                .rposition(|page| page.get() > inner.db_size)
             {
-                let page = inner.freelist.swap_remove(idx);
+                let page = inner.freelist.remove(idx);
                 self.allocated_from_freelist.push(page);
                 return Ok(page);
             }
@@ -3934,7 +3942,7 @@ where
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             // Return any unused lease pages to the freelist so they can
             // be reused by other transactions.
-            inner.freelist.append(&mut self.page_lease);
+            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
@@ -3950,7 +3958,7 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             // Return any unused lease pages.
-            inner.freelist.append(&mut self.page_lease);
+            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
@@ -3988,7 +3996,7 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         // Return any unused lease pages before computing committed db_size.
-        inner.freelist.append(&mut self.page_lease);
+        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
         {
@@ -4201,7 +4209,7 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-        inner.freelist.append(&mut self.page_lease);
+        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
         let commit_result = {
@@ -4484,7 +4492,7 @@ where
                 // freelist. Otherwise next_page skips over them permanently
                 // and a later commit can grow page_count past those holes,
                 // yielding "Page N: never used" corruption.
-                inner.freelist.append(&mut self.page_lease);
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                 return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
             } else {
                 // Read-only transaction: lease should be empty (only writers
@@ -4566,6 +4574,23 @@ where
             })
             .collect::<Result<HashMap<_, _>>>()?;
 
+        // Track pages that were allocated after the savepoint so that get_page
+        // can return zeros for them instead of BusySnapshot error.
+        for page_no in self
+            .allocated_from_eof
+            .iter()
+            .skip(entry.allocated_from_eof_snapshot.len())
+        {
+            self.rolled_back_pages.insert(*page_no);
+        }
+        for page_no in self
+            .allocated_from_freelist
+            .iter()
+            .skip(entry.allocated_from_freelist_snapshot.len())
+        {
+            self.rolled_back_pages.insert(*page_no);
+        }
+
         {
             let mut inner = self
                 .inner
@@ -4584,7 +4609,7 @@ where
                 // These are valid EOF page numbers that next_page has
                 // already advanced past (concurrent mode doesn't roll
                 // back next_page).
-                inner.freelist.append(&mut self.page_lease);
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                 return_pages_to_freelist(
                     &mut inner.freelist,
                     self.allocated_from_eof
@@ -4596,23 +4621,6 @@ where
                         .drain(entry.allocated_from_freelist_snapshot.len()..),
                 );
             }
-        }
-
-        // Track pages that were allocated after the savepoint so that get_page
-        // can return zeros for them instead of BusySnapshot error.
-        for page_no in self
-            .allocated_from_eof
-            .iter()
-            .skip(entry.allocated_from_eof_snapshot.len())
-        {
-            self.rolled_back_pages.insert(*page_no);
-        }
-        for page_no in self
-            .allocated_from_freelist
-            .iter()
-            .skip(entry.allocated_from_freelist_snapshot.len())
-        {
-            self.rolled_back_pages.insert(*page_no);
         }
 
         self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
@@ -4657,7 +4665,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                 // Concurrent: next_page stays advanced, so return lease
                 // pages and EOF allocations to the freelist.
-                inner.freelist.append(&mut self.page_lease);
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                 return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
             } else {
                 // Read-only: lease should be empty, clear defensively.
@@ -10747,7 +10755,6 @@ mod tests {
             p.get()
         );
         txn3.write_page(&cx, p2, &vec![0xBB; ps]).unwrap();
-        txn3.commit(&cx).unwrap();
 
         // Verify freelist is empty (in-flight).
         {
@@ -10757,9 +10764,7 @@ mod tests {
         }
 
         // 4. Rollback.
-        let mut txn4 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        txn4.free_page(&cx, p2).unwrap();
-        txn4.rollback(&cx).unwrap();
+        txn3.rollback(&cx).unwrap();
 
         // 5. Verify freelist has the page again (no leak).
         {
@@ -11368,12 +11373,10 @@ mod tests {
         let reused1 = txn.allocate_page(&cx).unwrap();
         let reused2 = txn.allocate_page(&cx).unwrap();
         assert!(
-            reused1 != reused2 && [p3, p4].contains(&reused1) && [p3, p4].contains(&reused2),
-            "bead_id={BEAD_ID} case=concurrent_savepoint_reuses_eof_pages reused=({}, {}) expected=({}, {})",
+            reused1.get() == 3 && reused2.get() == 4,
+            "bead_id={BEAD_ID} case=concurrent_savepoint_reuses_eof_pages reused=({}, {}) expected=(3, 4)",
             reused1.get(),
-            reused2.get(),
-            p3.get(),
-            p4.get()
+            reused2.get()
         );
         txn.write_page(&cx, reused1, &vec![0x44; ps]).unwrap();
         txn.write_page(&cx, reused2, &vec![0x55; ps]).unwrap();
