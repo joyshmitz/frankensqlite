@@ -582,6 +582,7 @@ pub struct EpochOrderCoordinator {
     pool: Arc<PerCoreWalBufferPool>,
     current_epoch: AtomicU64,
     append_epoch: AtomicU64,
+    advance_lock: Mutex<()>,
     wait_state: Mutex<EpochWaitState>,
     wait_cv: Condvar,
     config: EpochConfig,
@@ -598,6 +599,7 @@ impl EpochOrderCoordinator {
             pool,
             current_epoch: AtomicU64::new(0),
             append_epoch: AtomicU64::new(0),
+            advance_lock: Mutex::new(()),
             wait_state: Mutex::new(wait_state),
             wait_cv: Condvar::new(),
             config,
@@ -666,6 +668,10 @@ impl EpochOrderCoordinator {
         active_cores: &[usize],
         timeout: Duration,
     ) -> Result<u64, String> {
+        let _advance_guard = self
+            .advance_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let core_count = self.pool.core_count();
         for &core_id in active_cores {
             if core_id >= core_count {
@@ -689,6 +695,7 @@ impl EpochOrderCoordinator {
         {
             let now = Instant::now();
             if now >= deadline {
+                self.current_epoch.store(previous_epoch, Ordering::SeqCst);
                 return Err(format!(
                     "epoch fence timed out waiting for active cores to observe epoch {next_epoch}"
                 ));
@@ -705,6 +712,7 @@ impl EpochOrderCoordinator {
                     .iter()
                     .any(|core_id| guard.observed_epochs[*core_id] < next_epoch)
             {
+                self.current_epoch.store(previous_epoch, Ordering::SeqCst);
                 return Err(format!(
                     "epoch fence timed out waiting for active cores to observe epoch {next_epoch}"
                 ));
@@ -1284,6 +1292,55 @@ fn bd_ncivz_2_epoch_fence_timeout_when_active_core_not_observed() {
     assert!(
         error.contains("timed out"),
         "error should describe fence timeout: {error}"
+    );
+}
+
+#[test]
+fn bd_ncivz_2_epoch_fence_timeout_does_not_poison_next_advance() {
+    let coordinator =
+        EpochOrderCoordinator::new(1, BufferConfig::default(), EpochConfig::default());
+
+    coordinator
+        .append_to_core(0, 1, 64)
+        .expect("initial append should succeed");
+
+    let error = coordinator
+        .advance_epoch_and_wait(&[0], Duration::from_millis(20))
+        .expect_err("fence must timeout without active core observation");
+    assert!(
+        error.contains("timed out"),
+        "error should describe fence timeout: {error}"
+    );
+    assert_eq!(
+        coordinator.current_epoch(),
+        0,
+        "timed-out epoch advance must roll back the published epoch"
+    );
+    assert_eq!(
+        coordinator.current_append_epoch(),
+        0,
+        "timed-out epoch advance must not move the append epoch"
+    );
+
+    coordinator
+        .append_to_core(0, 2, 64)
+        .expect("append after timeout should still use epoch 0");
+    coordinator
+        .advance_epoch_and_wait(&[], Duration::from_millis(25))
+        .expect("retry advance should succeed");
+
+    let batch = coordinator
+        .flush_epoch(0)
+        .expect("retry advance should seal the original epoch");
+    assert_eq!(batch.total_records(), 2);
+    assert!(
+        batch.records.iter().all(|record| record.epoch == 0),
+        "timed-out fence must not relabel epoch-0 records: {:?}",
+        batch
+            .records
+            .iter()
+            .map(|record| record.epoch)
+            .collect::<Vec<_>>()
     );
 }
 

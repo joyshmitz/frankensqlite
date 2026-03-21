@@ -103,13 +103,13 @@ impl GroupCommitQueue {
         target_epoch: u64,
     ) -> Result<()> {
         loop {
-            if let Some(detail) = self
+            let failed_detail = self
                 .failed_epochs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&target_epoch)
-                .cloned()
-            {
+                .cloned();
+            if let Some(detail) = failed_detail {
                 return Err(FrankenError::internal(format!(
                     "group commit flush failed for epoch {target_epoch}: {detail}"
                 )));
@@ -3250,8 +3250,10 @@ where
                         .lock()
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-                    // Escalate to EXCLUSIVE for WAL write.
-                    inner.db_file.lock(cx, LockLevel::Exclusive)?;
+                    // WAL mode: No EXCLUSIVE lock needed. WAL allows concurrent
+                    // readers while writer appends frames. The wal_backend mutex
+                    // serializes writers, and MVCC handles reader isolation.
+                    // EXCLUSIVE is only needed during checkpoint.
 
                     // Write all frames in one consolidated I/O.
                     with_wal_backend(wal_backend, |wal| wal.append_frames(cx, &frame_refs))?;
@@ -3314,7 +3316,7 @@ where
                         }
                         return Err(error);
                     }
-                };
+                }
             }
 
             SubmitOutcome::Waiter => {
@@ -3328,7 +3330,7 @@ where
                 // So we wait for completed_epoch >= N+1.
                 let target_epoch = our_epoch + 1;
 
-                let mut guard = queue
+                let guard = queue
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
