@@ -36,7 +36,10 @@ use fsqlite_ast::{
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{ErrorCode, FrankenError, Result};
-use fsqlite_ext_fts5::{Fts5Expr, Fts5Table, build_expr, parse_fts5_query};
+use fsqlite_ext_fts5::{
+    Fts5Expr, Fts5Table, InvertedIndex, bm25_score, build_expr, highlight as fts5_highlight,
+    parse_fts5_query, snippet as fts5_snippet,
+};
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
 use fsqlite_ext_misc::GenerateSeriesTable;
 use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
@@ -4338,10 +4341,15 @@ impl Connection {
         let rows = match plan.idx_num {
             0 => fts5.all_rows().into_iter().collect::<Vec<_>>(),
             1 => {
-                let query = plan.args.first().ok_or_else(|| {
-                    FrankenError::Internal("fts5 MATCH scan missing query argument".to_owned())
-                })?;
-                fts5.search_rows(&query.to_text())
+                if plan.args.is_empty() {
+                    return Err(FrankenError::Internal(
+                        "fts5 MATCH scan missing query argument".to_owned(),
+                    ));
+                }
+                let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
+                let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+                let weights: Vec<f64> = fts5.columns().iter().map(|_| 1.0).collect();
+                fts5.search_rows_for_queries_with_weights(&query_refs, &weights)
                     .map_err(|error| {
                         FrankenError::function_error(format!("fts5 query failed: {error}"))
                     })?
@@ -4373,6 +4381,39 @@ impl Connection {
                 row
             })
             .collect())
+    }
+
+    fn build_fts5_aux_context_for_source(
+        &self,
+        src: &JoinTableSource,
+        plan: &LiveVtabScanPlan,
+    ) -> Result<Option<(String, Fts5AuxTableContext)>> {
+        if plan.idx_num != 1 || plan.args.is_empty() {
+            return Ok(None);
+        }
+
+        let key = src.table_name.to_ascii_uppercase();
+        let instances = self.vtab_instances.borrow();
+        let instance = instances.get(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
+        })?;
+        let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() else {
+            return Ok(None);
+        };
+
+        let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
+        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+        let query_terms = fts5.query_terms_for_queries(&query_refs).map_err(|error| {
+            FrankenError::function_error(format!("fts5 query failed: {error}"))
+        })?;
+        let table_label = src.alias.clone().unwrap_or_else(|| src.table_name.clone());
+        Ok(Some((
+            table_label,
+            Fts5AuxTableContext {
+                index: fts5.index().clone(),
+                query_terms,
+            },
+        )))
     }
 
     fn reset_statement_change_count(&self) {
@@ -21237,6 +21278,9 @@ impl Connection {
                 distinct: _,
                 ..
             } => {
+                if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
+                    return result;
+                }
                 let arg_vals: Vec<SqliteValue> = match args {
                     FunctionArgs::Star => vec![],
                     FunctionArgs::List(exprs) => exprs
@@ -24241,8 +24285,7 @@ impl Connection {
 
         let primary_width = table_sources[0].scan_width();
         let mut live_vtab_primary_scan = None;
-        let live_vtab_where_override = if table_sources.len() == 1
-            && self.has_live_vtab_instance(&table_sources[0].table_name)
+        let live_vtab_where_override = if self.has_live_vtab_instance(&table_sources[0].table_name)
         {
             let live_plan = self.plan_live_vtab_scan(
                 &table_sources[0].table_name,
@@ -24258,6 +24301,13 @@ impl Connection {
         } else {
             None
         };
+        let mut fts5_aux_context = Fts5AuxContext::default();
+        if let Some(plan) = live_vtab_primary_scan.as_ref()
+            && let Some((table_label, aux_table)) =
+                self.build_fts5_aux_context_for_source(&table_sources[0], plan)?
+        {
+            fts5_aux_context.insert(table_label, aux_table);
+        }
         let effective_where_clause = live_vtab_where_override
             .as_ref()
             .map(|expr| expr.as_ref())
@@ -24372,6 +24422,11 @@ impl Connection {
                 )?);
             }
         }
+        let _fts5_aux_guard = if fts5_aux_context.is_empty() {
+            None
+        } else {
+            Some(Fts5AuxContextGuard::push(fts5_aux_context))
+        };
 
         // ── 4. Perform joins ──
         // Start with primary table rows as "left" side.
@@ -36521,6 +36576,59 @@ struct LiveVtabScanPlan {
 }
 
 #[derive(Debug, Clone)]
+struct Fts5AuxTableContext {
+    index: InvertedIndex,
+    query_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Fts5AuxContext {
+    tables: HashMap<String, Fts5AuxTableContext>,
+}
+
+impl Fts5AuxContext {
+    fn insert(&mut self, table_label: String, context: Fts5AuxTableContext) {
+        self.tables.insert(table_label.to_ascii_uppercase(), context);
+    }
+
+    fn table(&self, table_label: &str) -> Option<&Fts5AuxTableContext> {
+        self.tables.get(&table_label.to_ascii_uppercase())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
+thread_local! {
+    static CURRENT_FTS5_AUX_CONTEXT: RefCell<Vec<Fts5AuxContext>> = const { RefCell::new(Vec::new()) };
+}
+
+struct Fts5AuxContextGuard;
+
+impl Fts5AuxContextGuard {
+    fn push(context: Fts5AuxContext) -> Self {
+        CURRENT_FTS5_AUX_CONTEXT.with(|stack| stack.borrow_mut().push(context));
+        Self
+    }
+}
+
+impl Drop for Fts5AuxContextGuard {
+    fn drop(&mut self) {
+        CURRENT_FTS5_AUX_CONTEXT.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
+}
+
+fn with_current_fts5_aux_context<T>(f: impl FnOnce(Option<&Fts5AuxContext>) -> T) -> T {
+    CURRENT_FTS5_AUX_CONTEXT.with(|stack| {
+        let stack = stack.borrow();
+        f(stack.last())
+    })
+}
+
+#[derive(Debug, Clone)]
 struct LiveVtabInsertRow {
     explicit_rowid: Option<SqliteValue>,
     values: Vec<SqliteValue>,
@@ -37304,6 +37412,236 @@ fn eval_join_predicate(
     Ok(is_sqlite_truthy(&val))
 }
 
+fn fts5_table_label_from_args(args: &FunctionArgs) -> Option<&str> {
+    let FunctionArgs::List(arguments) = args else {
+        return None;
+    };
+    let Some(Expr::Column(col_ref, _)) = arguments.first() else {
+        return None;
+    };
+    if col_ref.table.is_some() {
+        return None;
+    }
+    Some(col_ref.column.as_str())
+}
+
+fn current_fts5_rowid(
+    table_label: &str,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Option<i64> {
+    let idx = col_map.iter().position(|(table, column, hidden)| {
+        *hidden && table.eq_ignore_ascii_case(table_label) && column.eq_ignore_ascii_case("rowid")
+    })?;
+    row.get(idx).map(SqliteValue::to_integer)
+}
+
+fn current_fts5_visible_columns<'a>(
+    table_label: &str,
+    row: &'a [SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Vec<&'a SqliteValue> {
+    col_map
+        .iter()
+        .enumerate()
+        .filter(|(_, (table, _, hidden))| table.eq_ignore_ascii_case(table_label) && !*hidden)
+        .filter_map(|(idx, _)| row.get(idx))
+        .collect()
+}
+
+fn auto_fts5_column_index(query_terms: &[String], columns: &[&SqliteValue]) -> Option<usize> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut best_index = 0usize;
+    let mut best_hits = 0usize;
+    for (idx, value) in columns.iter().enumerate() {
+        let lower = sqlite_value_to_text(value).to_ascii_lowercase();
+        let hits = query_terms
+            .iter()
+            .map(|term| lower.matches(term.as_str()).count())
+            .sum();
+        if hits > best_hits {
+            best_hits = hits;
+            best_index = idx;
+        }
+    }
+    Some(best_index)
+}
+
+fn sqlite_value_as_f64(value: &SqliteValue) -> Option<f64> {
+    match value {
+        SqliteValue::Integer(i) => Some(*i as f64),
+        SqliteValue::Float(f) => Some(*f),
+        SqliteValue::Text(text) => text.parse::<f64>().ok(),
+        SqliteValue::Blob(_) | SqliteValue::Null => None,
+    }
+}
+
+fn eval_fts5_aux_function(
+    name: &str,
+    args: &FunctionArgs,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Result<SqliteValue> {
+    let table_label = fts5_table_label_from_args(args).ok_or_else(|| {
+        FrankenError::function_error(format!("unable to use function {name} in the requested context"))
+    })?;
+    let FunctionArgs::List(arguments) = args else {
+        return Err(FrankenError::function_error(format!(
+            "unable to use function {name} in the requested context",
+        )));
+    };
+    let rowid = current_fts5_rowid(table_label, row, col_map).ok_or_else(|| {
+        FrankenError::function_error(format!("unable to use function {name} in the requested context"))
+    })?;
+    let visible_columns = current_fts5_visible_columns(table_label, row, col_map);
+
+    with_current_fts5_aux_context(|ctx_opt| {
+        let ctx = ctx_opt.ok_or_else(|| {
+            FrankenError::function_error(format!(
+                "unable to use function {name} in the requested context",
+            ))
+        })?;
+        let table_ctx = ctx.table(table_label).ok_or_else(|| {
+            FrankenError::function_error(format!(
+                "unable to use function {name} in the requested context",
+            ))
+        })?;
+
+        match name {
+            "bm25" => {
+                let mut weights = Vec::new();
+                for expr in &arguments[1..] {
+                    let value = eval_join_expr(expr, row, col_map)?;
+                    if value.is_null() {
+                        return Ok(SqliteValue::Null);
+                    }
+                    let Some(weight) = sqlite_value_as_f64(&value) else {
+                        return Err(FrankenError::function_error(
+                            "bm25 column weight must be numeric",
+                        ));
+                    };
+                    weights.push(weight);
+                }
+                Ok(SqliteValue::Float(bm25_score(
+                    &table_ctx.index,
+                    rowid,
+                    &table_ctx.query_terms,
+                    &weights,
+                )))
+            }
+            "highlight" => {
+                if arguments.len() != 4 {
+                    return Err(FrankenError::function_error(
+                        "wrong number of arguments to function highlight()",
+                    ));
+                }
+                let col_value = eval_join_expr(&arguments[1], row, col_map)?;
+                let open_value = eval_join_expr(&arguments[2], row, col_map)?;
+                let close_value = eval_join_expr(&arguments[3], row, col_map)?;
+                if col_value.is_null() || open_value.is_null() || close_value.is_null() {
+                    return Ok(SqliteValue::Null);
+                }
+                let column_index = col_value.to_integer();
+                if column_index < 0 {
+                    return Err(FrankenError::function_error(
+                        "highlight column index must be non-negative",
+                    ));
+                }
+                let column_index = usize::try_from(column_index).map_err(|_| {
+                    FrankenError::function_error("highlight column index out of range")
+                })?;
+                let text = visible_columns.get(column_index).ok_or_else(|| {
+                    FrankenError::function_error("highlight column index out of range")
+                })?;
+                if text.is_null() {
+                    return Ok(SqliteValue::Null);
+                }
+                Ok(SqliteValue::Text(
+                    fts5_highlight(
+                        &sqlite_value_to_text(text),
+                        &table_ctx.query_terms,
+                        &open_value.to_text(),
+                        &close_value.to_text(),
+                    )
+                    .into(),
+                ))
+            }
+            "snippet" => {
+                if arguments.len() != 6 {
+                    return Err(FrankenError::function_error(
+                        "wrong number of arguments to function snippet()",
+                    ));
+                }
+                let col_value = eval_join_expr(&arguments[1], row, col_map)?;
+                let open_value = eval_join_expr(&arguments[2], row, col_map)?;
+                let close_value = eval_join_expr(&arguments[3], row, col_map)?;
+                let ellipsis_value = eval_join_expr(&arguments[4], row, col_map)?;
+                let max_tokens_value = eval_join_expr(&arguments[5], row, col_map)?;
+                if col_value.is_null()
+                    || open_value.is_null()
+                    || close_value.is_null()
+                    || ellipsis_value.is_null()
+                    || max_tokens_value.is_null()
+                {
+                    return Ok(SqliteValue::Null);
+                }
+                let max_tokens = usize::try_from(max_tokens_value.to_integer()).map_err(|_| {
+                    FrankenError::function_error("snippet token limit must be positive")
+                })?;
+                if !(1..=64).contains(&max_tokens) {
+                    return Err(FrankenError::function_error(
+                        "snippet token limit must be between 1 and 64",
+                    ));
+                }
+                let column_index = if col_value.to_integer() < 0 {
+                    auto_fts5_column_index(&table_ctx.query_terms, &visible_columns)
+                } else {
+                    usize::try_from(col_value.to_integer()).ok()
+                }
+                .ok_or_else(|| FrankenError::function_error("snippet column index out of range"))?;
+                let text = visible_columns.get(column_index).ok_or_else(|| {
+                    FrankenError::function_error("snippet column index out of range")
+                })?;
+                if text.is_null() {
+                    return Ok(SqliteValue::Null);
+                }
+                Ok(SqliteValue::Text(
+                    fts5_snippet(
+                        &sqlite_value_to_text(text),
+                        &table_ctx.query_terms,
+                        &open_value.to_text(),
+                        &close_value.to_text(),
+                        &ellipsis_value.to_text(),
+                        max_tokens,
+                    )
+                    .into(),
+                ))
+            }
+            _ => Err(FrankenError::function_error(format!(
+                "unable to use function {name} in the requested context",
+            ))),
+        }
+    })
+}
+
+fn try_eval_fts5_aux_function(
+    name: &str,
+    args: &FunctionArgs,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Option<Result<SqliteValue>> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "bm25" | "highlight" | "snippet" => {
+            Some(eval_fts5_aux_function(lower.as_str(), args, row, col_map))
+        }
+        _ => None,
+    }
+}
+
 /// Evaluate an expression against a combined join row, producing a value.
 #[allow(clippy::too_many_lines)]
 fn eval_join_expr(
@@ -37548,6 +37886,9 @@ fn eval_join_expr(
             }
         }
         Expr::FunctionCall { name, args, .. } => {
+            if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
+                return result;
+            }
             let arg_vals: Vec<SqliteValue> = match args {
                 FunctionArgs::List(exprs) => exprs
                     .iter()

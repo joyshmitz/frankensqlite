@@ -1173,6 +1173,48 @@ fn evaluate_query_string(
     Ok((matching_docs, query_terms))
 }
 
+fn evaluate_query_strings(
+    index: &InvertedIndex,
+    columns: &[String],
+    queries: &[&str],
+) -> std::result::Result<(Vec<i64>, Vec<String>), Fts5QueryError> {
+    let mut combined_docs: Option<Vec<i64>> = None;
+    let mut query_terms = Vec::new();
+
+    for query in queries {
+        let (matching_docs, match_terms) = evaluate_query_string(index, columns, query)?;
+        query_terms.extend(match_terms);
+        combined_docs = Some(match combined_docs {
+            Some(existing) => intersect_sorted(&existing, &matching_docs),
+            None => matching_docs,
+        });
+    }
+
+    Ok((combined_docs.unwrap_or_default(), query_terms))
+}
+
+fn search_rows_with_weights_from_parts(
+    index: &InvertedIndex,
+    columns: &[String],
+    documents: &HashMap<i64, Vec<String>>,
+    queries: &[&str],
+    weights: &[f64],
+) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
+    let (matching_docs, query_terms) = evaluate_query_strings(index, columns, queries)?;
+
+    let mut results: Vec<(i64, f64, Vec<String>)> = matching_docs
+        .into_iter()
+        .map(|docid| {
+            let score = bm25_score(index, docid, &query_terms, weights);
+            let row = documents.get(&docid).cloned().unwrap_or_default();
+            (docid, score, row)
+        })
+        .collect();
+
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}
+
 fn evaluate_expr_impl(
     index: &InvertedIndex,
     expr: &Fts5Expr,
@@ -1613,39 +1655,55 @@ impl Fts5Table {
     /// Search the FTS5 table with a query, returning matching rowids ranked
     /// by BM25.
     pub fn search(&self, query: &str) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        let (matching_docs, query_terms) =
-            evaluate_query_string(&self.index, &self.columns, query)?;
         let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
+        self.search_queries_with_weights(&[query], &weights)
+    }
 
-        let mut results: Vec<(i64, f64)> = matching_docs
+    pub fn search_queries_with_weights(
+        &self,
+        queries: &[&str],
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        let rows = search_rows_with_weights_from_parts(
+            &self.index,
+            &self.columns,
+            &self.documents,
+            queries,
+            weights,
+        )?;
+        Ok(rows
             .into_iter()
-            .map(|docid| {
-                let score = bm25_score(&self.index, docid, &query_terms, &weights);
-                (docid, score)
-            })
-            .collect();
-
-        // Sort by score (lower = better in FTS5 convention).
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        Ok(results)
+            .map(|(rowid, score, _columns)| (rowid, score))
+            .collect())
     }
 
     pub fn search_rows(
         &self,
         query: &str,
     ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
-        self.search(query).map(|results| {
-            results
-                .into_iter()
-                .map(|(rowid, score)| {
-                    let columns = self
-                        .get_document(rowid)
-                        .map_or_else(Vec::new, ToOwned::to_owned);
-                    (rowid, score, columns)
-                })
-                .collect()
-        })
+        let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
+        self.search_rows_for_queries_with_weights(&[query], &weights)
+    }
+
+    pub fn search_rows_for_queries_with_weights(
+        &self,
+        queries: &[&str],
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
+        search_rows_with_weights_from_parts(
+            &self.index,
+            &self.columns,
+            &self.documents,
+            queries,
+            weights,
+        )
+    }
+
+    pub fn query_terms_for_queries(
+        &self,
+        queries: &[&str],
+    ) -> std::result::Result<Vec<String>, Fts5QueryError> {
+        evaluate_query_strings(&self.index, &self.columns, queries).map(|(_docs, terms)| terms)
     }
 
     #[must_use]
@@ -1680,6 +1738,11 @@ impl Fts5Table {
     #[must_use]
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    #[must_use]
+    pub fn index(&self) -> &InvertedIndex {
+        &self.index
     }
 }
 
@@ -1946,36 +2009,17 @@ impl VirtualTableCursor for Fts5Cursor {
             // MATCH query: every filter arg is an additional MATCH expression
             // on the same table, combined with AND like SQLite does.
             if !args.is_empty() {
-                let mut combined_docs: Option<Vec<i64>> = None;
-                let mut query_terms = Vec::new();
-                for query_val in args {
-                    let query = query_val.to_text();
-                    let (matching_docs, match_terms) =
-                        evaluate_query_string(&self.index, &self.columns, &query).map_err(|e| {
-                            FrankenError::function_error(format!("fts5 query error: {e}"))
-                        })?;
-                    query_terms.extend(match_terms);
-                    combined_docs = Some(match combined_docs {
-                        Some(existing) => intersect_sorted(&existing, &matching_docs),
-                        None => matching_docs,
-                    });
-                }
-
-                let matching_docs = combined_docs.unwrap_or_default();
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
-
-                self.results = matching_docs
-                    .into_iter()
-                    .map(|docid| {
-                        let score = bm25_score(&self.index, docid, &query_terms, &weights);
-                        let columns = self.documents.get(&docid).cloned().unwrap_or_default();
-                        (docid, score, columns)
-                    })
-                    .collect();
-
-                // Sort by score (lower = better in FTS5 convention).
-                self.results
-                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let queries: Vec<String> = args.iter().map(SqliteValue::to_text).collect();
+                let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+                self.results = search_rows_with_weights_from_parts(
+                    &self.index,
+                    &self.columns,
+                    &self.documents,
+                    &query_refs,
+                    &weights,
+                )
+                .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
             }
         } else {
             // Full table scan (idx_num == 0): return all documents.

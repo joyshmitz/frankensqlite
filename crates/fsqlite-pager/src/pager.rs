@@ -1353,9 +1353,14 @@ impl PublishedPagerState {
     ) {
         self.publication_write_count
             .fetch_add(1, AtomicOrdering::Relaxed);
+        // Monotonic max: commit_seq must never regress under group commit.
         self.visible_commit_seq
-            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        self.db_size.store(update.db_size, AtomicOrdering::Release);
+            .fetch_max(update.visible_commit_seq.get(), AtomicOrdering::Release);
+        // Monotonic max: db_size must never regress. Under group commit,
+        // Transaction A (db_size=5) may publish after Transaction B (db_size=7),
+        // which would revert the published db_size from 7 to 5. This causes
+        // BusySnapshot errors where subsequent transactions can't see pages 6-7.
+        self.db_size.fetch_max(update.db_size, AtomicOrdering::Release);
         self.journal_mode.store(
             encode_journal_mode(update.journal_mode),
             AtomicOrdering::Release,
@@ -3811,8 +3816,14 @@ where
             // In WAL mode classify page-1 work by semantic trigger so later beads
             // can remove or defer each class independently.
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
+            // only when it was explicitly dirty, but also when the database
+            // grows (new pages allocated beyond current db_size). Without this,
+            // other connections reading page 1 from WAL won't see the updated
+            // page_count header, causing BusySnapshot errors.
             let must_write_page1 = if self.journal_mode == JournalMode::Wal {
                 wal_page1_plan.requires_page_one_rewrite()
+                    || wal_page1_plan.requires_page_count_advance()
             } else {
                 true
             };
@@ -4000,8 +4011,14 @@ where
             }
 
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
+            // only when it was explicitly dirty, but also when the database
+            // grows (new pages allocated beyond current db_size). Without this,
+            // other connections reading page 1 from WAL won't see the updated
+            // page_count header, causing BusySnapshot errors.
             let must_write_page1 = if self.journal_mode == JournalMode::Wal {
                 wal_page1_plan.requires_page_one_rewrite()
+                    || wal_page1_plan.requires_page_count_advance()
             } else {
                 true
             };

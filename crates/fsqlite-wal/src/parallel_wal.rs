@@ -294,7 +294,8 @@ pub struct SegmentRecoveryResult {
 pub struct SegmentRecoveryOptions {
     /// Delete segment files after successful recovery.
     pub delete_after_recovery: bool,
-    /// Skip corrupt segments instead of failing.
+    /// Stop at the first corrupt segment and return the durable prefix instead
+    /// of failing the whole recovery.
     pub skip_corrupt: bool,
 }
 
@@ -324,7 +325,7 @@ pub fn recover_segments(
 
     let mut all_records = Vec::new();
 
-    for (epoch, path) in &segments {
+    for (segment_index, (epoch, path)) in segments.iter().enumerate() {
         // Get file size for byte tracking
         let metadata = fs::metadata(path)?;
         let file_size = metadata.len();
@@ -344,11 +345,15 @@ pub fn recover_segments(
                     );
                     if options.skip_corrupt {
                         eprintln!(
-                            "warning: skipping corrupt segment {}: {error}",
+                            "warning: stopping recovery at corrupt segment {}: {error}",
                             path.display()
                         );
-                        result.partial_segments.push(path.clone());
-                        continue;
+                        result.partial_segments.extend(
+                            segments[segment_index..]
+                                .iter()
+                                .map(|(_, path)| path.clone()),
+                        );
+                        break;
                     }
                     return Err(error);
                 }
@@ -362,11 +367,18 @@ pub fn recover_segments(
             }
             Err(e) => {
                 if options.skip_corrupt {
-                    eprintln!("warning: skipping corrupt segment {}: {e}", path.display());
-                    result.partial_segments.push(path.clone());
-                } else {
-                    return Err(e);
+                    eprintln!(
+                        "warning: stopping recovery at corrupt segment {}: {e}",
+                        path.display()
+                    );
+                    result.partial_segments.extend(
+                        segments[segment_index..]
+                            .iter()
+                            .map(|(_, path)| path.clone()),
+                    );
+                    break;
                 }
+                return Err(e);
             }
         }
     }
@@ -1498,6 +1510,64 @@ mod tests {
         assert_eq!(result.segments_recovered, 0);
         assert_eq!(result.partial_segments, vec![renamed]);
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_recover_and_apply_segments_skip_corrupt_stops_at_first_bad_epoch() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("prefix.db");
+
+        for epoch in 1..=3u64 {
+            let batch = EpochFlushBatch {
+                epoch,
+                records: vec![WalRecord {
+                    txn_token: TxnToken::new(
+                        fsqlite_types::TxnId::new(epoch).unwrap(),
+                        fsqlite_types::TxnEpoch::new(0),
+                    ),
+                    epoch,
+                    page_id: PageNumber::new(1).unwrap(),
+                    begin_seq: CommitSeq::new(epoch * 100),
+                    end_seq: Some(CommitSeq::new(epoch * 100)),
+                    before_image: Vec::new(),
+                    after_image: vec![epoch as u8; 16],
+                }],
+                records_per_core: vec![1],
+            };
+            write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+        }
+
+        let corrupt_epoch_path = segment_path(&db_path, 2);
+        std::fs::write(&corrupt_epoch_path, [0xFF_u8; 8]).expect("corrupt write should succeed");
+
+        let mut page_contents = HashMap::new();
+        let result = recover_and_apply_segments(
+            &db_path,
+            &mut page_contents,
+            SegmentRecoveryOptions {
+                skip_corrupt: true,
+                ..Default::default()
+            },
+        )
+        .expect("skip_corrupt should return the durable prefix");
+
+        assert_eq!(result.segments_recovered, 1);
+        assert_eq!(result.records_applied, 1);
+        assert_eq!(result.epochs, vec![1]);
+        assert_eq!(
+            result.partial_segments,
+            vec![segment_path(&db_path, 2), segment_path(&db_path, 3)]
+        );
+
+        let page = page_contents
+            .get(&1)
+            .expect("prefix recovery should apply the last durable epoch only");
+        assert!(
+            page.iter().all(|&byte| byte == 1),
+            "recovery must stop before epoch 3 once epoch 2 is corrupt"
+        );
     }
 
     #[test]
