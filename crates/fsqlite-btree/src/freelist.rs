@@ -375,7 +375,9 @@ pub const fn ptrmap_entry_offset(
         // pointer map page forward by one page.
         return None;
     }
+    
     let index = pgno.get() - ptrmap_page.get() - 1;
+    
     Some(index * PTRMAP_ENTRY_SIZE_BYTES)
 }
 
@@ -718,9 +720,9 @@ mod tests {
     #[test]
     fn test_ptrmap_entry_offset_skips_pending_byte_inside_group() {
         // For 4096-byte pages, the pending byte page lands in the middle of
-        // the pointer-map group that starts at page 261582. Pages after the
-        // pending byte but before the next pointer-map page must have their
-        // entry index shifted down by one.
+        // the pointer-map group that starts at page 261582. 
+        // The slot corresponding to the pending byte page is simply left unused,
+        // and subsequent pages maintain their unshifted index offsets.
         let usable_size = 4096;
         let page_size = 4096;
         let pending_byte_pgno = (PENDING_BYTE_OFFSET / page_size) + 1;
@@ -743,6 +745,7 @@ mod tests {
         );
         assert_eq!(
             ptrmap_entry_offset(pgno, usable_size, page_size),
+            // No shift occurs. The slot for the pending byte is wasted.
             Some(563 * PTRMAP_ENTRY_SIZE_BYTES)
         );
     }
@@ -752,18 +755,29 @@ mod tests {
         let usable_size = 4096;
         let page_size = 4096;
         let ptrmap_page = 261582;
-        // group size is 820. With pending byte page, it covers 821 pages: 261582 to 262402.
+        // Group size is 820 physical pages.
+        // Group starts at 261582. Next group starts at 261582 + 820 = 262402.
+        // Therefore, 262402 is NOT in this group, it IS the next ptrmap page!
         let pgno = PageNumber::new(262402).unwrap();
-        
+
         assert_eq!(
-            ptrmap_page_for(pgno, usable_size, page_size).unwrap().get(),
+            ptrmap_page_for(pgno, usable_size, page_size),
+            None // It's a ptrmap page itself!
+        );
+        assert_eq!(
+            ptrmap_entry_offset(pgno, usable_size, page_size),
+            None
+        );
+
+        let last_in_group = PageNumber::new(262401).unwrap();
+        assert_eq!(
+            ptrmap_page_for(last_in_group, usable_size, page_size).unwrap().get(),
             ptrmap_page
         );
-        
-        let offset = ptrmap_entry_offset(pgno, usable_size, page_size).unwrap();
-        assert!(offset + PTRMAP_ENTRY_SIZE_BYTES <= usable_size, "offset {} + 5 > usable_size {}", offset, usable_size);
+        let offset = ptrmap_entry_offset(last_in_group, usable_size, page_size).unwrap();
+        assert!(offset + PTRMAP_ENTRY_SIZE_BYTES <= usable_size);
+        assert_eq!(offset, 818 * PTRMAP_ENTRY_SIZE_BYTES);
     }
-
     #[test]
     fn test_ptrmap_entry_encode_decode() {
         let entry = PtrMapEntry {

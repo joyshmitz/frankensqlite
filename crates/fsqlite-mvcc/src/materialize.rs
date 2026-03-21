@@ -215,8 +215,9 @@ pub fn materialize_page(
     }
 
     // Build working state from base page
+    let btree_ref = visible_deltas[0].cell_key.btree;
     let mut state =
-        WorkingPageState::from_base_page(base, page_number, &header, header_offset, usable_size)?;
+        WorkingPageState::from_base_page(base, page_number, &header, header_offset, usable_size, btree_ref)?;
 
     // Apply each visible delta
     for delta in &visible_deltas {
@@ -298,6 +299,7 @@ impl WorkingPageState {
         header: &BtreePageHeader,
         header_offset: usize,
         usable_size: u32,
+        btree_ref: fsqlite_types::BtreeRef,
     ) -> Result<Self> {
         let cell_pointers = read_cell_pointers(base.as_bytes(), header, header_offset)?;
         let page_bytes = base.as_bytes();
@@ -315,7 +317,7 @@ impl WorkingPageState {
 
             // Compute key digest and sort key for this cell
             let (key_digest, sort_key) =
-                compute_cell_key_and_sort_key(page_bytes, cell_offset, header.page_type)?;
+                compute_cell_key_and_sort_key(page_bytes, cell_offset, header.page_type, btree_ref)?;
 
             cells.push(WorkingCell {
                 content: cell_content,
@@ -474,6 +476,7 @@ fn compute_cell_key_and_sort_key(
     page: &[u8],
     cell_offset: usize,
     page_type: BtreePageType,
+    btree_ref: fsqlite_types::BtreeRef,
 ) -> Result<([u8; 16], SortKey)> {
     // For table leaf pages, extract the rowid
     // For index leaf pages, extract the key bytes
@@ -494,7 +497,11 @@ fn compute_cell_key_and_sort_key(
         // Hash the rowid for key_digest
         let mut key_bytes = [0u8; 10];
         let len = encode_varint_i64(rowid as i64, &mut key_bytes);
-        let key_digest = compute_key_digest(&key_bytes[..len]);
+        let key_digest = fsqlite_types::SemanticKeyRef::compute_digest(
+            fsqlite_types::SemanticKeyKind::TableRow,
+            btree_ref,
+            &key_bytes[..len],
+        );
 
         Ok((key_digest, SortKey::Rowid(rowid as i64)))
     } else if page_type == BtreePageType::LeafIndex {
@@ -516,7 +523,11 @@ fn compute_cell_key_and_sort_key(
         let key_end = key_start + key_len;
 
         let key_bytes = page[key_start..key_end].to_vec();
-        let key_digest = compute_key_digest(&key_bytes);
+        let key_digest = fsqlite_types::SemanticKeyRef::compute_digest(
+            fsqlite_types::SemanticKeyKind::IndexEntry,
+            btree_ref,
+            &key_bytes,
+        );
 
         Ok((key_digest, SortKey::IndexKey(key_bytes)))
     } else {
@@ -580,13 +591,7 @@ fn compute_cell_key_and_sort_key_from_delta(
     }
 }
 
-/// Compute a BLAKE3-truncated key digest.
-fn compute_key_digest(key_bytes: &[u8]) -> [u8; 16] {
-    let hash = blake3::hash(key_bytes);
-    let mut digest = [0u8; 16];
-    digest.copy_from_slice(&hash.as_bytes()[..16]);
-    digest
-}
+// Removed compute_key_digest
 
 /// Compute the end offset of a cell.
 fn compute_cell_end(

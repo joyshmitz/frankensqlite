@@ -1491,11 +1491,16 @@ impl ArcCache {
         &self.shards[hash & self.shard_mask]
     }
 
-    /// Acquire the inner lock for direct manipulation.
-    ///
-    /// NOTE: In sharded mode, this returns the first shard.
-    pub fn lock(&self) -> fsqlite_types::sync_primitives::MutexGuard<'_, ArcCacheInner> {
-        self.shards[0].lock()
+    fn resident_pages_snapshot(&self) -> Option<usize> {
+        let mut total = 0usize;
+        for shard in &self.shards {
+            total = total.checked_add(shard.try_lock()?.len())?;
+        }
+        Some(total)
+    }
+
+    fn inflight_count_snapshot(&self) -> Option<usize> {
+        Some(self.inflight.try_lock()?.len())
     }
 
     /// Optimized sharded get.
@@ -1541,12 +1546,20 @@ impl ArcCache {
 
     fn wait_for_peer_load(&self, key: CacheKey, slot: &Arc<InflightLoad>) -> AsyncLookup {
         Self::wait_on_slot(slot.as_ref());
-        let lookup = {
+        let is_hit = {
             let shard = self.select_shard(&key);
             let mut inner = shard.lock();
-            inner.request(&key)
+            // ONLY call request if it's actually in T1/T2 to count the hit.
+            // If it's a Miss or GhostHit, don't call request to avoid eating the ghost!
+            if inner.get(&key).is_some() {
+                let lookup = inner.request(&key);
+                debug_assert!(matches!(lookup, CacheLookup::Hit));
+                true
+            } else {
+                false
+            }
         };
-        if matches!(lookup, CacheLookup::Hit) {
+        if is_hit {
             AsyncLookup::WaitedForPeerHit
         } else {
             AsyncLookup::WaitedForPeerMiss
@@ -1562,12 +1575,18 @@ impl ArcCache {
     where
         F: FnOnce() -> Result<CachedPage, E> + std::panic::UnwindSafe,
     {
-        let lookup = {
+        let is_hit = {
             let shard = self.select_shard(&key);
             let mut inner = shard.lock();
-            inner.request(&key)
+            if inner.get(&key).is_some() {
+                let lookup = inner.request(&key);
+                debug_assert!(matches!(lookup, CacheLookup::Hit));
+                true
+            } else {
+                false
+            }
         };
-        if matches!(lookup, CacheLookup::Hit) {
+        if is_hit {
             self.release_inflight_slot(key, slot);
             return Ok(AsyncLookup::Hit);
         }
@@ -1582,8 +1601,8 @@ impl ArcCache {
                         // Someone else synchronously loaded it. Update LRU.
                         let _ = inner.request(&key);
                     } else {
-                        // Not resident. We already accounted for the miss/ghost hit in `lookup`.
-                        // Do not call `request` again to avoid double-counting misses.
+                        // Not resident. Do the request now to get lookup state and admit.
+                        let lookup = inner.request(&key);
                         debug_assert_eq!(page.key, key, "request_async loader returned wrong key");
                         inner.admit(key, page, lookup);
                     }
@@ -1613,12 +1632,18 @@ impl ArcCache {
 
     fn release_inflight_slot(&self, key: CacheKey, slot: &Arc<InflightLoad>) {
         {
+            let mut inflight = self.inflight.lock();
+            if let Some(existing) = inflight.get(&key) {
+                if Arc::ptr_eq(existing, slot) {
+                    inflight.remove(&key);
+                }
+            }
+        }
+        {
             let mut state = slot.state.lock();
             state.loading = false;
         }
         slot.cv.notify_all();
-        let mut inflight = self.inflight.lock();
-        let _ = inflight.remove(&key);
     }
 
     #[cfg(test)]
@@ -1632,8 +1657,8 @@ impl std::fmt::Debug for ArcCache {
         f.debug_struct("ArcCache")
             .field("shards_len", &self.shards.len())
             .field("shard_mask", &self.shard_mask)
-            .field("inner", &*self.lock())
-            .field("inflight_len", &self.inflight.lock().len())
+            .field("resident_pages", &self.resident_pages_snapshot())
+            .field("inflight_len", &self.inflight_count_snapshot())
             .finish_non_exhaustive()
     }
 }
@@ -1684,6 +1709,17 @@ mod tests {
         let mut cp = CachedPage::new(k, fsqlite_types::PageData::zeroed(ps), 0, None);
         cp.byte_size = size;
         cp
+    }
+
+    fn lock_shard_for_key<'a>(
+        cache: &'a ArcCache,
+        key: &CacheKey,
+    ) -> fsqlite_types::sync_primitives::MutexGuard<'a, ArcCacheInner> {
+        cache.select_shard(key).lock()
+    }
+
+    fn total_cached_pages(cache: &ArcCache) -> usize {
+        cache.shards.iter().map(|shard| shard.lock().len()).sum()
     }
 
     // ── 1. test_cache_key_mvcc_awareness ──────────────────────────────
@@ -2247,59 +2283,59 @@ mod tests {
     #[test]
     fn test_e2e_arc_cache_behavior_under_mixed_workload() {
         // Multiple transactions reading/writing pages through the ARC.
-        let cache = ArcCache::new(20, 0);
+        let cache = ArcCache::new(128, 0);
 
         // Transaction 1: writes pages 1-5 at commit_seq=1.
-        {
-            let mut inner = cache.lock();
-            for i in 1..=5u32 {
-                let k = key(i, 1);
-                let l = inner.request(&k);
-                inner.admit(k, page(k, 4096), l);
-            }
+        for i in 1..=5u32 {
+            let k = key(i, 1);
+            let mut inner = lock_shard_for_key(&cache, &k);
+            let l = inner.request(&k);
+            inner.admit(k, page(k, 4096), l);
         }
 
         // Transaction 2: reads pages 1-3 (same version), writes 6-8.
-        {
-            let mut inner = cache.lock();
-            for i in 1..=3u32 {
-                let k = key(i, 1);
-                let l = inner.request(&k);
-                assert_eq!(
-                    l,
-                    CacheLookup::Hit,
-                    "bead_id={BEAD_ID} case=e2e_txn2_read_hit page={i}"
-                );
-                inner.get(&k).unwrap().pin();
-            }
-            for i in 6..=8u32 {
-                let k = key(i, 2);
-                let l = inner.request(&k);
-                inner.admit(k, page(k, 4096), l);
-            }
-            // Unpin.
-            for i in 1..=3u32 {
-                let k = key(i, 1);
-                inner.get(&k).unwrap().unpin();
-            }
+        for i in 1..=3u32 {
+            let k = key(i, 1);
+            let mut inner = lock_shard_for_key(&cache, &k);
+            let l = inner.request(&k);
+            assert_eq!(
+                l,
+                CacheLookup::Hit,
+                "bead_id={BEAD_ID} case=e2e_txn2_read_hit page={i}"
+            );
+            inner.get(&k).unwrap().pin();
+        }
+        for i in 6..=8u32 {
+            let k = key(i, 2);
+            let mut inner = lock_shard_for_key(&cache, &k);
+            let l = inner.request(&k);
+            inner.admit(k, page(k, 4096), l);
+        }
+        // Unpin.
+        for i in 1..=3u32 {
+            let k = key(i, 1);
+            let inner = lock_shard_for_key(&cache, &k);
+            inner.get(&k).unwrap().unpin();
         }
 
         // Verify all pages are accessible.
-        let inner = cache.lock();
-        assert_eq!(inner.len(), 8, "bead_id={BEAD_ID} case=e2e_total_pages");
+        assert_eq!(
+            total_cached_pages(&cache),
+            8,
+            "bead_id={BEAD_ID} case=e2e_total_pages"
+        );
         for i in 1..=5u32 {
             assert!(
-                inner.get(&key(i, 1)).is_some(),
+                cache.get(&key(i, 1)).is_some(),
                 "bead_id={BEAD_ID} case=e2e_page_{i}_v1_present"
             );
         }
         for i in 6..=8u32 {
             assert!(
-                inner.get(&key(i, 2)).is_some(),
+                cache.get(&key(i, 2)).is_some(),
                 "bead_id={BEAD_ID} case=e2e_page_{i}_v2_present"
             );
         }
-        drop(inner);
     }
 
     #[test]
@@ -2346,7 +2382,7 @@ mod tests {
             "bead_id={BEAD_ID_BD_7PU_1} case=singleflight_placeholder_cleared"
         );
 
-        let mut inner = cache.lock();
+        let mut inner = lock_shard_for_key(&cache, &k);
         assert_eq!(
             inner.request(&k),
             CacheLookup::Hit,
@@ -2374,11 +2410,29 @@ mod tests {
             "bead_id={BEAD_ID_BD_7PU_1} case=error_placeholder_cleared"
         );
 
-        let mut inner = cache.lock();
+        let mut inner = lock_shard_for_key(&cache, &k);
+        assert_eq!(
+            inner.request(&k),
+            CacheLookup::Miss,
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_leaves_clean_miss"
+        );
+        drop(inner);
+
+        let retry = cache
+            .request_async(k, || -> Result<CachedPage, &'static str> {
+                Ok(page(k, 4096))
+            })
+            .expect("retry after error should succeed");
+        assert!(
+            matches!(retry, AsyncLookup::Loaded | AsyncLookup::Hit),
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_retry_succeeds"
+        );
+
+        let mut inner = lock_shard_for_key(&cache, &k);
         assert_eq!(
             inner.request(&k),
             CacheLookup::Hit,
-            "bead_id={BEAD_ID_BD_7PU_1} case=error_retry_hit"
+            "bead_id={BEAD_ID_BD_7PU_1} case=error_retry_admits_page"
         );
         drop(inner);
     }
@@ -2389,7 +2443,7 @@ mod tests {
         let k = key(903, 1);
 
         {
-            let mut inner = cache.lock();
+            let mut inner = lock_shard_for_key(&cache, &k);
             let lookup = inner.request(&k);
             inner.admit(k, page(k, 4096), lookup);
             drop(inner);
@@ -2702,7 +2756,6 @@ mod tests {
 
         cache.get(&old).expect("old version must exist").pin();
         cache.set_gc_horizon(CommitSeq::new(2));
-
         assert!(
             cache.get(&old).is_some(),
             "bead_id={BEAD_ID_BD_3JK9} case=version_coalesce_skips_pinned"

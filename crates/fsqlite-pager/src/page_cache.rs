@@ -20,7 +20,6 @@
 //! false sharing between adjacent shards.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -564,7 +563,9 @@ impl ShardedPageCache {
     #[inline]
     fn shard_index(page_no: PageNumber) -> usize {
         let hash = page_no.get().wrapping_mul(GOLDEN_RATIO_32);
-        (hash as usize) & SHARD_MASK
+        // Multiplicative hashing requires extracting the highest bits.
+        // SHARD_COUNT is 128 (2^7), so we shift right by (32 - 7) = 25.
+        (hash >> 25) as usize
     }
 
     /// Access the underlying page pool.
@@ -603,9 +604,7 @@ impl ShardedPageCache {
     pub fn get(&self, page_no: PageNumber) -> Option<Vec<u8>> {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get(page_no).map(|slice| {
-            slice.to_vec()
-        })
+        shard.get(page_no).map(|slice| slice.to_vec())
     }
 
     /// Access a cached page via a callback (zero-copy pattern).

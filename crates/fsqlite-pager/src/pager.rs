@@ -133,7 +133,7 @@ type GroupCommitQueueRef = Arc<GroupCommitQueue>;
 // Shared WAL Backend (D1-CRITICAL: enables split-lock commit)
 // ---------------------------------------------------------------------------
 //
-// The WAL backend is held in a separate Arc<Mutex<...>> to enable split-lock
+// The WAL backend is held in a separate Arc<RwLock<...>> to enable split-lock
 // commit. This allows Thread B to start its prepare phase (which needs
 // inner.lock()) while Thread A is doing WAL I/O (which needs wal_backend.write()
 // but NOT inner.lock()).
@@ -144,7 +144,10 @@ type GroupCommitQueueRef = Arc<GroupCommitQueue>;
 //         inner.lock() re-acquired for ~10us (post-commit only)
 
 /// Thread-safe shared WAL backend for split-lock commit protocol.
-/// Uses RwLock: concurrent page reads via read(), exclusive writes via write().
+///
+/// We retain an `RwLock` here because WAL publication is still split from
+/// `inner.lock()`, but page lookup paths currently take write access as well:
+/// the `WalBackend` lookup methods mutate backend snapshot state.
 pub type SharedWalBackend = Arc<std::sync::RwLock<Option<Box<dyn WalBackend>>>>;
 
 /// Create a new empty shared WAL backend.
@@ -162,20 +165,6 @@ fn with_wal_backend<T>(
         .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
     let wal = guard
         .as_deref_mut()
-        .ok_or_else(|| FrankenError::internal("WAL mode active but no WAL backend installed"))?;
-    f(wal)
-}
-
-/// Read access to WAL backend (read_page — concurrent with other reads).
-fn with_wal_backend_read<T>(
-    wal_backend: &SharedWalBackend,
-    f: impl FnOnce(&dyn WalBackend) -> Result<T>,
-) -> Result<T> {
-    let guard = wal_backend
-        .read()
-        .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
-    let wal = guard
-        .as_deref()
         .ok_or_else(|| FrankenError::internal("WAL mode active but no WAL backend installed"))?;
     f(wal)
 }
@@ -2382,7 +2371,7 @@ where
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
+        let (db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
 
         let file_size = db_file.file_size(cx)?;
         if file_size == 0 {
@@ -5280,7 +5269,7 @@ mod tests {
 
         fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
             self.observed_unlock_trace_ids
-                .write()
+                .lock()
                 .unwrap()
                 .push(cx.trace_id());
             if self.fail_unlock_on_checkpoint_error {
@@ -5598,7 +5587,7 @@ mod tests {
         fn arm_after_db_writes(&self, successful_db_writes_before_failure: usize) {
             let mut state = self
                 .state
-                .write()
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.armed = true;
             state.remaining_successful_db_writes = successful_db_writes_before_failure;
@@ -5629,7 +5618,7 @@ mod tests {
             let is_target_db = {
                 let state = self
                     .state
-                    .write()
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 path == Some(state.target_path.as_path()) && flags.contains(VfsOpenFlags::MAIN_DB)
             };
@@ -5669,7 +5658,7 @@ mod tests {
             if self.is_target_db {
                 let mut state = self
                     .state
-                    .write()
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.armed {
                     if state.remaining_successful_db_writes == 0 {
@@ -6821,7 +6810,7 @@ mod tests {
         );
 
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
-        let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let (db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
         let mut restored = vec![0u8; ps];
         let bytes_read = db_file
             .read(&cx, &mut restored, PageSize::DEFAULT.as_usize() as u64)
@@ -8155,7 +8144,7 @@ mod tests {
         txn.commit(&cx).unwrap();
 
         frames
-            .write()
+            .lock()
             .unwrap()
             .iter()
             .map(|(page_number, _, _)| *page_number)
@@ -8383,7 +8372,7 @@ mod tests {
             db_size_if_commit: u32,
         ) -> fsqlite_error::Result<()> {
             self.frames
-                .write()
+                .lock()
                 .unwrap()
                 .push((page_number, page_data.to_vec(), db_size_if_commit));
             Ok(())
@@ -8459,7 +8448,7 @@ mod tests {
         fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
             Ok(self
                 .frames
-                .write()
+                .lock()
                 .unwrap()
                 .iter()
                 .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
@@ -8572,7 +8561,7 @@ mod tests {
             db_size_if_commit: u32,
         ) -> fsqlite_error::Result<()> {
             self.frames
-                .write()
+                .lock()
                 .unwrap()
                 .push((page_number, page_data.to_vec(), db_size_if_commit));
             Ok(())
@@ -8601,7 +8590,7 @@ mod tests {
             frames: &[crate::traits::WalFrameRef<'_>],
         ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
             self.prepare_lock_levels
-                .write()
+                .lock()
                 .unwrap()
                 .push(*self.observed_lock_level.lock().unwrap());
 
@@ -8654,7 +8643,7 @@ mod tests {
             prepared: &mut crate::traits::PreparedWalFrameBatch,
         ) -> fsqlite_error::Result<()> {
             self.append_lock_levels
-                .write()
+                .lock()
                 .unwrap()
                 .push(*self.observed_lock_level.lock().unwrap());
             *self.append_prepared_calls.lock().unwrap() += 1;
@@ -8686,7 +8675,7 @@ mod tests {
         fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
             Ok(self
                 .frames
-                .write()
+                .lock()
                 .unwrap()
                 .iter()
                 .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
@@ -8809,7 +8798,7 @@ mod tests {
 
         // Verify default state: bytes 18-19 should be 1 (rollback journal).
         {
-            let mut inner = pager.inner.lock().unwrap();
+            let inner = pager.inner.lock().unwrap();
             let mut page1 = vec![0u8; inner.page_size.as_usize()];
             let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
             assert!(n >= DATABASE_HEADER_SIZE);
@@ -8823,7 +8812,7 @@ mod tests {
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
 
         {
-            let mut inner = pager.inner.lock().unwrap();
+            let inner = pager.inner.lock().unwrap();
             let mut page1 = vec![0u8; inner.page_size.as_usize()];
             let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
             assert!(n >= DATABASE_HEADER_SIZE);
@@ -8835,7 +8824,7 @@ mod tests {
         pager.set_journal_mode(&cx, JournalMode::Delete).unwrap();
 
         {
-            let mut inner = pager.inner.lock().unwrap();
+            let inner = pager.inner.lock().unwrap();
             let mut page1 = vec![0u8; inner.page_size.as_usize()];
             let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
             assert!(n >= DATABASE_HEADER_SIZE);
@@ -10376,7 +10365,7 @@ mod tests {
         );
         assert_eq!(
             frames
-                .write()
+                .lock()
                 .unwrap()
                 .iter()
                 .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)

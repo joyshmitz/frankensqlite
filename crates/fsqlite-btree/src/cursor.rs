@@ -1386,6 +1386,7 @@ impl<P: PageReader> BtCursor<P> {
                     if found {
                         return Ok(true);
                     }
+                    self.at_eof = false;
                     return self.advance_next(cx);
                 }
                 // cell_idx == cell_count means we already visited right_child.
@@ -1414,6 +1415,7 @@ impl<P: PageReader> BtCursor<P> {
         if found {
             Ok(true)
         } else {
+            self.at_eof = false;
             self.advance_next(cx)
         }
     }
@@ -1489,6 +1491,7 @@ impl<P: PageReader> BtCursor<P> {
                     if found {
                         return Ok(true);
                     }
+                    self.at_eof = false;
                     return self.advance_prev(cx);
                 }
                 // cell_idx == 0 means we came from the leftmost child.
@@ -1511,6 +1514,7 @@ impl<P: PageReader> BtCursor<P> {
         if found {
             Ok(true)
         } else {
+            self.at_eof = false;
             self.advance_prev(cx)
         }
     }
@@ -2682,10 +2686,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     let seek_res = cursor.index_seek(cx, &successor_key)?;
                     if !seek_res.is_found() {
                         return Err(FrankenError::DatabaseCorrupt {
-                            detail: "duplicate successor missing after interior rebalance".to_owned(),
+                            detail: "duplicate successor missing after interior rebalance"
+                                .to_owned(),
                         });
                     }
-                    
+
                     let top_after_seek = cursor.stack.last().expect("cursor stack empty").clone();
                     if !top_after_seek.header.page_type.is_leaf() {
                         // The seek found the interior node separator we just inserted.
@@ -2693,7 +2698,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                         let successor_found = cursor.advance_next(cx)?;
                         if !successor_found || cursor.at_eof {
                             return Err(FrankenError::DatabaseCorrupt {
-                                detail: "duplicate leaf successor missing after interior rebalance".to_owned(),
+                                detail: "duplicate leaf successor missing after interior rebalance"
+                                    .to_owned(),
                             });
                         }
                     }
@@ -2705,13 +2711,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     let successor_found = cursor.advance_next(cx)?;
                     if !successor_found || cursor.at_eof {
                         return Err(FrankenError::DatabaseCorrupt {
-                            detail: "duplicate successor missing after interior replacement".to_owned(),
+                            detail: "duplicate successor missing after interior replacement"
+                                .to_owned(),
                         });
                     }
                     let duplicate_successor = cursor.payload(cx)?;
                     if duplicate_successor != successor_key {
                         return Err(FrankenError::DatabaseCorrupt {
-                            detail: "interior delete advanced to wrong successor duplicate".to_owned(),
+                            detail: "interior delete advanced to wrong successor duplicate"
+                                .to_owned(),
                         });
                     }
                 }
