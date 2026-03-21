@@ -190,7 +190,6 @@ impl MigrationRunner {
 
     /// Executes migration SQL and records the version, without transaction management.
     fn apply_one_inner(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
-        use crate::compat::BatchExt;
         conn.execute_batch(migration.up_sql)?;
         conn.execute_with_params(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
