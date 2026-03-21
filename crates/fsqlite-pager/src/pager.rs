@@ -4,7 +4,7 @@
 //! VFS-backed database file and a zero-copy [`PageCache`].
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
@@ -1624,7 +1624,7 @@ where
                 cleanup_cx,
                 page_lease: Vec::new(),
                 rolled_back_pages: HashSet::new(),
-                txn_read_cache: HashMap::new(),
+                txn_read_cache: RefCell::new(HashMap::new()),
             });
         }
 
@@ -1784,6 +1784,7 @@ where
             cleanup_cx,
             page_lease: Vec::new(),
             rolled_back_pages: HashSet::new(),
+            txn_read_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -2727,7 +2728,7 @@ pub struct SimpleTransaction<V: Vfs> {
     /// ~80,000 inner.lock acquisitions at 16 threads (reduces to ~80).
     /// Only used in WAL mode where the published snapshot fast path is
     /// defeated by constant commit_seq advancement.
-    txn_read_cache: HashMap<PageNumber, PageData>,
+    txn_read_cache: RefCell<HashMap<PageNumber, PageData>>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -3728,20 +3729,8 @@ where
         // snapshot fast path above is defeated (commit_seq constantly advances),
         // causing EVERY page read to hit inner.lock(). This cache eliminates
         // ~99% of those lock acquisitions for repeated B-tree traversals.
-        if let Some(cached) = self.txn_read_cache.get(&page_no) {
+        if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
             return Ok(cached.clone());
-        }
-
-        // WAL mode fast path: try reading from WAL backend directly.
-        // The WAL backend has its own lock (finer-grained than inner.lock).
-        if self.journal_mode == JournalMode::Wal {
-            if let Ok(Some(wal_data)) =
-                with_wal_backend(&self.wal_backend, |wal| wal.read_page(cx, page_no.get()))
-            {
-                let page = PageData::from_vec(wal_data);
-                self.txn_read_cache.insert(page_no, page.clone());
-                return Ok(page);
-            }
         }
 
         let mut inner = self
@@ -3765,7 +3754,9 @@ where
                 .publish_observed_page(cx, publish_update, page_no, page.clone());
         }
         // Cache the page read from inner.lock() for future reads.
-        self.txn_read_cache.insert(page_no, page.clone());
+        self.txn_read_cache
+            .borrow_mut()
+            .insert(page_no, page.clone());
         Ok(page)
     }
 
@@ -4128,16 +4119,16 @@ where
 
             // Record full commit path timing.
             if self.journal_mode == JournalMode::Wal {
-                let phase_a_us =
-                    t_phase_a_done.duration_since(t_commit_start).as_micros() as u64;
-                let phase_b_us =
-                    t_phase_b_done.duration_since(t_phase_a_done).as_micros() as u64;
-                let phase_c1_us =
-                    t_phase_c1_done.duration_since(t_phase_b_done).as_micros() as u64;
+                let phase_a_us = t_phase_a_done.duration_since(t_commit_start).as_micros() as u64;
+                let phase_b_us = t_phase_b_done.duration_since(t_phase_a_done).as_micros() as u64;
+                let phase_c1_us = t_phase_c1_done.duration_since(t_phase_b_done).as_micros() as u64;
                 let phase_c2_us =
                     t_phase_c2_done.duration_since(t_phase_c1_done).as_micros() as u64;
                 GLOBAL_CONSOLIDATION_METRICS.record_commit_phases(
-                    phase_a_us, phase_b_us, phase_c1_us, phase_c2_us,
+                    phase_a_us,
+                    phase_b_us,
+                    phase_c1_us,
+                    phase_c2_us,
                 );
             }
 

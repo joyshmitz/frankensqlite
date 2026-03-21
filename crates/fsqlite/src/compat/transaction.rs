@@ -100,6 +100,64 @@ impl<'a> Transaction<'a> {
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         self.conn.query_row(sql)
     }
+
+    /// Query returning exactly one row with parameters within this transaction.
+    pub fn query_row_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row, FrankenError> {
+        self.conn.query_row_with_params(sql, params)
+    }
+
+    /// Execute a query that returns exactly one row, mapping it with `f`.
+    ///
+    /// Analogous to `ConnectionExt::query_row_map` but within a transaction.
+    pub fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        f: F,
+    ) -> Result<T, FrankenError>
+    where
+        F: FnOnce(&Row) -> Result<T, FrankenError>,
+    {
+        let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
+        let row = self.conn.query_row_with_params(sql, &values)?;
+        f(&row)
+    }
+
+    /// Execute a query and collect all rows into a `Vec<T>` via mapping closure.
+    ///
+    /// Analogous to `ConnectionExt::query_map_collect` but within a transaction.
+    pub fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        f: F,
+    ) -> Result<Vec<T>, FrankenError>
+    where
+        F: FnMut(&Row) -> Result<T, FrankenError>,
+    {
+        let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
+        let rows = self.conn.query_with_params(sql, &values)?;
+        rows.iter().map(f).collect()
+    }
+
+    /// Execute a string containing multiple SQL statements separated by
+    /// semicolons, within this transaction.
+    ///
+    /// Analogous to `BatchExt::execute_batch` but within a transaction.
+    pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
+        Connection::execute_batch(self.conn, sql)
+    }
+
+    /// Get `last_insert_rowid()` within this transaction.
+    pub fn last_insert_rowid(&self) -> Result<i64, FrankenError> {
+        let row = self.conn.query_row("SELECT last_insert_rowid();")?;
+        use super::RowExt;
+        row.get_typed::<i64>(0)
+    }
 }
 
 impl Drop for Transaction<'_> {
