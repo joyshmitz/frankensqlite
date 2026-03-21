@@ -19,9 +19,11 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_void};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite::Connection;
 use fsqlite_ast::Statement;
@@ -71,6 +73,7 @@ static COMPAT_STEP: AtomicU64 = AtomicU64::new(0);
 static COMPAT_FINALIZE: AtomicU64 = AtomicU64::new(0);
 static COMPAT_COLUMN: AtomicU64 = AtomicU64::new(0);
 static COMPAT_ERRMSG: AtomicU64 = AtomicU64::new(0);
+static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct CompatMetricsSnapshot {
@@ -130,6 +133,7 @@ const DEFAULT_ERROR_MESSAGE: &str = "not an error";
 /// Wraps a `Connection` plus the last error message for `sqlite3_errmsg`.
 pub struct Sqlite3 {
     conn: Connection,
+    temporary_path: Option<PathBuf>,
     last_error: Mutex<CString>,
     last_error_code: AtomicI32,
     last_changes: AtomicI32,
@@ -137,9 +141,10 @@ pub struct Sqlite3 {
 }
 
 impl Sqlite3 {
-    fn new(conn: Connection) -> Self {
+    fn new(conn: Connection, temporary_path: Option<PathBuf>) -> Self {
         Self {
             conn,
+            temporary_path,
             last_error: Mutex::new(CString::new(DEFAULT_ERROR_MESSAGE).expect("static")),
             last_error_code: AtomicI32::new(SQLITE_OK),
             last_changes: AtomicI32::new(0),
@@ -195,6 +200,71 @@ impl Sqlite3 {
     }
 }
 
+fn cleanup_temporary_database_artifacts(path: &Path) {
+    let journal_path = {
+        let mut jp = path.as_os_str().to_owned();
+        jp.push("-journal");
+        PathBuf::from(jp)
+    };
+    let wal_path = {
+        let mut wp = path.as_os_str().to_owned();
+        wp.push("-wal");
+        PathBuf::from(wp)
+    };
+    let shm_path = {
+        let mut sp = path.as_os_str().to_owned();
+        sp.push("-shm");
+        PathBuf::from(sp)
+    };
+
+    for candidate in [path, &journal_path, &wal_path, &shm_path] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                target: "fsqlite.compat",
+                path = %candidate.display(),
+                error = %error,
+                "failed to remove temporary sqlite3_open database artifact"
+            ),
+        }
+    }
+}
+
+enum OpenTarget {
+    Path(String),
+    Temporary(PathBuf),
+}
+
+fn reserve_temporary_database_path() -> std::io::Result<PathBuf> {
+    let temp_dir = std::env::temp_dir();
+    for _ in 0..32 {
+        let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = temp_dir.join(format!(
+            "frankensqlite-c-api-{}-{nanos}-{counter}.db",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to reserve unique temporary database path",
+    ))
+}
+
 /// Opaque prepared statement handle exposed via C FFI.
 ///
 /// Wraps the SQL string, the parent connection, and a row cursor so
@@ -235,7 +305,16 @@ type ExecCallback = unsafe extern "C" fn(
 // ── Helper: convert FrankenError → c_int ────────────────────────────
 
 fn error_to_code(err: &FrankenError) -> c_int {
-    err.error_code() as c_int
+    parse_embedded_vdbe_result_code(err).unwrap_or_else(|| err.error_code() as c_int)
+}
+
+fn parse_embedded_vdbe_result_code(err: &FrankenError) -> Option<c_int> {
+    let FrankenError::Internal(message) = err else {
+        return None;
+    };
+    let suffix = message.strip_prefix("VDBE halted with code ")?;
+    let (code_text, _) = suffix.split_once(':')?;
+    code_text.parse::<c_int>().ok()
 }
 
 fn i64_to_c_int_saturating(value: i64) -> c_int {
@@ -548,17 +627,42 @@ pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut 
         return SQLITE_MISUSE;
     }
 
-    let path = if filename.is_null() {
-        ":memory:".to_owned()
+    let open_target = if filename.is_null() {
+        OpenTarget::Path(":memory:".to_owned())
     } else if let Ok(s) = CStr::from_ptr(filename).to_str() {
         if s.is_empty() {
-            ":memory:".to_owned()
+            match reserve_temporary_database_path() {
+                Ok(path) => OpenTarget::Temporary(path),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "fsqlite.compat",
+                        error = %error,
+                        "sqlite3_open failed to reserve temporary database path"
+                    );
+                    *pp_db = std::ptr::null_mut();
+                    return SQLITE_CANTOPEN;
+                }
+            }
         } else {
-            s.to_owned()
+            OpenTarget::Path(s.to_owned())
         }
     } else {
         *pp_db = std::ptr::null_mut();
         return SQLITE_CANTOPEN;
+    };
+
+    let (path, temporary_path) = match open_target {
+        OpenTarget::Path(path) => (path, None),
+        OpenTarget::Temporary(path) => {
+            let path_str = if let Some(path_str) = path.to_str() {
+                path_str.to_owned()
+            } else {
+                let _ = std::fs::remove_file(&path);
+                *pp_db = std::ptr::null_mut();
+                return SQLITE_CANTOPEN;
+            };
+            (path_str, Some(path))
+        }
     };
 
     tracing::info!(target: "fsqlite.compat", path = %path, "sqlite3_open");
@@ -568,17 +672,23 @@ pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut 
 
     match open_result {
         Ok(Ok(conn)) => {
-            let handle = Box::new(Sqlite3::new(conn));
+            let handle = Box::new(Sqlite3::new(conn, temporary_path));
             *pp_db = Box::into_raw(handle);
             SQLITE_OK
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_open failed");
+            if let Some(path) = temporary_path {
+                let _ = std::fs::remove_file(path);
+            }
             *pp_db = std::ptr::null_mut();
             error_to_code(&e)
         }
         Err(_) => {
             tracing::error!(target: "fsqlite.compat", path = %path, "sqlite3_open panicked");
+            if let Some(path) = temporary_path {
+                let _ = std::fs::remove_file(path);
+            }
             *pp_db = std::ptr::null_mut();
             SQLITE_ERROR
         }
@@ -618,7 +728,14 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
     }));
 
     match close_result {
-        Ok(Ok(())) => SQLITE_OK,
+        Ok(Ok(())) => {
+            let temporary_path = handle.temporary_path.clone();
+            drop(handle);
+            if let Some(path) = temporary_path.as_deref() {
+                cleanup_temporary_database_artifacts(path);
+            }
+            SQLITE_OK
+        }
         Ok(Err(e)) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_close failed");
             handle.set_error(&e);
@@ -986,11 +1103,15 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut Sqlite3Stmt) -> c_int {
     tracing::info!(target: "fsqlite.compat", "sqlite3_finalize");
 
     let stmt = Box::from_raw(stmt);
+    let rc = match stmt.last_step_code {
+        SQLITE_ROW | SQLITE_DONE => SQLITE_OK,
+        code => code,
+    };
     if !stmt.db.is_null() {
         (&*stmt.db).release_statement();
     }
     drop(stmt);
-    SQLITE_OK
+    rc
 }
 
 // ── sqlite3_reset ───────────────────────────────────────────────────
@@ -1303,8 +1424,41 @@ mod tests {
             let rc = sqlite3_open(path.as_ptr(), &mut db);
             assert_eq!(rc, SQLITE_OK);
             assert!(!db.is_null());
-            sqlite3_close(db);
+            let temp_path = (&*db)
+                .temporary_path
+                .clone()
+                .expect("empty filename should create a temporary database");
+            assert!(
+                temp_path.exists(),
+                "temporary database file should exist while handle is open"
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert!(
+                !temp_path.exists(),
+                "temporary database file should be removed on close"
+            );
         }
+    }
+
+    #[test]
+    fn test_cleanup_temporary_database_artifacts_removes_sidecars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("temp.db");
+        let journal_path = PathBuf::from(format!("{}-journal", path.display()));
+        let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", path.display()));
+
+        std::fs::write(&path, b"db").unwrap();
+        std::fs::write(&journal_path, b"journal").unwrap();
+        std::fs::write(&wal_path, b"wal").unwrap();
+        std::fs::write(&shm_path, b"shm").unwrap();
+
+        cleanup_temporary_database_artifacts(&path);
+
+        assert!(!path.exists());
+        assert!(!journal_path.exists());
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
     }
 
     #[test]
@@ -1692,6 +1846,33 @@ mod tests {
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_finalize_returns_last_error_code() {
+        unsafe {
+            let db = open_memory();
+
+            let setup =
+                CString::new("CREATE TABLE t(x INTEGER PRIMARY KEY); INSERT INTO t VALUES(1);")
+                    .unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let sql = CString::new("INSERT INTO t VALUES(1);").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let step_rc = sqlite3_step(stmt);
+            assert_eq!(step_rc, SQLITE_CONSTRAINT);
+            assert_eq!(sqlite3_finalize(stmt), step_rc);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
 
@@ -2160,7 +2341,7 @@ mod tests {
             )
             .unwrap();
             let rows = conn.query("SELECT v FROM t").unwrap();
-            let handle = Sqlite3::new(conn);
+            let handle = Sqlite3::new(conn, None);
             let mut captured: Vec<u8> = Vec::new();
 
             assert_eq!(
@@ -2293,7 +2474,7 @@ mod tests {
 
             let conn = Connection::open(":memory:").unwrap();
             let rows = conn.query("SELECT X'CAFE'").unwrap();
-            let handle = Sqlite3::new(conn);
+            let handle = Sqlite3::new(conn, None);
             let mut captured: Vec<u8> = Vec::new();
 
             assert_eq!(
