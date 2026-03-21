@@ -1581,7 +1581,7 @@ impl VfsFile for UnixFile {
         Ok(())
     }
 
-    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         let mut total = 0_usize;
         while total < buf.len() {

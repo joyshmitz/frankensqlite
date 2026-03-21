@@ -5223,7 +5223,7 @@ mod tests {
             result
         }
 
-        fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
             self.inner.read(cx, buf, offset)
         }
 
@@ -5448,7 +5448,7 @@ mod tests {
             result
         }
 
-        fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
             self.inner.read(cx, buf, offset)
         }
 
@@ -5632,7 +5632,7 @@ mod tests {
             self.inner.close(cx)
         }
 
-        fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
             self.inner.read(cx, buf, offset)
         }
 

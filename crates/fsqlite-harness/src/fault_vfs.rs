@@ -580,7 +580,7 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         self.inner.close(cx)
     }
 
-    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         match self.state.check_read(&self.path, offset, buf.len()) {
             ReadDecision::Allow => self.inner.read(cx, buf, offset),
             ReadDecision::IoError => Err(io_failure_error("fault injection: read failure")),

@@ -433,7 +433,7 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
-    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         let storage = self.storage.lock().map_err(|_| lock_err())?;
 

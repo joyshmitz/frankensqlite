@@ -27,6 +27,7 @@ pub trait BatchExt {
 }
 
 impl BatchExt for Connection {
+    #[allow(clippy::use_self)]
     fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
         Connection::execute_batch(self, sql)
     }

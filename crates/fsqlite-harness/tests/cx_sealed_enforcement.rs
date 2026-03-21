@@ -276,7 +276,7 @@ impl VfsFile for DummyFile {
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
-    fn read(&mut self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+    fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
         Ok(0)
     }
     fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
@@ -664,7 +664,7 @@ impl VfsFile for RecordingFile {
         Ok(())
     }
 
-    fn read(&mut self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.log.push(format!("read:{offset}:{}", buf.len()));
         let start = usize::try_from(offset).expect("offset must fit usize");
         if start >= self.bytes.len() {

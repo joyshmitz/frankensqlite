@@ -4999,10 +4999,7 @@ impl Connection {
         let started = Instant::now();
         let mut handoff = BeginBusyRetryHandoff::default();
 
-        loop {
-            let Some(wait) = handoff.next_wait(started, deadline) else {
-                return Err(FrankenError::Busy);
-            };
+        while let Some(wait) = handoff.next_wait(started, deadline) {
             perform_begin_busy_retry_handoff(wait);
             self.refresh_memdb_if_stale(cx)?;
             match pager.begin(cx, mode) {
@@ -5011,6 +5008,7 @@ impl Connection {
                 Err(err) => return Err(err),
             }
         }
+        Err(FrankenError::Busy)
     }
 
     fn refresh_prepared_schema_state(
@@ -16342,10 +16340,7 @@ impl Connection {
                     let started = Instant::now();
                     let mut handoff = BeginBusyRetryHandoff::default();
 
-                    loop {
-                        let Some(wait) = handoff.next_wait(started, deadline) else {
-                            break; // timeout expired — propagate the Busy below
-                        };
+                    while let Some(wait) = handoff.next_wait(started, deadline) {
                         perform_begin_busy_retry_handoff(wait);
                         commit_res = {
                             let mut txn_guard = self.active_txn.borrow_mut();
@@ -55789,7 +55784,7 @@ mod tests {
         }
 
         fn read(
-            &mut self,
+            &self,
             _cx: &Cx,
             buf: &mut [u8],
             offset: u64,

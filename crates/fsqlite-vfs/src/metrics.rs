@@ -256,7 +256,7 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         vfs_trace_op!("close", &*self.path, 0_u64, self.inner.close(cx))
     }
 
-    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         GLOBAL_VFS_METRICS.read_ops.fetch_add(1, Ordering::Relaxed);
         let bytes_requested = buf.len() as u64;
         let result = vfs_trace_op!(

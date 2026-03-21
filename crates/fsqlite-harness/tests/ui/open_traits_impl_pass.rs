@@ -16,7 +16,7 @@ impl VfsFile for DemoFile {
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
-    fn read(&mut self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+    fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
         Ok(0)
     }
     fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {

@@ -697,7 +697,7 @@ impl VfsFile for IoUringFile {
         self.inner.close(cx)
     }
 
-    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();

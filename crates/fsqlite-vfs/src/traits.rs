@@ -105,7 +105,7 @@ pub trait VfsFile: Send + Sync {
     ///
     /// Returns the number of bytes actually read. If fewer bytes are read
     /// than requested (short read), the remaining bytes in `buf` are zeroed.
-    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize>;
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize>;
 
     /// Write `buf` starting at byte offset `offset`.
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()>;
@@ -194,7 +194,7 @@ mod tests {
             fn close(&mut self, _cx: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&mut self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+            fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
                 Ok(0)
             }
             fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
@@ -249,7 +249,7 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&mut self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
             fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
