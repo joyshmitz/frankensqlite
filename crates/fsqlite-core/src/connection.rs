@@ -4244,12 +4244,9 @@ impl Connection {
             let mut terms: Vec<&Expr> = Vec::new();
             flatten_and_terms(where_expr, &mut terms);
             for term in terms {
-                if let Some(candidate) = extract_live_vtab_constraint_candidate(
-                    term,
-                    col_map,
-                    &src.table_name,
-                    src.alias.as_deref(),
-                ) {
+                if let Some(candidate) =
+                    extract_live_vtab_constraint_candidate(term, col_map, &src.table_name)
+                {
                     candidates.push(candidate);
                 } else {
                     residual_terms.push(term.clone());
@@ -20512,19 +20509,18 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(effective, &refs, &col_map)
-                                .unwrap_or(SqliteValue::Null)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (**expr).clone());
-                                eval_join_expr(&inlined, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                                eval_join_expr(&inlined, r, &col_map)
+                            })?
                         } else {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
-                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
+                                eval_join_expr(expr, r, &col_map)
+                            })?
                         };
                         values.push(val);
                     }
@@ -20867,19 +20863,18 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(effective, &refs, &col_map)
-                                .unwrap_or(SqliteValue::Null)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (*expr).clone());
-                                eval_join_expr(&inlined, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                                eval_join_expr(&inlined, r, &col_map)
+                            })?
                         } else {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
-                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
+                                eval_join_expr(expr, r, &col_map)
+                            })?
                         };
                         row.values.push(val);
                     }
@@ -21281,6 +21276,11 @@ impl Connection {
             } => {
                 if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                     return result;
+                }
+                if is_fts5_aux_function_name(name) {
+                    return Err(FrankenError::function_error(format!(
+                        "unable to use function {name} in the requested context",
+                    )));
                 }
                 let arg_vals: Vec<SqliteValue> = match args {
                     FunctionArgs::Star => vec![],
@@ -21822,21 +21822,20 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(effective, &refs, &col_map)
-                                .unwrap_or(SqliteValue::Null)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
                             // Correlated scalar subqueries need to be inlined
                             // with the representative row's column values.
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (**expr).clone());
-                                eval_join_expr(&inlined, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                                eval_join_expr(&inlined, r, &col_map)
+                            })?
                         } else {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
-                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
+                                eval_join_expr(expr, r, &col_map)
+                            })?
                         };
                         values.push(val);
                     }
@@ -22114,19 +22113,18 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(effective, &refs, &col_map)
-                                .unwrap_or(SqliteValue::Null)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (*expr).clone());
-                                eval_join_expr(&inlined, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                                eval_join_expr(&inlined, r, &col_map)
+                            })?
                         } else {
-                            group_rows.first().map_or(SqliteValue::Null, |r| {
-                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
-                            })
+                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
+                                eval_join_expr(expr, r, &col_map)
+                            })?
                         };
                         row.values.push(val);
                     }
@@ -24305,11 +24303,8 @@ impl Connection {
             .unwrap_or(where_clause.as_deref());
         let mut fts5_aux_context = Fts5AuxContext::default();
         for src in &table_sources {
-            let queries = collect_fts5_match_queries_for_source(
-                where_clause.as_deref(),
-                &src.table_name,
-                src.alias.as_deref(),
-            );
+            let queries =
+                collect_fts5_match_queries_for_source(where_clause.as_deref(), &src.table_name);
             if let Some(aux_table) = self.build_fts5_aux_context_for_source(src, &queries)? {
                 fts5_aux_context.insert(src.table_name.clone(), aux_table);
             }
@@ -24332,6 +24327,7 @@ impl Connection {
                     i,
                     primary_where_pushdown,
                     &col_map[..primary_width],
+                    (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
                 )?);
             } else if let Some(cached) = scanned_cache.get(&src.table_name) {
                 // Same table referenced again (e.g. CTE self-join): clone cached rows.
@@ -24340,6 +24336,7 @@ impl Connection {
                     i,
                     primary_where_pushdown,
                     &col_map[..primary_width],
+                    (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
                 )?);
             } else if self.time_travel_active.get() {
                 // Time-travel mode: read directly from MemDatabase (self.db)
@@ -24383,6 +24380,7 @@ impl Connection {
                     i,
                     primary_where_pushdown,
                     &col_map[..primary_width],
+                    (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
                 )?);
             } else {
                 if i == 0 {
@@ -24394,6 +24392,7 @@ impl Connection {
                             i,
                             primary_where_pushdown,
                             &col_map[..primary_width],
+                            (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
                         )?);
                         continue;
                     }
@@ -24421,6 +24420,7 @@ impl Connection {
                     i,
                     primary_where_pushdown,
                     &col_map[..primary_width],
+                    (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
                 )?);
             }
         }
@@ -24666,9 +24666,10 @@ impl Connection {
                             let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
                             values.push(eval_join_expr_with_using(
                                 &inlined, row, &col_map, using_skip,
-                            ));
+                            )?);
                         } else {
-                            values.push(eval_join_expr_with_using(expr, row, &col_map, using_skip));
+                            values
+                                .push(eval_join_expr_with_using(expr, row, &col_map, using_skip)?);
                         }
                     }
                 }
@@ -24678,9 +24679,9 @@ impl Connection {
                     let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
                     values.push(eval_join_expr_with_using(
                         &inlined, row, &col_map, using_skip,
-                    ));
+                    )?);
                 } else {
-                    values.push(eval_join_expr_with_using(expr, row, &col_map, using_skip));
+                    values.push(eval_join_expr_with_using(expr, row, &col_map, using_skip)?);
                 }
             }
             result.push(Row { values });
@@ -30594,6 +30595,15 @@ fn eval_group_agg_join_expr(
         }
         Expr::FunctionCall { name, args, .. } => {
             // Scalar function — evaluate args which may themselves contain aggs.
+            if is_fts5_aux_function_name(name) {
+                let row = group_rows.first().map_or(&[][..], |row| row.as_slice());
+                if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
+                    return result;
+                }
+                return Err(FrankenError::function_error(format!(
+                    "unable to use function {name} in the requested context",
+                )));
+            }
             let arg_vals: Vec<SqliteValue> = match args {
                 FunctionArgs::List(exprs) => exprs
                     .iter()
@@ -37143,28 +37153,12 @@ fn eval_live_vtab_constant_expr(expr: &Expr) -> Option<SqliteValue> {
     }
 }
 
-fn is_vtab_table_match_operand(
-    expr: &Expr,
-    col_map: &[(String, String, bool)],
-    table_name: &str,
-    alias: Option<&str>,
-) -> bool {
-    if let Expr::Column(col_ref, _) = expr
-        && col_ref.table.is_none()
-    {
-        if col_ref.column.eq_ignore_ascii_case(table_name) {
-            return true;
-        }
-        if let Some(alias) = alias
-            && col_ref.column.eq_ignore_ascii_case(alias)
-        {
-            return true;
-        }
-        return col_map
-            .iter()
-            .any(|(table, _, _)| table.eq_ignore_ascii_case(&col_ref.column));
-    }
-    false
+fn is_vtab_table_match_operand(expr: &Expr, table_name: &str) -> bool {
+    matches!(
+        expr,
+        Expr::Column(col_ref, _)
+            if col_ref.table.is_none() && col_ref.column.eq_ignore_ascii_case(table_name)
+    )
 }
 
 fn column_ref_to_vtab_constraint_column(
@@ -37184,7 +37178,6 @@ fn extract_live_vtab_constraint_candidate(
     expr: &Expr,
     col_map: &[(String, String, bool)],
     table_name: &str,
-    alias: Option<&str>,
 ) -> Option<LiveVtabConstraintCandidate> {
     match expr {
         Expr::BinaryOp {
@@ -37230,7 +37223,7 @@ fn extract_live_vtab_constraint_candidate(
             ..
         } => {
             let value = eval_live_vtab_constant_expr(pattern)?;
-            let column = if is_vtab_table_match_operand(inner, col_map, table_name, alias) {
+            let column = if is_vtab_table_match_operand(inner, table_name) {
                 0
             } else if let Expr::Column(col_ref, _) = inner.as_ref() {
                 column_ref_to_vtab_constraint_column(col_ref, col_map)?
@@ -37251,19 +37244,17 @@ fn extract_live_vtab_constraint_candidate(
     }
 }
 
-fn is_fts5_table_label_match(expr: &Expr, table_name: &str, alias: Option<&str>) -> bool {
-    let Expr::Column(col_ref, _) = expr else {
-        return false;
-    };
-    col_ref.table.is_none()
-        && (col_ref.column.eq_ignore_ascii_case(table_name)
-            || alias.is_some_and(|alias| col_ref.column.eq_ignore_ascii_case(alias)))
+fn is_fts5_table_label_match(expr: &Expr, table_name: &str) -> bool {
+    matches!(
+        expr,
+        Expr::Column(col_ref, _)
+            if col_ref.table.is_none() && col_ref.column.eq_ignore_ascii_case(table_name)
+    )
 }
 
 fn collect_fts5_match_queries_for_source(
     where_clause: Option<&Expr>,
     table_name: &str,
-    alias: Option<&str>,
 ) -> Vec<String> {
     let Some(where_clause) = where_clause else {
         return Vec::new();
@@ -37281,7 +37272,7 @@ fn collect_fts5_match_queries_for_source(
             not: false,
             ..
         } = term
-            && is_fts5_table_label_match(expr, table_name, alias)
+            && is_fts5_table_label_match(expr, table_name)
             && let Some(query) = eval_live_vtab_constant_expr(pattern)
             && !query.is_null()
         {
@@ -37297,6 +37288,7 @@ fn maybe_filter_primary_join_rows(
     table_index: usize,
     primary_where_pushdown: Option<&Expr>,
     primary_col_map: &[(String, String, bool)],
+    fts5_aux_context: Option<&Fts5AuxContext>,
 ) -> Result<Vec<Vec<SqliteValue>>> {
     if table_index != 0 {
         return Ok(row_data);
@@ -37306,6 +37298,8 @@ fn maybe_filter_primary_join_rows(
     };
 
     let mut filtered = Vec::with_capacity(row_data.len());
+    let _fts5_aux_guard =
+        fts5_aux_context.map(|context| Fts5AuxContextGuard::push(context.clone()));
     for row in row_data {
         if eval_join_predicate(expr, &row, primary_col_map)? {
             filtered.push(row);
@@ -37511,15 +37505,8 @@ fn current_fts5_visible_columns<'a>(
 
 fn resolve_fts5_row_table_label(
     table_label: &str,
-    col_map: &[(String, String, bool)],
+    _col_map: &[(String, String, bool)],
 ) -> Option<String> {
-    if col_map
-        .iter()
-        .any(|(table, _, _)| table.eq_ignore_ascii_case(table_label))
-    {
-        return Some(table_label.to_owned());
-    }
-
     with_current_fts5_aux_context(|ctx_opt| {
         ctx_opt.and_then(|ctx| {
             ctx.table(table_label)
@@ -37718,7 +37705,6 @@ fn try_eval_fts5_aux_function(
     row: &[SqliteValue],
     col_map: &[(String, String, bool)],
 ) -> Option<Result<SqliteValue>> {
-    let _table_label = fts5_table_label_from_args(args)?;
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "bm25" | "highlight" | "snippet" => {
@@ -37726,6 +37712,12 @@ fn try_eval_fts5_aux_function(
         }
         _ => None,
     }
+}
+
+fn is_fts5_aux_function_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("bm25")
+        || name.eq_ignore_ascii_case("highlight")
+        || name.eq_ignore_ascii_case("snippet")
 }
 
 /// Evaluate an expression against a combined join row, producing a value.
@@ -37746,19 +37738,11 @@ fn eval_join_expr(
             // FTS-style shorthand: `<table_name> MATCH 'query'` uses the table
             // identifier as an implicit document-text operand.
             if table_prefix.is_none()
-                && col_map
-                    .iter()
-                    .any(|(table, _, hidden)| table.eq_ignore_ascii_case(col_name) && !hidden)
+                && let Some(row_table_label) = resolve_fts5_row_table_label(col_name, col_map)
             {
-                let text = col_map
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (table, _, hidden))| {
-                        table.eq_ignore_ascii_case(col_name) && !hidden
-                    })
-                    .filter_map(|(idx, _)| row.get(idx))
-                    .filter(|value| !matches!(value, SqliteValue::Null))
-                    .map(sqlite_value_to_text)
+                let text = collect_match_columns(&row_table_label, row, col_map)
+                    .into_iter()
+                    .map(|(_, value)| value)
                     .collect::<Vec<_>>()
                     .join(" ");
                 return Ok(SqliteValue::Text(text.into()));
@@ -37974,6 +37958,11 @@ fn eval_join_expr(
         Expr::FunctionCall { name, args, .. } => {
             if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                 return result;
+            }
+            if is_fts5_aux_function_name(name) {
+                return Err(FrankenError::function_error(format!(
+                    "unable to use function {name} in the requested context",
+                )));
             }
             let arg_vals: Vec<SqliteValue> = match args {
                 FunctionArgs::List(exprs) => exprs
@@ -39291,17 +39280,17 @@ fn eval_join_expr_with_using(
     row: &[SqliteValue],
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
-) -> SqliteValue {
+) -> Result<SqliteValue> {
     if let Some(skip) = using_skip {
         if let Expr::Column(col_ref, _) = expr {
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
             if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, Some(skip)) {
-                return row.get(idx).cloned().unwrap_or(SqliteValue::Null);
+                return Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null));
             }
         }
     }
-    eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
+    eval_join_expr(expr, row, col_map)
 }
 
 // ── Time-travel query helper functions (#23) ──────────────────────────────
@@ -40954,6 +40943,72 @@ mod tests {
             rows[0].get(0),
             Some(&SqliteValue::Text("[Rust] powers search".into()))
         );
+    }
+
+    #[test]
+    fn test_sql_fts5_rejects_alias_match_operand_like_sqlite() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'Rust powers search')")
+            .unwrap();
+
+        let err = conn
+            .query("SELECT rowid FROM docs AS d WHERE d MATCH 'rust'")
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("column not found: d") || message.contains("no such column: d"),
+            "expected alias MATCH rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn test_sql_fts5_rejects_alias_aux_argument_like_sqlite() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'Rust powers search')")
+            .unwrap();
+
+        let err = conn
+            .query("SELECT highlight(d, 0, '[', ']') FROM docs AS d WHERE docs MATCH 'rust'")
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("column not found: d")
+                || message.contains("no such column: d")
+                || message.contains("unable to use function highlight"),
+            "expected alias aux-function rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn test_sql_fts5_primary_scan_does_not_steal_joined_match_predicate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE notes USING fts5(content)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, content) VALUES (1, 'alpha document')")
+            .unwrap();
+        conn.execute("INSERT INTO notes(rowid, content) VALUES (1, 'beta note')")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT docs.content, notes.content
+                 FROM docs
+                 JOIN notes ON 1 = 1
+                 WHERE notes MATCH 'beta'",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("alpha document".into()))
+        );
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("beta note".into())));
     }
 
     #[test]
