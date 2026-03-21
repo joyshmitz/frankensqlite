@@ -3221,23 +3221,37 @@ where
                 let mut arrival_wait_us: u64 = 0;
 
                 'flusher_loop: loop {
-                    // Wait for more arrivals only on the first iteration.
-                    // Pipelined batches are already queued and ready.
+                    // Wait for more arrivals only on the first iteration,
+                    // and only if there aren't already multiple batches queued.
+                    // With epoch pipelining, batches accumulate during FLUSHING,
+                    // so subsequent iterations have batches pre-queued.
                     if is_first_iteration {
                         let t_arrival_wait_start = Instant::now();
-                        let deadline = Instant::now() + Duration::from_micros(50);
-                        loop {
-                            let should_flush = {
-                                let consolidator = queue
-                                    .consolidator
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                consolidator.should_flush_now()
-                            };
-                            if should_flush || Instant::now() >= deadline {
-                                break;
+                        // Check if we already have enough batches to flush immediately.
+                        let already_full = {
+                            let consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            consolidator.pending_batch_count() > 1
+                                || consolidator.should_flush_now()
+                        };
+                        if !already_full {
+                            // Brief wait for concurrent submitters (reduced from 50µs to 20µs).
+                            let deadline = Instant::now() + Duration::from_micros(20);
+                            loop {
+                                let should_flush = {
+                                    let consolidator = queue
+                                        .consolidator
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    consolidator.should_flush_now()
+                                };
+                                if should_flush || Instant::now() >= deadline {
+                                    break;
+                                }
+                                std::hint::spin_loop();
                             }
-                            std::hint::spin_loop();
                         }
                         arrival_wait_us = Instant::now()
                             .duration_since(t_arrival_wait_start)
@@ -4039,9 +4053,8 @@ where
         };
 
         if commit_result.is_ok() {
-            // For journal mode, update db_size from our computed value.
-            // For WAL mode with group commit, the flusher already set inner.db_size
-            // to the consolidated max across all batched transactions - don't revert it.
+            // Phase C1 (FAST, under inner.lock): Update metadata only.
+            // Minimize time under inner.lock — 16 threads serialize here.
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
@@ -4057,24 +4070,25 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
-            // Publish metadata and committed pages in one pass so small
-            // autocommit writes do not pay multiple snapshot-plane updates.
-            self.publish_committed_state(cx, publish_update);
-
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
 
+            // DROP inner.lock BEFORE publish — eliminates double-serialization.
+            // Previously: inner.lock + publish_lock held simultaneously = convoy.
+            // Now: inner.lock released first, publish_lock acquired independently.
             drop(inner);
+
+            // Phase C2 (outside inner.lock): Publish to snapshot plane.
+            // This acquires publish_lock but no longer under inner.lock,
+            // so other threads can do Phase C1 while we publish.
+            self.publish_committed_state(cx, publish_update);
 
             // WAL readers prefer the published snapshot plane or WAL backend,
             // so copying committed pages into the shared cache is wasted work.
             if publish_update.journal_mode == JournalMode::Wal {
                 self.discard_committed_pages();
             } else {
-                // Cache admission is a post-commit optimization, so re-enter
-                // only the cache mutex instead of holding the pager metadata
-                // lock across the entire success path.
                 let committed_cache_pages = self.drain_committed_cache_pages();
                 if !committed_cache_pages.is_empty() {
                     let inner = self
@@ -4082,7 +4096,6 @@ where
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if inner.commit_seq == publish_update.visible_commit_seq {
-                        // ShardedPageCache has per-shard internal locking
                         for (page_no, buf) in committed_cache_pages {
                             self.cache.insert_buffer(page_no, buf);
                         }
