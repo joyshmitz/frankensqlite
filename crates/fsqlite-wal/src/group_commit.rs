@@ -527,6 +527,35 @@ impl GroupCommitConsolidator {
         Ok(())
     }
 
+    /// Abort the current flush after the flusher observed an I/O error.
+    ///
+    /// This transitions the state machine out of `Flushing` so waiters can be
+    /// released with the epoch-level failure published by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if not in `Flushing` phase.
+    pub fn abort_flush(&mut self) -> Result<()> {
+        if self.phase != ConsolidationPhase::Flushing {
+            return Err(FrankenError::Internal(format!(
+                "abort_flush called in {:?} phase, expected Flushing",
+                self.phase
+            )));
+        }
+
+        self.phase = ConsolidationPhase::Complete;
+        self.completed_epoch = self.epoch;
+        self.filling_started = None;
+
+        debug!(
+            target: "fsqlite_wal::group_commit",
+            epoch = self.epoch,
+            "abort_flush: FLUSHING → COMPLETE"
+        );
+
+        Ok(())
+    }
+
     /// Transition from COMPLETE to FILLING for the next epoch.
     fn transition_to_filling(&mut self) {
         self.phase = ConsolidationPhase::Filling;
@@ -812,6 +841,34 @@ mod tests {
         let c = &mut GroupCommitConsolidator::new(GroupCommitConfig::default());
         // Cannot complete flush in FILLING phase.
         assert!(c.complete_flush().is_err());
+    }
+
+    #[test]
+    fn test_consolidator_abort_flush_releases_epoch_and_allows_next_cycle() {
+        let mut c = GroupCommitConsolidator::new(GroupCommitConfig::default());
+
+        c.submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: sample_page(0x01),
+            db_size_if_commit: 1,
+        }]))
+        .unwrap();
+        c.begin_flush().unwrap();
+        c.abort_flush().unwrap();
+
+        assert_eq!(c.phase(), ConsolidationPhase::Complete);
+        assert_eq!(c.completed_epoch(), 1);
+
+        let outcome = c
+            .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x02),
+                db_size_if_commit: 2,
+            }]))
+            .unwrap();
+        assert_eq!(outcome, SubmitOutcome::Flusher);
+        assert_eq!(c.phase(), ConsolidationPhase::Filling);
+        assert_eq!(c.pending_batch_count(), 1);
     }
 
     // ── Consolidated write tests ──

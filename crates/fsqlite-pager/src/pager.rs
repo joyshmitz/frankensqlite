@@ -59,10 +59,9 @@ struct GroupCommitQueue {
     /// Atomic epoch counter for lock-free waiter polling.
     /// Updated by flusher after complete_flush(), read by waiters.
     completed_epoch: AtomicU64,
-    /// Epoch of the most recent failed flush, if any.
-    failed_epoch: AtomicU64,
-    /// Error message published by the flusher for failed epochs.
-    failed_error: Mutex<Option<String>>,
+    /// Failure outcomes by epoch. Kept so late-scheduled waiters cannot miss
+    /// a failed flush after a newer epoch completes successfully.
+    failed_epochs: Mutex<HashMap<u64, String>>,
 }
 
 impl GroupCommitQueue {
@@ -71,8 +70,7 @@ impl GroupCommitQueue {
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
-            failed_epoch: AtomicU64::new(0),
-            failed_error: Mutex::new(None),
+            failed_epochs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,13 +82,12 @@ impl GroupCommitQueue {
 
     /// Publish a failed epoch and wake all waiters.
     fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError) {
-        self.failed_epoch.store(epoch, AtomicOrdering::Release);
-        let mut failed_error = self
-            .failed_error
+        let mut failed_epochs = self
+            .failed_epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *failed_error = Some(error.to_string());
-        drop(failed_error);
+        failed_epochs.insert(epoch, error.to_string());
+        drop(failed_epochs);
         self.flush_complete.notify_all();
     }
 
@@ -106,20 +103,20 @@ impl GroupCommitQueue {
         target_epoch: u64,
     ) -> Result<()> {
         loop {
-            if self.is_epoch_complete(target_epoch) {
-                return Ok(());
-            }
-
-            if self.failed_epoch.load(AtomicOrdering::Acquire) >= target_epoch {
-                let detail = self
-                    .failed_error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-                    .unwrap_or_else(|| "group commit flush failed".to_owned());
+            if let Some(detail) = self
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&target_epoch)
+                .cloned()
+            {
                 return Err(FrankenError::internal(format!(
                     "group commit flush failed for epoch {target_epoch}: {detail}"
                 )));
+            }
+
+            if self.is_epoch_complete(target_epoch) {
+                return Ok(());
             }
 
             guard = self
@@ -1394,7 +1391,8 @@ impl PublishedPagerState {
         // Transaction A (db_size=5) may publish after Transaction B (db_size=7),
         // which would revert the published db_size from 7 to 5. This causes
         // BusySnapshot errors where subsequent transactions can't see pages 6-7.
-        self.db_size.fetch_max(update.db_size, AtomicOrdering::Release);
+        self.db_size
+            .fetch_max(update.db_size, AtomicOrdering::Release);
         self.journal_mode.store(
             encode_journal_mode(update.journal_mode),
             AtomicOrdering::Release,
@@ -9043,6 +9041,48 @@ mod tests {
             message.contains("missing page 4"),
             "bead_id={BEAD_ID} case=wal_batch_helper_missing_page error={message}"
         );
+    }
+
+    #[test]
+    fn test_group_commit_queue_retains_failed_epoch_for_late_waiter() {
+        let queue = GroupCommitQueue::new(GroupCommitConfig::default());
+        queue.publish_failed_epoch(
+            1,
+            &FrankenError::internal("forced group commit flush failure"),
+        );
+        queue.publish_completed_epoch(2);
+
+        let guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let err = queue.wait_for_epoch_outcome(guard, 1).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("epoch 1"),
+            "bead_id={BEAD_ID} case=group_commit_failed_epoch_late_waiter_mentions_epoch message={message}"
+        );
+        assert!(
+            message.contains("forced group commit flush failure"),
+            "bead_id={BEAD_ID} case=group_commit_failed_epoch_late_waiter_preserves_detail message={message}"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_queue_success_not_poisoned_by_other_failed_epoch() {
+        let queue = GroupCommitQueue::new(GroupCommitConfig::default());
+        queue.publish_failed_epoch(
+            1,
+            &FrankenError::internal("forced group commit flush failure"),
+        );
+        queue.publish_completed_epoch(2);
+
+        let guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.wait_for_epoch_outcome(guard, 2).unwrap();
     }
 
     #[test]
