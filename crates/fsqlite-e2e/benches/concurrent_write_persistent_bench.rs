@@ -414,6 +414,14 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     "[FrankenSQLite {n_threads}t] conflicts={total_conflicts}, p50={:?}, p95={:?}, p99={:?}, max={:?}",
                     p50, p95, p99, max
                 );
+
+                // Print phase timing report from group commit metrics
+                let metrics = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
+                if metrics.total_commits() > 0 {
+                    eprintln!("[FrankenSQLite {n_threads}t phase timing]\n{}", metrics.phase_timing_report());
+                }
+                // Reset metrics for next iteration
+                fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.reset();
             },
             criterion::BatchSize::LargeInput,
         );
